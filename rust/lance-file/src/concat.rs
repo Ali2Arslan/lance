@@ -11,6 +11,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     future::Future,
+    num::NonZeroU64,
     ops::Range,
     sync::Arc,
 };
@@ -30,10 +31,10 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::{
-    reader::{CachedFileMetadata, FileReader, RawFileMetadataOpen},
+    reader::{CachedFileMetadata, FileReader, FullMetadataReadOptions, RawFileMetadataOpen},
     version::ConcreteFileVersion,
     versions,
-    writer::{FileWriteSummary, FileWriterOptions},
+    writer::{FileWriteResult, FileWriterOptions},
 };
 
 /// Caller-defined runtime identity of the final target for Blob-bearing parts.
@@ -62,6 +63,7 @@ impl BlobTargetId {
 pub struct EncodedFileInput {
     scheduler: FileScheduler,
     expected_num_rows: Option<u64>,
+    metadata_options: FullMetadataReadOptions,
 }
 
 impl EncodedFileInput {
@@ -70,6 +72,7 @@ impl EncodedFileInput {
         Self {
             scheduler,
             expected_num_rows: None,
+            metadata_options: FullMetadataReadOptions::default(),
         }
     }
 
@@ -78,6 +81,14 @@ impl EncodedFileInput {
     /// A mismatch is an input error, not a compatibility result.
     pub fn with_expected_num_rows(mut self, expected_num_rows: u64) -> Self {
         self.expected_num_rows = Some(expected_num_rows);
+        self
+    }
+
+    /// Use the exact metadata suffix size reported when this file was written.
+    pub fn with_metadata_size_bytes(mut self, metadata_size_bytes: NonZeroU64) -> Self {
+        self.metadata_options = self
+            .metadata_options
+            .with_metadata_size_bytes(metadata_size_bytes);
         self
     }
 
@@ -155,7 +166,10 @@ impl DataFilePart {
         blob_target_id: Option<BlobTargetId>,
     ) -> Result<Self> {
         validate_blob_id_range(blob_ids.as_ref())?;
-        let metadata = Arc::new(FileReader::read_all_metadata(&input.scheduler()).await?);
+        let metadata = Arc::new(
+            FileReader::read_all_metadata_with_options(&input.scheduler(), input.metadata_options)
+                .await?,
+        );
         let schema = Arc::new(normalize_blob_footer_schema(metadata.file_schema.as_ref()));
         if let Some(expected_num_rows) = input.expected_num_rows
             && metadata.num_rows != expected_num_rows
@@ -351,12 +365,13 @@ async fn validate_blob_descriptors(
         &blob_schema,
         &field_id_to_column_index,
     )?;
-    let reader = FileReader::try_open(
+    let reader = FileReader::try_open_with_metadata_options(
         input.scheduler(),
         Some(projection),
         Arc::<DecoderPlugins>::default(),
         &LanceCache::no_cache(),
         Default::default(),
+        input.metadata_options,
     )
     .await?;
     let mut batches = reader
@@ -551,6 +566,8 @@ pub struct FileConcatOutput {
     pub num_rows: u64,
     /// Size of the completed or reused object.
     pub size_bytes: u64,
+    /// Exact number of bytes from the schema descriptor through EOF.
+    pub metadata_size_bytes: NonZeroU64,
 }
 
 /// A compatibility reason that requires a caller-controlled decode/re-encode fallback.
@@ -940,12 +957,15 @@ where
         })
     })?;
     if prepared.len() == 1 && reuse_single_input {
+        let metadata_size_bytes = NonZeroU64::new(prepared[0].metadata.metadata_size_bytes())
+            .ok_or_else(|| Error::internal("concat input has an empty metadata suffix"))?;
         return Ok(FileConcatResult::Reused(
             0,
             FileConcatOutput {
                 version: target.version,
                 num_rows: total_rows,
                 size_bytes: prepared[0].metadata.file_size_bytes,
+                metadata_size_bytes,
             },
         ));
     }
@@ -953,7 +973,7 @@ where
     let object_writer = output_factory().await?;
     let mut writer =
         versions::create_lazy_writer(target.version, object_writer, options.writer_options)?;
-    let write_result: Result<FileWriteSummary> = async {
+    let write_result: Result<FileWriteResult> = async {
         let column_count = prepared[0].metadata.column_infos.len();
         let mut output_pages = std::iter::repeat_with(Vec::new)
             .take(column_count)
@@ -1018,16 +1038,20 @@ where
             &columns,
             total_rows,
         )?;
-        writer.finish().await
+        writer.finish_with_metadata_size().await
     }
     .await;
 
     match write_result {
-        Ok(summary) => Ok(FileConcatResult::Written(FileConcatOutput {
-            version: target.version,
-            num_rows: summary.num_rows,
-            size_bytes: summary.size_bytes,
-        })),
+        Ok(result) => {
+            let summary = result.summary();
+            Ok(FileConcatResult::Written(FileConcatOutput {
+                version: target.version,
+                num_rows: summary.num_rows,
+                size_bytes: summary.size_bytes,
+                metadata_size_bytes: result.metadata_size_bytes(),
+            }))
+        }
         Err(error) => {
             writer.abort().await;
             Err(error)
@@ -1080,11 +1104,12 @@ where
             "concat_files requires at least one complete input file",
         ));
     }
-    let raw_metadata = futures::future::try_join_all(
-        ordered_inputs
-            .iter()
-            .map(|input| FileReader::read_raw_metadata_for_dispatch(&input.scheduler)),
-    )
+    let raw_metadata = futures::future::try_join_all(ordered_inputs.iter().map(|input| {
+        FileReader::read_raw_metadata_for_dispatch_with_options(
+            &input.scheduler,
+            input.metadata_options,
+        )
+    }))
     .await?;
     if target.version == ConcreteFileVersion::V1
         || raw_metadata
