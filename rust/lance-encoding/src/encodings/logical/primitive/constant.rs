@@ -20,7 +20,9 @@ use crate::{
     buffer::LanceBuffer,
     decoder::PageEncoding,
     encoder::EncodedPage,
-    encodings::logical::primitive::{CachedPageData, PageLoadTask},
+    encodings::logical::primitive::{
+        CachedPageData, PageInitialization, PageInitializationBuffers, PageLoadTask,
+    },
     format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefUnraveler},
 };
@@ -102,7 +104,7 @@ enum ScalarSource {
 }
 
 /// The (scalar, rep, def) file ranges a constant page reads, in the order
-/// `init_ranges` appends and `init_from_buffers` consumes them.  Any field is
+/// `init_layout` declares and `init_from_buffers` consumes them.  Any field is
 /// `None` when that buffer is absent. Computed once at construction so the two
 /// halves share one source of truth and their buffer order cannot drift.
 #[derive(Debug)]
@@ -208,62 +210,76 @@ impl ConstantPageScheduler {
 }
 
 impl crate::encodings::logical::primitive::StructuralPageScheduler for ConstantPageScheduler {
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+    fn init_layout(&self) -> Result<PageInitialization> {
         // Order must match `init_from_buffers`' consumption: scalar, rep, def.
-        Ok([&self.layout.scalar, &self.layout.rep, &self.layout.def]
-            .into_iter()
-            .flatten()
-            .cloned()
-            .collect())
+        Ok(PageInitialization::new([
+            self.layout.scalar.clone(),
+            self.layout.rep.clone(),
+            self.layout.def.clone(),
+        ]))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        // Consume `buffers` in the same scalar, rep, def order `init_ranges`
-        // appended them, using the shared layout's presence flags.
-        let (has_rep, has_def) = (self.layout.rep.is_some(), self.layout.def.is_some());
+        // Consume `buffers` in the same scalar, rep, def order `init_layout`
+        // declared them, using the shared layout's presence flags.
         let scalar_source = self.scalar_source.clone();
         let data_type = self.data_type.clone();
         async move {
-            let mut data_iter = buffers.into_iter();
+            let [scalar_buffer, rep_buffer, def_buffer] = buffers.try_into_array("constant")?;
 
-            let scalar = match scalar_source {
-                ScalarSource::Inline(inline) => {
+            let scalar = match (scalar_source, scalar_buffer) {
+                (ScalarSource::Inline(inline), None) => {
                     lance_arrow::scalar::decode_scalar_from_inline_value(&data_type, &inline)?
                 }
-                ScalarSource::ValueBuffer(_) => {
-                    let bytes = data_iter.next().unwrap();
+                (ScalarSource::ValueBuffer(_), Some(bytes)) => {
                     let buf = LanceBuffer::from_bytes(bytes, 1);
                     lance_arrow::scalar::decode_scalar_from_value_buffer(&data_type, buf.as_ref())?
                 }
+                _ => {
+                    return Err(Error::internal(
+                        "Constant page scalar buffer does not match its initialization layout",
+                    ));
+                }
             };
 
-            let rep = has_rep.then(|| {
-                let rep = data_iter.next().unwrap();
+            let rep = rep_buffer.map(|rep| {
                 let rep = LanceBuffer::from_bytes(rep, 2);
                 rep.borrow_to_typed_slice::<u16>()
             });
 
-            let def = has_def.then(|| {
-                let def = data_iter.next().unwrap();
+            let def = def_buffer.map(|def| {
                 let def = LanceBuffer::from_bytes(def, 2);
                 def.borrow_to_typed_slice::<u16>()
             });
 
             let cached = Arc::new(CachedConstantState { scalar, rep, def });
-            self.repdef = Some(cached.clone());
             Ok(cached as Arc<dyn CachedPageData>)
         }
         .boxed()
     }
 
     fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()> {
-        self.repdef = Some(data.clone().as_arc_any().downcast().map_err(|_| {
-            Error::invalid_input_source("Cached constant page data has an unexpected type".into())
-        })?);
+        let cached: Arc<CachedConstantState> =
+            data.clone().as_arc_any().downcast().map_err(|_| {
+                Error::invalid_input_source(
+                    "Cached constant page data has an unexpected type".into(),
+                )
+            })?;
+        if cached.scalar.data_type() != &self.data_type {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Cached constant page scalar has data type {:?}, expected {:?}",
+                    cached.scalar.data_type(),
+                    self.data_type
+                )
+                .into(),
+            ));
+        }
+        self.repdef = Some(cached);
         Ok(())
     }
 
@@ -477,5 +493,34 @@ impl crate::decoder::DecodePageTask for DecodeConstantTask {
             data,
             repdef: unraveler,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::BooleanArray;
+
+    use super::*;
+    use crate::encodings::logical::primitive::StructuralPageScheduler;
+
+    #[test]
+    fn rejects_cached_scalar_with_different_data_type() {
+        let mut scheduler = ConstantPageScheduler::try_new(
+            Arc::from([]),
+            Some(Bytes::new()),
+            DataType::UInt8,
+            Arc::from([DefinitionInterpretation::AllValidItem]),
+        )
+        .unwrap();
+        let cached: Arc<dyn CachedPageData> = Arc::new(CachedConstantState {
+            scalar: Arc::new(BooleanArray::from(vec![true])),
+            rep: None,
+            def: None,
+        });
+
+        let error = scheduler.try_load(&cached).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("Boolean"));
+        assert!(error.to_string().contains("UInt8"));
     }
 }

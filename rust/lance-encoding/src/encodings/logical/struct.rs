@@ -209,27 +209,7 @@ impl StructuralFieldScheduler for StructuralStructScheduler {
 
     fn initialize<'a>(
         &'a mut self,
-        filter: &'a FilterExpression,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        let children_initialization = self
-            .children
-            .iter_mut()
-            .map(|child| child.initialize(filter, context))
-            .collect::<FuturesUnordered<_>>();
-        async move {
-            children_initialization
-                .map(|res| res.map(|_| ()))
-                .try_collect::<Vec<_>>()
-                .await?;
-            Ok(())
-        }
-        .boxed()
-    }
-
-    fn initialize_ranges<'a>(
-        &'a mut self,
-        requested_ranges: &'a [Range<u64>],
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
@@ -238,7 +218,7 @@ impl StructuralFieldScheduler for StructuralStructScheduler {
         let children_initialization = self
             .children
             .iter_mut()
-            .map(|child| child.initialize_ranges(requested_ranges, filter, context))
+            .map(|child| child.initialize(requested_ranges, filter, context))
             .collect::<FuturesUnordered<_>>();
         async move {
             children_initialization

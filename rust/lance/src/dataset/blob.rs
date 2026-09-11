@@ -5679,17 +5679,24 @@ mod tests {
             .unwrap();
         assert!(descriptors.column(0).data_type().is_struct());
 
+        let read_payload = || {
+            let dataset = dataset.clone();
+            async move {
+                let mut scanner = dataset.scan();
+                scanner.blob_handling(BlobHandling::AllBinary);
+                scanner
+                    .project(&["blobs"])
+                    .unwrap()
+                    .try_into_batch()
+                    .await
+                    .unwrap()
+            }
+        };
+
         // Pass 2: bytes view (LargeBinary). Used by compact_files.
         // Without the fix this used to panic in BlobPageScheduler::load
         // when it downcast the cached BlobDescriptionPageScheduler state.
-        let mut scanner = dataset.scan();
-        scanner.blob_handling(BlobHandling::AllBinary);
-        let bytes = scanner
-            .project(&["blobs"])
-            .unwrap()
-            .try_into_batch()
-            .await
-            .unwrap();
+        let bytes = read_payload().await;
         assert_eq!(bytes.column(0).data_type(), &DataType::LargeBinary);
         let blobs = bytes.column(0).as_binary::<i64>();
         assert_eq!(blobs.value(0), b"foo");
@@ -5706,6 +5713,13 @@ mod tests {
             .await
             .unwrap();
         assert!(descriptors.column(0).data_type().is_struct());
+
+        // Pass 4: repeat the bytes view to exercise the payload cache hit.
+        let bytes = read_payload().await;
+        let blobs = bytes.column(0).as_binary::<i64>();
+        assert_eq!(blobs.value(0), b"foo");
+        assert_eq!(blobs.value(1), b"bar");
+        assert_eq!(blobs.value(2), b"baz");
     }
 
     #[tokio::test]

@@ -3002,27 +3002,31 @@ impl SparseStructuralScheduler {
 }
 
 impl StructuralPageScheduler for SparseStructuralScheduler {
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+    fn init_layout(&self) -> Result<PageInitialization> {
         let (meta_buf_position, meta_buf_size) = self.metadata_buffer()?;
-        let mut required_ranges = Vec::with_capacity(self.buffer_offsets_and_sizes.len() - 1);
-        required_ranges.push(Self::checked_buffer_range(
+        let mut buffer_ranges = Vec::with_capacity(self.buffer_offsets_and_sizes.len() - 1);
+        buffer_ranges.push(Some(Self::checked_buffer_range(
             meta_buf_position,
             meta_buf_size,
             "metadata",
-        )?);
+        )?));
         for (position, size) in self.buffer_offsets_and_sizes.iter().skip(2) {
-            required_ranges.push(Self::checked_buffer_range(*position, *size, "structural")?);
+            buffer_ranges.push(Some(Self::checked_buffer_range(
+                *position,
+                *size,
+                "structural",
+            )?));
         }
-        Ok(required_ranges)
+        Ok(PageInitialization::new(buffer_ranges))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         async move {
-            let mut buffers = buffers.into_iter();
+            let mut buffers = buffers.into_required("sparse")?.into_iter();
             let meta_bytes = buffers.next().ok_or_else(|| {
                 Error::invalid_input_source("Sparse layout is missing chunk metadata buffer".into())
             })?;
@@ -3063,7 +3067,6 @@ impl StructuralPageScheduler for SparseStructuralScheduler {
                 plan,
                 row_domain: self.row_domain,
             });
-            self.page_meta = Some(page_meta.clone());
             Ok(page_meta as Arc<dyn CachedPageData>)
         }
         .boxed()
@@ -4689,8 +4692,14 @@ mod tests {
         scheduler: &mut SparseStructuralScheduler,
         io: &Arc<dyn EncodingsIo>,
     ) -> Result<Arc<dyn CachedPageData>> {
-        let buffers = io.submit_request(scheduler.init_ranges()?, 0).await?;
-        scheduler.init_from_buffers(buffers, io).await
+        let initialization = scheduler.init_layout()?;
+        let buffers = io
+            .submit_request(initialization.required_ranges().cloned().collect(), 0)
+            .await?;
+        let buffers = initialization.with_buffers(buffers)?;
+        let state = scheduler.init_from_buffers(buffers, io).await?;
+        scheduler.try_load(&state)?;
+        Ok(state)
     }
 
     fn position_set(

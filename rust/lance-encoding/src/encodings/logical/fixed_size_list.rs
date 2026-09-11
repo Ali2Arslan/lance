@@ -163,25 +163,18 @@ impl StructuralFieldScheduler for StructuralFixedSizeListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
-    }
-
-    fn initialize_ranges<'a>(
-        &'a mut self,
-        requested_ranges: &'a [Range<u64>],
-        filter: &'a FilterExpression,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        let child_ranges = match self.child_ranges(requested_ranges) {
-            Ok(child_ranges) => child_ranges,
-            Err(error) => return std::future::ready(Err(error)).boxed(),
+        let child_ranges = match requested_ranges.map(|ranges| self.child_ranges(ranges)) {
+            Some(Ok(child_ranges)) => Some(child_ranges),
+            Some(Err(error)) => return std::future::ready(Err(error)).boxed(),
+            None => None,
         };
         async move {
             self.child
-                .initialize_ranges(&child_ranges, filter, context)
+                .initialize(child_ranges.as_deref(), filter, context)
                 .await
         }
         .boxed()

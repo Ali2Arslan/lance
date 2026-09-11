@@ -35,7 +35,7 @@ use itertools::Itertools;
 use lance_arrow::DataTypeExt;
 use lance_arrow::deepcopy::deep_copy_nulls;
 use lance_core::{
-    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder},
+    cache::{CacheKey, CacheKeySchema, Context, DeepSizeOf, KeyBuilder, LanceCache},
     error::{Error, LanceOptionExt},
     utils::bit::pad_bytes,
 };
@@ -122,31 +122,128 @@ struct PageLoadTask {
     num_rows: u64,
 }
 
+/// The ordered initialization-buffer slots for one page.
+///
+/// Optional slots preserve the semantic position of absent buffers so range
+/// declaration and buffer consumption share one representation.
+#[derive(Debug)]
+struct PageInitialization {
+    buffer_ranges: Vec<Option<Range<u64>>>,
+}
+
+impl PageInitialization {
+    fn new(buffer_ranges: impl IntoIterator<Item = Option<Range<u64>>>) -> Self {
+        Self {
+            buffer_ranges: buffer_ranges.into_iter().collect(),
+        }
+    }
+
+    fn required_ranges(&self) -> impl Iterator<Item = &Range<u64>> {
+        self.buffer_ranges.iter().flatten()
+    }
+
+    fn num_required_ranges(&self) -> usize {
+        self.required_ranges().count()
+    }
+
+    fn with_buffers(self, buffers: Vec<Bytes>) -> Result<PageInitializationBuffers> {
+        let expected = self.num_required_ranges();
+        if buffers.len() != expected {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Page initialization received {} buffers for {expected} declared ranges",
+                    buffers.len()
+                )
+                .into(),
+            ));
+        }
+
+        let mut buffers = buffers.into_iter();
+        let mut buffer_slots = Vec::with_capacity(self.buffer_ranges.len());
+        for range in self.buffer_ranges {
+            if range.is_some() {
+                let buffer = buffers.next().ok_or_else(|| {
+                    Error::internal("Page initialization buffer was not assigned")
+                })?;
+                buffer_slots.push(Some(buffer));
+            } else {
+                buffer_slots.push(None);
+            }
+        }
+        debug_assert!(
+            buffers.next().is_none(),
+            "validated page initialization buffer count must be exhausted"
+        );
+        Ok(PageInitializationBuffers { buffer_slots })
+    }
+}
+
+#[derive(Debug)]
+struct PageInitializationBuffers {
+    buffer_slots: Vec<Option<Bytes>>,
+}
+
+impl PageInitializationBuffers {
+    fn try_into_array<const N: usize>(self, layout: &str) -> Result<[Option<Bytes>; N]> {
+        let actual = self.buffer_slots.len();
+        self.buffer_slots.try_into().map_err(|_| {
+            Error::internal(format!(
+                "{layout} page initialization declared {actual} buffer slots, expected {N}"
+            ))
+        })
+    }
+
+    fn into_required(self, layout: &str) -> Result<Vec<Bytes>> {
+        self.buffer_slots
+            .into_iter()
+            .enumerate()
+            .map(|(index, buffer)| {
+                buffer.ok_or_else(|| {
+                    Error::internal(format!(
+                        "{layout} page initialization buffer slot {index} is absent"
+                    ))
+                })
+            })
+            .collect()
+    }
+}
+
 /// A trait for figuring out how to schedule the data within
 /// a single page.
 trait StructuralPageScheduler: std::fmt::Debug + Send {
-    /// Whether the requested page-local ranges require initialized metadata.
-    fn needs_initialization(&self, _ranges: &[Range<u64>]) -> Result<bool> {
-        Ok(true)
+    /// Whether this page requires initialized metadata before scheduling.
+    fn needs_initialization(&self) -> bool {
+        true
     }
 
-    /// The file byte ranges this page must read to initialize its metadata
-    /// (chunk metadata, dictionary, repetition index, ...). May be empty.
+    /// Describes the file byte ranges this page must read to initialize its
+    /// metadata (chunk metadata, dictionary, repetition index, ...).
     ///
-    /// Ranges are returned in the buffer order expected by
-    /// [`Self::init_from_buffers`]. The field scheduler sorts the combined I/O
-    /// request by file offset and restores buffers to this order afterward.
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>>;
+    /// The field scheduler sorts the combined I/O request by file offset and
+    /// restores buffers to the declared slots afterward.
+    fn init_layout(&self) -> Result<PageInitialization>;
 
-    /// Completes initialization given the bytes for [`Self::init_ranges`], in the same order.
+    /// Returns initialized state from the bytes declared by [`Self::init_layout`].
+    ///
+    /// The caller attaches the returned state with [`Self::try_load`].
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>>;
 
     /// Tries to attach metadata from a previous initialization.
     fn try_load(&mut self, data: &Arc<dyn CachedPageData>) -> Result<()>;
+
+    // Identifies the requested decode shape (e.g. blob descriptor struct vs
+    // raw bytes). Blob columns can produce multiple page scheduler variants
+    // for the same physical column depending on the target field's data type,
+    // and the cached page state types differ per variant. The stable view is
+    // mixed into the cache key so different variants do not collide.
+    fn cache_view(&self) -> PageCacheView {
+        PageCacheView::Native
+    }
+
     /// Schedules the read of the given ranges in the page
     ///
     /// The read may be split into multiple "shards" if the page is extremely large.
@@ -1640,28 +1737,22 @@ impl ComplexAllNullScheduler {
 }
 
 impl StructuralPageScheduler for ComplexAllNullScheduler {
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+    fn init_layout(&self) -> Result<PageInitialization> {
         // Fully load the rep & def buffers, as needed
         let (rep_pos, rep_size) = self.buffer_offsets_and_sizes[0];
         let (def_pos, def_size) = self.buffer_offsets_and_sizes[1];
 
-        let mut reads = Vec::with_capacity(2);
-        if rep_size > 0 {
-            reads.push(rep_pos..rep_pos + rep_size);
-        }
-        if def_size > 0 {
-            reads.push(def_pos..def_pos + def_size);
-        }
-        Ok(reads)
+        Ok(PageInitialization::new([
+            (rep_size > 0).then_some(rep_pos..rep_pos + rep_size),
+            (def_size > 0).then_some(def_pos..def_pos + def_size),
+        ]))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        let has_rep = self.buffer_offsets_and_sizes[0].1 > 0;
-        let has_def = self.buffer_offsets_and_sizes[1].1 > 0;
         let rep_codec = self.rep_codec.clone();
         let def_codec = self.def_codec.clone();
         let num_rep_values = self.num_rep_values;
@@ -1670,7 +1761,7 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
         let max_def = self.max_def;
 
         async move {
-            let mut data_iter = buffers.into_iter();
+            let [rep_bytes, def_bytes] = buffers.try_into_array("complex all-null")?;
 
             // RLE levels select the smallest validated cache representation;
             // everything else expands eagerly to `LazyLevels::Dense`.
@@ -1723,15 +1814,13 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
                 }
             };
 
-            let rep = if has_rep {
-                let rep = data_iter.next().unwrap();
+            let rep = if let Some(rep) = rep_bytes {
                 Some(build_levels(rep, &rep_codec, num_rep_values, "repetition")?)
             } else {
                 None
             };
 
-            let def = if has_def {
-                let def = data_iter.next().unwrap();
+            let def = if let Some(def) = def_bytes {
                 Some(build_levels(def, &def_codec, num_def_values, "definition")?)
             } else {
                 None
@@ -1739,8 +1828,6 @@ impl StructuralPageScheduler for ComplexAllNullScheduler {
 
             validate_complex_all_null_levels(&rep, &def, max_rep, max_def)?;
             let repdef = Arc::new(CachedComplexAllNullState { rep, def });
-
-            self.repdef = Some(repdef.clone());
 
             Ok(repdef as Arc<dyn CachedPageData>)
         }
@@ -1973,17 +2060,17 @@ impl DecodePageTask for DecodeComplexAllNullTask {
 pub struct SimpleAllNullScheduler {}
 
 impl StructuralPageScheduler for SimpleAllNullScheduler {
-    fn needs_initialization(&self, _ranges: &[Range<u64>]) -> Result<bool> {
-        Ok(false)
+    fn needs_initialization(&self) -> bool {
+        false
     }
 
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
-        Ok(Vec::new())
+    fn init_layout(&self) -> Result<PageInitialization> {
+        Ok(PageInitialization::new([]))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        _buffers: Vec<Bytes>,
+        _buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
@@ -2731,47 +2818,48 @@ fn build_chunk_index(
 }
 
 impl StructuralPageScheduler for MiniBlockScheduler {
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
+    fn init_layout(&self) -> Result<PageInitialization> {
         // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
         // we may also need to fetch the repetition index.  Here, we gather what buffers we
         // need.
         let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
-        let mut bufs_needed = 1;
-        if self.dictionary.is_some() {
-            bufs_needed += 1;
-        }
-        if self.repetition_index_depth > 0 {
-            bufs_needed += 1;
-        }
-        let mut required_ranges = Vec::with_capacity(bufs_needed);
-        required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
-        if let Some(ref dictionary) = self.dictionary {
-            required_ranges.push(
-                dictionary.dictionary_buf_position_and_size.0
-                    ..dictionary.dictionary_buf_position_and_size.0
-                        + dictionary.dictionary_buf_position_and_size.1,
-            );
-        }
-        if self.repetition_index_depth > 0 {
-            let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
-            required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
-        }
-        Ok(required_ranges)
+        let dictionary_range = self.dictionary.as_ref().map(|dictionary| {
+            dictionary.dictionary_buf_position_and_size.0
+                ..dictionary.dictionary_buf_position_and_size.0
+                    + dictionary.dictionary_buf_position_and_size.1
+        });
+        let repetition_index_range = if self.repetition_index_depth > 0 {
+            let (rep_index_pos, rep_index_size) =
+                self.buffer_offsets_and_sizes.last().ok_or_else(|| {
+                    Error::invalid_input_source(
+                        "Mini-block page has a repetition index but no buffers".into(),
+                    )
+                })?;
+            Some(*rep_index_pos..*rep_index_pos + *rep_index_size)
+        } else {
+            None
+        };
+        Ok(PageInitialization::new([
+            Some(meta_buf_position..meta_buf_position + meta_buf_size),
+            dictionary_range,
+            repetition_index_range,
+        ]))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
         let base = self.buffer_offsets_and_sizes[1].0;
         let data_buf_size = self.buffer_offsets_and_sizes[1].1;
 
         async move {
-            let mut buffers = buffers.into_iter().fuse();
-            let meta_bytes = buffers.next().unwrap();
-            let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
-            let rep_index_bytes = buffers.next();
+            let [meta_bytes, dictionary_bytes, rep_index_bytes] =
+                buffers.try_into_array("mini-block")?;
+            let meta_bytes = meta_bytes.ok_or_else(|| {
+                Error::internal("Mini-block page initialization is missing chunk metadata")
+            })?;
 
             let words = Words::from_bytes(meta_bytes, self.has_large_chunk)?;
             let chunk_index = build_chunk_index(
@@ -2784,24 +2872,28 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             )?;
 
             // decode dictionary
-            let dictionary = if let Some(ref mut dictionary) = self.dictionary {
-                let dictionary_data = dictionary_bytes.unwrap();
-                Some(Arc::new(dictionary.dictionary_decompressor.decompress(
-                    Some(LanceBuffer::from_bytes(
-                        dictionary_data,
-                        dictionary.dictionary_data_alignment,
-                    )),
-                    dictionary.num_dictionary_items,
-                )?))
-            } else {
-                None
+            let dictionary = match (self.dictionary.as_ref(), dictionary_bytes) {
+                (Some(dictionary), Some(dictionary_data)) => {
+                    Some(Arc::new(dictionary.dictionary_decompressor.decompress(
+                        Some(LanceBuffer::from_bytes(
+                            dictionary_data,
+                            dictionary.dictionary_data_alignment,
+                        )),
+                        dictionary.num_dictionary_items,
+                    )?))
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(Error::internal(
+                        "Mini-block page initialization dictionary slot does not match its layout",
+                    ));
+                }
             };
 
             let page_meta = Arc::new(MiniBlockCacheableState {
                 chunk_index,
                 dictionary,
             });
-            self.page_meta = Some(page_meta.clone());
             Ok(page_meta as Arc<dyn CachedPageData>)
         }
         .boxed()
@@ -3377,33 +3469,35 @@ impl CachedPageData for FullZipCacheableState {
 }
 
 impl StructuralPageScheduler for FullZipScheduler {
-    fn needs_initialization(&self, _ranges: &[Range<u64>]) -> Result<bool> {
-        Ok(self.enable_cache && self.rep_index.is_some())
+    fn needs_initialization(&self) -> bool {
+        self.enable_cache && self.rep_index.is_some()
     }
 
-    fn init_ranges(&self) -> Result<Vec<Range<u64>>> {
-        Ok(
-            if self.enable_cache
-                && let Some(rep_index) = self.rep_index
-            {
-                let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
-                vec![rep_index.buf_position..(rep_index.buf_position + total_size)]
-            } else {
-                Vec::new()
-            },
-        )
+    fn init_layout(&self) -> Result<PageInitialization> {
+        let repetition_index_range = if self.enable_cache
+            && let Some(rep_index) = self.rep_index
+        {
+            let total_size = (self.rows_in_page + 1) * rep_index.bytes_per_value;
+            Some(rep_index.buf_position..(rep_index.buf_position + total_size))
+        } else {
+            None
+        };
+        Ok(PageInitialization::new([repetition_index_range]))
     }
 
     fn init_from_buffers<'a>(
         &'a mut self,
-        buffers: Vec<Bytes>,
+        buffers: PageInitializationBuffers,
         _io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        if self.enable_cache && self.rep_index.is_some() {
+        let [rep_index_buffer] = match buffers.try_into_array("full-zip") {
+            Ok(buffers) => buffers,
+            Err(error) => return std::future::ready(Err(error)).boxed(),
+        };
+        if let Some(rep_index_buffer) = rep_index_buffer {
             let state = Arc::new(FullZipCacheableState {
-                rep_index_buffer: LanceBuffer::from_bytes(buffers[0].clone(), 1),
+                rep_index_buffer: LanceBuffer::from_bytes(rep_index_buffer, 1),
             });
-            self.cached_state = Some(state.clone());
             std::future::ready(Ok(state as Arc<dyn CachedPageData>)).boxed()
         } else {
             std::future::ready(Ok(Arc::new(NoCachedPageData) as Arc<dyn CachedPageData>)).boxed()
@@ -4101,7 +4195,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
                 .map(|r| r.end - r.start)
                 .sum::<u64>(),
             mapping.ranges_in_page.len(),
-            cur_page.num_rows,
+            cur_page.row_range.end - cur_page.row_range.start,
             self.scheduler.column_index,
             cur_page.page_index,
         );
@@ -4136,7 +4230,7 @@ impl StructuralSchedulingJob for StructuralPrimitiveFieldSchedulingJob<'_> {
 #[derive(Debug)]
 struct PageInfoAndScheduler {
     page_index: usize,
-    num_rows: u64,
+    row_range: Range<u64>,
     scheduler: Box<dyn StructuralPageScheduler>,
 }
 
@@ -4148,12 +4242,7 @@ struct PageInfoAndScheduler {
 pub struct StructuralPrimitiveFieldScheduler {
     page_schedulers: Vec<PageInfoAndScheduler>,
     column_index: u32,
-    // Identifies the requested decode shape (e.g. blob descriptor struct vs
-    // raw bytes). Blob columns can produce multiple page scheduler variants
-    // for the same physical column depending on the target field's data type,
-    // and the cached page state types differ per variant. The stable view is
-    // mixed into the cache key so different variants do not collide.
-    page_view: PageCacheView,
+    target_data_type_tag: Arc<str>,
 }
 
 impl StructuralPrimitiveFieldScheduler {
@@ -4163,39 +4252,32 @@ impl StructuralPrimitiveFieldScheduler {
         cache_repetition_index: bool,
         target_field: &Field,
     ) -> Result<Self> {
-        let page_schedulers = column_info
-            .page_infos
-            .iter()
-            .enumerate()
-            .map(|(page_index, page_info)| {
-                Self::page_info_to_scheduler(
-                    page_info,
-                    page_index,
-                    decompressors,
-                    cache_repetition_index,
-                    target_field,
+        let mut page_schedulers = Vec::with_capacity(column_info.page_infos.len());
+        let mut row_start = 0_u64;
+        for (page_index, page_info) in column_info.page_infos.iter().enumerate() {
+            let row_end = row_start.checked_add(page_info.num_rows).ok_or_else(|| {
+                Error::invalid_input_source(
+                    format!(
+                        "Page row range overflowed for column {} at page {page_index}: start={row_start}, rows={}",
+                        column_info.index, page_info.num_rows
+                    )
+                    .into(),
                 )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let contains_blob_pages = column_info.page_infos.iter().any(|page_info| {
-            matches!(
-                page_info.encoding.as_structural().layout,
-                Some(pb21::page_layout::Layout::BlobLayout(_))
-            )
-        });
-        let page_view = if contains_blob_pages {
-            if matches!(target_field.data_type(), DataType::Struct(_)) {
-                PageCacheView::BlobDescriptor
-            } else {
-                PageCacheView::BlobPayload
-            }
-        } else {
-            PageCacheView::Native
-        };
+            })?;
+            page_schedulers.push(Self::page_info_to_scheduler(
+                page_info,
+                page_index,
+                row_start..row_end,
+                decompressors,
+                cache_repetition_index,
+                target_field,
+            )?);
+            row_start = row_end;
+        }
         Ok(Self {
             page_schedulers,
             column_index: column_info.index,
-            page_view,
+            target_data_type_tag: format!("{:?}", target_field.data_type()).into(),
         })
     }
 
@@ -4313,6 +4395,7 @@ impl StructuralPrimitiveFieldScheduler {
     fn page_info_to_scheduler(
         page_info: &PageInfo,
         page_index: usize,
+        row_range: Range<u64>,
         decompressors: &dyn DecompressionStrategy,
         cache_repetition_index: bool,
         target_field: &Field,
@@ -4327,7 +4410,7 @@ impl StructuralPrimitiveFieldScheduler {
         )?;
         Ok(PageInfoAndScheduler {
             page_index,
-            num_rows: page_info.num_rows,
+            row_range,
             scheduler,
         })
     }
@@ -4437,6 +4520,7 @@ pub struct PageDataCacheKey {
     pub column_index: u32,
     pub page_index: u32,
     pub view: PageCacheView,
+    pub target_data_type_tag: Arc<str>,
 }
 
 impl CacheKey for PageDataCacheKey {
@@ -4444,10 +4528,11 @@ impl CacheKey for PageDataCacheKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!(
-            "v1/{}/{}/{}",
+            "v2/{}/{}/{}/{}",
             self.column_index,
             self.page_index,
-            self.view.cache_tag()
+            self.view.cache_tag(),
+            self.target_data_type_tag
         )
         .into()
     }
@@ -4457,7 +4542,7 @@ impl CacheKey for PageDataCacheKey {
     }
 
     fn schema() -> CacheKeySchema {
-        CacheKeySchema::new("lance.encoding.logical.primitive.page-data-key", 1)
+        CacheKeySchema::new("lance.encoding.logical.primitive.page-data-key", 2)
     }
 
     fn write_key(&self, builder: &mut KeyBuilder) {
@@ -4468,6 +4553,7 @@ impl CacheKey for PageDataCacheKey {
             PageCacheView::BlobDescriptor => 1,
             PageCacheView::BlobPayload => 2,
         });
+        builder.write_str(&self.target_data_type_tag);
     }
 }
 
@@ -4480,13 +4566,16 @@ struct PageRangeMapping {
     ranges_in_page: Vec<Range<u64>>,
 }
 
-/// Maps global row `ranges` onto a column's pages in a single forward walk,
-/// yielding the page-local sub-ranges for every page any range touches.
+/// Maps global row `ranges` onto a column's pages, yielding the page-local
+/// sub-ranges for every page any range touches.
 ///
 /// This is the single place that converts global rows to (page, page-local
 /// rows): `initialize` consumes it to learn which pages to read, and the
 /// scheduling job consumes it to learn what to read from each. `ranges` must be
 /// ascending and non-overlapping (the precondition `schedule_ranges` relies on).
+///
+/// Each range binary-searches its first overlapping page and then walks only
+/// the pages it touches, avoiding a scan through pages between sparse ranges.
 fn map_ranges_to_pages(
     pages: &[PageInfoAndScheduler],
     ranges: &[Range<u64>],
@@ -4514,251 +4603,269 @@ fn map_ranges_to_pages(
         }
     }
 
-    let mut result = Vec::new();
-    let mut global_row_offset = 0u64;
-    let mut range_idx = 0usize;
-    for (page_idx, page) in pages.iter().enumerate() {
-        if range_idx >= ranges.len() {
-            break;
-        }
-        let page_end = global_row_offset
-            .checked_add(page.num_rows)
-            .ok_or_else(|| {
-                Error::invalid_input_source(
-                    format!(
-                        "Page row offset overflowed: start={global_row_offset}, rows={}",
-                        page.num_rows
-                    )
-                    .into(),
-                )
-            })?;
-        while range_idx < ranges.len() && ranges[range_idx].end <= global_row_offset {
-            range_idx += 1;
-        }
-        let mut ranges_in_page = Vec::new();
-        // Collect every range (or its leading part) that overlaps this page. A
-        // range clamps to the page start so one spanning a page boundary maps to
-        // row 0 here; it is only consumed once it ends within the page.
-        while range_idx < ranges.len() && ranges[range_idx].start < page_end {
-            let start_in_page = ranges[range_idx].start.max(global_row_offset) - global_row_offset;
-            let end_in_page = ranges[range_idx].end.min(page_end) - global_row_offset;
-            if start_in_page < end_in_page {
-                ranges_in_page.push(start_in_page..end_in_page);
-            }
-            if ranges[range_idx].end <= page_end {
-                range_idx += 1;
-            } else {
+    let mut result: Vec<PageRangeMapping> = Vec::new();
+    for range in ranges {
+        let mut page_idx = pages.partition_point(|page| page.row_range.end <= range.start);
+        while let Some(page) = pages.get(page_idx) {
+            if page.row_range.start >= range.end {
                 break;
             }
+            let start_in_page = range.start.max(page.row_range.start) - page.row_range.start;
+            let end_in_page = range.end.min(page.row_range.end) - page.row_range.start;
+            if start_in_page < end_in_page {
+                if let Some(mapping) = result.last_mut()
+                    && mapping.page_idx == page_idx
+                {
+                    mapping.ranges_in_page.push(start_in_page..end_in_page);
+                } else {
+                    result.push(PageRangeMapping {
+                        page_idx,
+                        ranges_in_page: vec![start_in_page..end_in_page],
+                    });
+                }
+            }
+            page_idx += 1;
         }
-        if !ranges_in_page.is_empty() {
-            result.push(PageRangeMapping {
-                page_idx,
-                ranges_in_page,
-            });
-        }
-        global_row_offset = page_end;
     }
     Ok(result)
 }
 
+#[derive(Debug)]
+struct PageCacheMiss {
+    page_idx: usize,
+    cache_key: PageDataCacheKey,
+    initialization: PageInitialization,
+}
+
+async fn read_page_initialization_buffers(
+    io: &Arc<dyn EncodingsIo>,
+    all_ranges: Vec<Range<u64>>,
+) -> Result<Vec<Bytes>> {
+    // `submit_request` coalesces (and later un-coalesces) in one forward
+    // pass, so submit ranges in file order. Page layouts are not required
+    // to declare their initialization ranges in that order, so retain each
+    // range's original position and restore it before initializing pages.
+    let mut sorted_ranges = all_ranges.into_iter().enumerate().collect::<Vec<_>>();
+    sorted_ranges.sort_by_key(|(_, range)| (range.start, range.end));
+    let sorted_requests = sorted_ranges
+        .iter()
+        .map(|(_, range)| range.clone())
+        .collect::<Vec<_>>();
+    let expected_buffer_count = sorted_requests.len();
+    let sorted_buffers = if sorted_requests.is_empty() {
+        Vec::new()
+    } else {
+        io.submit_request(sorted_requests, 0).await?
+    };
+    if sorted_buffers.len() != expected_buffer_count {
+        return Err(Error::invalid_input_source(
+            format!(
+                "Page initialization I/O returned {} buffers for {} ranges",
+                sorted_buffers.len(),
+                expected_buffer_count
+            )
+            .into(),
+        ));
+    }
+    let mut buffers = vec![None; expected_buffer_count];
+    for ((original_idx, _), buffer) in sorted_ranges.into_iter().zip(sorted_buffers) {
+        buffers[original_idx] = Some(buffer);
+    }
+    buffers
+        .into_iter()
+        .map(|buffer| {
+            buffer.ok_or_else(|| Error::internal("Page initialization buffer was not assigned"))
+        })
+        .collect()
+}
+
+async fn cache_initialized_page(
+    cache: Arc<LanceCache>,
+    cache_key: PageDataCacheKey,
+    data: Arc<dyn CachedPageData>,
+) {
+    if data
+        .clone()
+        .as_arc_any()
+        .downcast::<NoCachedPageData>()
+        .is_err()
+    {
+        cache
+            .insert_with_key(&cache_key, Arc::new(CachedPage { data }))
+            .await;
+    }
+}
+
 impl StructuralPrimitiveFieldScheduler {
-    fn initialize_pages<'a>(
-        &'a mut self,
-        requested_ranges: Option<&'a [Range<u64>]>,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        let cache = context.cache().clone();
-        let column_index = self.column_index;
-        let page_view = self.page_view;
-
-        async move {
-            let page_mappings = match requested_ranges {
-                None => self
-                    .page_schedulers
-                    .iter()
-                    .enumerate()
-                    .map(|(page_idx, page)| PageRangeMapping {
-                        page_idx,
-                        ranges_in_page: vec![0..page.num_rows],
-                    })
-                    .collect(),
-                Some(ranges) => map_ranges_to_pages(&self.page_schedulers, ranges)?,
+    async fn find_cache_misses(
+        &mut self,
+        page_mappings: Vec<PageRangeMapping>,
+        cache: &Arc<LanceCache>,
+    ) -> Result<Vec<PageCacheMiss>> {
+        // Serve cache hits in place; the rest are misses we must read.
+        let mut misses = Vec::with_capacity(page_mappings.len());
+        for mapping in page_mappings {
+            let page_idx = mapping.page_idx;
+            let page = &self.page_schedulers[page_idx];
+            if !page.scheduler.needs_initialization() {
+                continue;
+            }
+            let page_index = u32::try_from(page.page_index).map_err(|_| {
+                Error::invalid_input_source(
+                    format!("Page index does not fit u32: {}", page.page_index).into(),
+                )
+            })?;
+            let cache_key = PageDataCacheKey {
+                column_index: self.column_index,
+                page_index,
+                view: page.scheduler.cache_view(),
+                target_data_type_tag: self.target_data_type_tag.clone(),
             };
-
-            // Serve cache hits in place; the rest are misses we must read.
-            let mut misses = Vec::new();
-            for mapping in page_mappings {
-                let page_idx = mapping.page_idx;
-                let page = &self.page_schedulers[page_idx];
-                if !page
+            if let Some(cached_page) = cache.get_with_key(&cache_key).await {
+                match self.page_schedulers[page_idx]
                     .scheduler
-                    .needs_initialization(&mapping.ranges_in_page)?
+                    .try_load(&cached_page.data)
                 {
-                    continue;
-                }
-                let page_index = u32::try_from(page.page_index).map_err(|_| {
-                    Error::invalid_input_source(
-                        format!("Page index does not fit u32: {}", page.page_index).into(),
-                    )
-                })?;
-                let cache_key = PageDataCacheKey {
-                    column_index,
-                    page_index,
-                    view: page_view,
-                };
-                if let Some(cached_page) = cache.get_with_key(&cache_key).await {
-                    match self.page_schedulers[page_idx]
-                        .scheduler
-                        .try_load(&cached_page.data)
-                    {
-                        Ok(()) => continue,
-                        Err(error) => {
-                            debug!("Replacing invalid cached page data for {cache_key:?}: {error}");
-                        }
+                    Ok(()) => continue,
+                    Err(error) => {
+                        debug!("Replacing invalid cached page data for {cache_key:?}: {error}");
                     }
                 }
-                misses.push((page_idx, cache_key));
             }
-            if misses.is_empty() {
-                return Ok(());
-            }
-
-            // Concatenate the misses' metadata ranges into one request so adjacent
-            // ranges coalesce into shared GETs instead of one request per page.
-            let mut all_ranges = Vec::new();
-            let mut per_page_counts = Vec::with_capacity(misses.len());
-            for (page_idx, _) in &misses {
-                let ranges = self.page_schedulers[*page_idx].scheduler.init_ranges()?;
-                per_page_counts.push(ranges.len());
-                all_ranges.extend(ranges);
-            }
-
-            // `submit_request` coalesces (and later un-coalesces) in one forward
-            // pass, so submit ranges in file order. Page layouts are not required
-            // to declare their initialization ranges in that order, so retain each
-            // range's original position and restore it before initializing pages.
-            let mut sorted_ranges = all_ranges.iter().cloned().enumerate().collect::<Vec<_>>();
-            sorted_ranges.sort_by(|(_, left), (_, right)| {
-                (left.start, left.end).cmp(&(right.start, right.end))
+            let initialization = self.page_schedulers[page_idx].scheduler.init_layout()?;
+            misses.push(PageCacheMiss {
+                page_idx,
+                cache_key,
+                initialization,
             });
-            let sorted_requests = sorted_ranges
-                .iter()
-                .map(|(_, range)| range.clone())
-                .collect::<Vec<_>>();
-            let expected_buffer_count = sorted_requests.len();
-            let sorted_buffers = if sorted_requests.is_empty() {
-                Vec::new()
-            } else {
-                context.io().submit_request(sorted_requests, 0).await?
-            };
-            if sorted_buffers.len() != expected_buffer_count {
+        }
+        Ok(misses)
+    }
+
+    fn initialization_ranges(misses: &[PageCacheMiss]) -> Vec<Range<u64>> {
+        let num_ranges = misses
+            .iter()
+            .map(|miss| miss.initialization.num_required_ranges())
+            .sum();
+        let mut all_ranges = Vec::with_capacity(num_ranges);
+        for miss in misses {
+            all_ranges.extend(miss.initialization.required_ranges().cloned());
+        }
+        all_ranges
+    }
+
+    async fn initialize_cache_misses(
+        &mut self,
+        misses: Vec<PageCacheMiss>,
+        buffers: Vec<Bytes>,
+        cache: Arc<LanceCache>,
+        io: &Arc<dyn EncodingsIo>,
+    ) -> Result<()> {
+        let mut buffers = buffers.into_iter();
+
+        // Initialize each missing page from its slice of the buffers, in file
+        // order. `init_from_buffers` can perform further I/O (e.g. loading blob
+        // descriptions), so run pages concurrently; peel disjoint `&mut` page
+        // borrows off the slice to satisfy the borrow checker without a lookup
+        // table.
+        let mut tail = self.page_schedulers.as_mut_slice();
+        let mut next_page = 0;
+        let mut page_inits = FuturesOrdered::new();
+        for miss in misses {
+            let PageCacheMiss {
+                page_idx,
+                cache_key,
+                initialization,
+            } = miss;
+            let relative_idx = page_idx
+                .checked_sub(next_page)
+                .ok_or_else(|| Error::internal("Page initialization indices are not ordered"))?;
+            if relative_idx >= tail.len() {
+                return Err(Error::internal(format!(
+                    "Page initialization index {page_idx} is out of bounds"
+                )));
+            }
+            let (_, rest) = tail.split_at_mut(relative_idx);
+            let (page, rest) = rest.split_first_mut().ok_or_else(|| {
+                Error::internal(format!(
+                    "Page initialization index {page_idx} is out of bounds"
+                ))
+            })?;
+            tail = rest;
+            next_page = page_idx + 1;
+
+            let count = initialization.num_required_ranges();
+            let page_buffers = buffers.by_ref().take(count).collect::<Vec<_>>();
+            if page_buffers.len() != count {
                 return Err(Error::invalid_input_source(
                     format!(
-                        "Page initialization I/O returned {} buffers for {} ranges",
-                        sorted_buffers.len(),
-                        expected_buffer_count
+                        "Page {page_idx} received {} initialization buffers, expected {count}",
+                        page_buffers.len()
                     )
                     .into(),
                 ));
             }
-            let mut buffers = vec![None; all_ranges.len()];
-            for ((original_idx, _), buffer) in sorted_ranges.into_iter().zip(sorted_buffers) {
-                buffers[original_idx] = Some(buffer);
-            }
-            let buffers = buffers
-                .into_iter()
-                .map(|buffer| {
-                    buffer.ok_or_else(|| {
-                        Error::internal("Page initialization buffer was not assigned")
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let mut buffers = buffers.into_iter();
-
-            // Initialize each missing page from its slice of the buffers, in file
-            // order. `init_from_buffers` can perform further I/O (e.g. loading blob
-            // descriptions), so run pages concurrently; peel disjoint `&mut` page
-            // borrows off the slice to satisfy the borrow checker without a lookup
-            // table.
-            let io = context.io();
-            let mut tail = self.page_schedulers.as_mut_slice();
-            let mut next_page = 0;
-            let mut page_inits = FuturesOrdered::new();
-            for ((page_idx, cache_key), count) in misses.into_iter().zip(per_page_counts) {
-                let relative_idx = page_idx.checked_sub(next_page).ok_or_else(|| {
-                    Error::internal("Page initialization indices are not ordered")
-                })?;
-                if relative_idx >= tail.len() {
-                    return Err(Error::internal(format!(
-                        "Page initialization index {page_idx} is out of bounds"
-                    )));
-                }
-                let (_, rest) = tail.split_at_mut(relative_idx);
-                let (page, rest) = rest.split_first_mut().ok_or_else(|| {
-                    Error::internal(format!(
-                        "Page initialization index {page_idx} is out of bounds"
-                    ))
-                })?;
-                tail = rest;
-                next_page = page_idx + 1;
-
-                let page_buffers = buffers.by_ref().take(count).collect::<Vec<_>>();
-                if page_buffers.len() != count {
-                    return Err(Error::invalid_input_source(
-                        format!(
-                            "Page {page_idx} received {} initialization buffers, expected {count}",
-                            page_buffers.len()
-                        )
-                        .into(),
-                    ));
-                }
-                let init = page.scheduler.init_from_buffers(page_buffers, io);
-                let cache = cache.clone();
-                page_inits.push_back(async move {
-                    let cached = init.await?;
-                    if cached
-                        .clone()
-                        .as_arc_any()
-                        .downcast::<NoCachedPageData>()
-                        .is_err()
-                    {
-                        cache
-                            .insert_with_key(&cache_key, Arc::new(CachedPage { data: cached }))
-                            .await;
-                    }
-                    Ok::<(), Error>(())
-                });
-            }
-            if buffers.next().is_some() {
-                return Err(Error::invalid_input_source(
-                    "Page initialization returned unassigned buffers".into(),
-                ));
-            }
-
-            page_inits.try_collect::<Vec<()>>().await?;
-            Ok(())
+            let page_buffers = initialization.with_buffers(page_buffers)?;
+            let cache = cache.clone();
+            let scheduler = &mut page.scheduler;
+            page_inits.push_back(async move {
+                let cached = scheduler.init_from_buffers(page_buffers, io).await?;
+                scheduler.try_load(&cached)?;
+                cache_initialized_page(cache, cache_key, cached).await;
+                Ok::<(), Error>(())
+            });
         }
-        .boxed()
+        if buffers.next().is_some() {
+            return Err(Error::invalid_input_source(
+                "Page initialization returned unassigned buffers".into(),
+            ));
+        }
+
+        page_inits.try_collect::<Vec<()>>().await?;
+        Ok(())
+    }
+
+    async fn initialize_pages(
+        &mut self,
+        requested_ranges: Option<&[Range<u64>]>,
+        context: &SchedulerContext,
+    ) -> Result<()> {
+        let page_mappings = match requested_ranges {
+            None => self
+                .page_schedulers
+                .iter()
+                .enumerate()
+                .map(|(page_idx, page)| PageRangeMapping {
+                    page_idx,
+                    ranges_in_page: vec![0..(page.row_range.end - page.row_range.start)],
+                })
+                .collect(),
+            Some(ranges) => map_ranges_to_pages(&self.page_schedulers, ranges)?,
+        };
+
+        let cache = context.cache().clone();
+        let misses = self.find_cache_misses(page_mappings, &cache).await?;
+        if misses.is_empty() {
+            return Ok(());
+        }
+
+        // Concatenate the misses' metadata ranges into one request so adjacent
+        // ranges coalesce into shared GETs instead of one request per page.
+        let all_ranges = Self::initialization_ranges(&misses);
+        let buffers = read_page_initialization_buffers(context.io(), all_ranges).await?;
+        self.initialize_cache_misses(misses, buffers, cache, context.io())
+            .await
     }
 }
 
 impl StructuralFieldScheduler for StructuralPrimitiveFieldScheduler {
     fn initialize<'a>(
         &'a mut self,
+        requested_ranges: Option<&'a [Range<u64>]>,
         _filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
-        self.initialize_pages(None, context)
-    }
-
-    fn initialize_ranges<'a>(
-        &'a mut self,
-        requested_ranges: &'a [Range<u64>],
-        _filter: &'a FilterExpression,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        self.initialize_pages(Some(requested_ranges), context)
+        self.initialize_pages(requested_ranges, context).boxed()
     }
 
     fn schedule_ranges<'a>(
@@ -7578,10 +7685,10 @@ mod tests {
         FullZipDecodeTaskItem, FullZipReadSource, FullZipRepIndexDetails, FullZipScheduler,
         LazyLevels, LevelCodec, LevelCursor, LevelPlan, MiniBlockChunk, MiniBlockChunkIndex,
         MiniBlockCompressed, MiniblockChunkSize, PageCacheView, PageDataCacheKey,
-        PageInfoAndScheduler, PerValueDataBlock, PerValueDecompressor, PreambleAction,
-        RunEndsBuilder, RunPosition, RunStorage, SimpleAllNullScheduler, StructuralPageScheduler,
-        StructuralPrimitiveFieldScheduler, VariableFullZipDecoder, dense_levels_from_block,
-        map_ranges_to_pages, validate_complex_all_null_levels,
+        PageInfoAndScheduler, PageInitialization, PerValueDataBlock, PerValueDecompressor,
+        PreambleAction, RunEndsBuilder, RunPosition, RunStorage, SimpleAllNullScheduler,
+        StructuralPageScheduler, StructuralPrimitiveFieldScheduler, VariableFullZipDecoder,
+        dense_levels_from_block, map_ranges_to_pages, validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::{
@@ -7705,7 +7812,11 @@ mod tests {
             dictionaries,
             &TestCases::default()
                 .with_structural_encodings()
-                .with_page_sizes(vec![4096]),
+                .with_page_sizes(vec![1])
+                .with_range(0..1)
+                .with_range(1..2)
+                .with_indices(vec![0])
+                .with_indices(vec![1]),
             HashMap::new(),
         )
         .await;
@@ -9040,11 +9151,13 @@ mod tests {
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
+        let initialization = scheduler.init_layout().unwrap();
         assert!(
-            scheduler.init_ranges().unwrap().is_empty(),
+            initialization.required_ranges().next().is_none(),
             "FullZip should not request any ranges when caching is disabled"
         );
-        let cached_data = scheduler.init_from_buffers(vec![], &io_dyn).await.unwrap();
+        let buffers = initialization.with_buffers(vec![]).unwrap();
+        let cached_data = scheduler.init_from_buffers(buffers, &io_dyn).await.unwrap();
 
         assert!(
             cached_data
@@ -9073,7 +9186,8 @@ mod tests {
 
         use super::{
             CachedPage, CachedPageData, Error, PageCacheView, PageDataCacheKey,
-            PageInfoAndScheduler, PageLoadTask, StructuralPrimitiveFieldScheduler,
+            PageInfoAndScheduler, PageInitialization, PageInitializationBuffers, PageLoadTask,
+            StructuralPrimitiveFieldScheduler,
         };
         use crate::EncodingsIo;
         use crate::decoder::{FilterExpression, SchedulerContext, StructuralFieldScheduler};
@@ -9113,17 +9227,18 @@ mod tests {
             meta_range: Range<u64>,
         }
         impl StructuralPageScheduler for FakePageScheduler {
-            fn init_ranges(&self) -> crate::Result<Vec<Range<u64>>> {
-                Ok(vec![self.meta_range.clone()])
+            fn init_layout(&self) -> crate::Result<PageInitialization> {
+                Ok(PageInitialization::new([Some(self.meta_range.clone())]))
             }
             fn init_from_buffers<'a>(
                 &'a mut self,
-                buffers: Vec<bytes::Bytes>,
+                buffers: PageInitializationBuffers,
                 _io: &Arc<dyn EncodingsIo>,
             ) -> BoxFuture<'a, crate::Result<Arc<dyn CachedPageData>>> {
-                assert_eq!(buffers.len(), 1, "each page gets exactly its own range");
+                let [buffer] = buffers.try_into_array("fake").unwrap();
+                let buffer = buffer.unwrap();
                 assert_eq!(
-                    &buffers[0][..8],
+                    &buffer[..8],
                     &self.meta_range.start.to_le_bytes(),
                     "each page gets the buffer for its own range"
                 );
@@ -9155,7 +9270,7 @@ mod tests {
         let page_schedulers = (0..NUM_PAGES)
             .map(|i| PageInfoAndScheduler {
                 page_index: i as usize,
-                num_rows: 100,
+                row_range: (i * 100)..((i + 1) * 100),
                 scheduler: Box::new(FakePageScheduler {
                     meta_range: (i * STRIDE)..(i * STRIDE + META_LEN),
                 }),
@@ -9164,7 +9279,7 @@ mod tests {
         let mut scheduler = StructuralPrimitiveFieldScheduler {
             page_schedulers,
             column_index: 0,
-            page_view: super::PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
 
         let io = Arc::new(RecordingScheduler {
@@ -9172,12 +9287,12 @@ mod tests {
         });
         // A no-op cache always misses, so every page is a miss.
         let cache = Arc::new(lance_core::cache::LanceCache::no_cache());
-        let context = SchedulerContext::new(io.clone(), cache);
+        let context = SchedulerContext::new(io.clone(), cache.clone());
 
         // `None` requests every page; against an always-miss cache that's an
         // N-page miss.
         let filter = FilterExpression::no_filter();
-        scheduler.initialize(&filter, &context).await.unwrap();
+        scheduler.initialize(None, &filter, &context).await.unwrap();
 
         {
             let requests = io.requests.lock().unwrap();
@@ -9194,11 +9309,17 @@ mod tests {
         }
 
         io.requests.lock().unwrap().clear();
+        let cache_misses_before = cache.stats().await.misses;
         let requested_ranges = Arc::<[Range<u64>]>::from([150..151, 6_350..6_351]);
         scheduler
-            .initialize_ranges(&requested_ranges, &filter, &context)
+            .initialize(Some(&requested_ranges), &filter, &context)
             .await
             .unwrap();
+        assert_eq!(
+            cache.stats().await.misses - cache_misses_before,
+            2,
+            "range-scoped initialization must only look up touched pages"
+        );
 
         {
             let requests = io.requests.lock().unwrap();
@@ -9219,6 +9340,7 @@ mod tests {
             column_index: 9,
             page_index: 0,
             view: PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
         cache
             .insert_with_key(
@@ -9231,17 +9353,17 @@ mod tests {
         let mut recovering_scheduler = StructuralPrimitiveFieldScheduler {
             page_schedulers: vec![PageInfoAndScheduler {
                 page_index: 0,
-                num_rows: 100,
+                row_range: 0..100,
                 scheduler: Box::new(FakePageScheduler {
                     meta_range: 0..META_LEN,
                 }),
             }],
             column_index: 9,
-            page_view: PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
         let recovering_context = SchedulerContext::new(io.clone(), cache.clone());
         recovering_scheduler
-            .initialize(&filter, &recovering_context)
+            .initialize(None, &filter, &recovering_context)
             .await
             .unwrap();
         assert_eq!(io.requests.lock().unwrap().as_slice(), &[vec![0..META_LEN]]);
@@ -9250,16 +9372,16 @@ mod tests {
         let mut warm_scheduler = StructuralPrimitiveFieldScheduler {
             page_schedulers: vec![PageInfoAndScheduler {
                 page_index: 0,
-                num_rows: 100,
+                row_range: 0..100,
                 scheduler: Box::new(FakePageScheduler {
                     meta_range: 0..META_LEN,
                 }),
             }],
             column_index: 9,
-            page_view: PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
         warm_scheduler
-            .initialize(&filter, &recovering_context)
+            .initialize(None, &filter, &recovering_context)
             .await
             .unwrap();
         assert!(
@@ -9271,24 +9393,24 @@ mod tests {
             page_schedulers: vec![
                 PageInfoAndScheduler {
                     page_index: 0,
-                    num_rows: 100,
+                    row_range: 0..100,
                     scheduler: Box::new(FakePageScheduler {
                         meta_range: STRIDE..(STRIDE + META_LEN),
                     }),
                 },
                 PageInfoAndScheduler {
                     page_index: 1,
-                    num_rows: 100,
+                    row_range: 100..200,
                     scheduler: Box::new(FakePageScheduler {
                         meta_range: 0..META_LEN,
                     }),
                 },
             ],
             column_index: 0,
-            page_view: super::PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
         out_of_order_scheduler
-            .initialize(&filter, &context)
+            .initialize(None, &filter, &context)
             .await
             .unwrap();
         assert_eq!(
@@ -9299,7 +9421,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_cache_key_distinguishes_page_and_view() {
+    async fn page_cache_key_distinguishes_page_view_and_target_type() {
         let cache = lance_core::cache::LanceCache::with_capacity(4 * 1024);
         let cases = [
             (
@@ -9307,6 +9429,7 @@ mod tests {
                     column_index: 7,
                     page_index: 0,
                     view: PageCacheView::Native,
+                    target_data_type_tag: Arc::from("Boolean"),
                 },
                 10,
             ),
@@ -9315,6 +9438,7 @@ mod tests {
                     column_index: 7,
                     page_index: 1,
                     view: PageCacheView::Native,
+                    target_data_type_tag: Arc::from("Boolean"),
                 },
                 11,
             ),
@@ -9322,7 +9446,17 @@ mod tests {
                 PageDataCacheKey {
                     column_index: 7,
                     page_index: 0,
+                    view: PageCacheView::Native,
+                    target_data_type_tag: Arc::from("UInt8"),
+                },
+                12,
+            ),
+            (
+                PageDataCacheKey {
+                    column_index: 7,
+                    page_index: 0,
                     view: PageCacheView::BlobDescriptor,
+                    target_data_type_tag: Arc::from("Struct"),
                 },
                 20,
             ),
@@ -9331,6 +9465,7 @@ mod tests {
                     column_index: 7,
                     page_index: 0,
                     view: PageCacheView::BlobPayload,
+                    target_data_type_tag: Arc::from("LargeBinary"),
                 },
                 21,
             ),
@@ -9365,11 +9500,11 @@ mod tests {
         let mut scheduler = StructuralPrimitiveFieldScheduler {
             page_schedulers: vec![PageInfoAndScheduler {
                 page_index: 0,
-                num_rows: 10,
+                row_range: 0..10,
                 scheduler: Box::new(SimpleAllNullScheduler::default()),
             }],
             column_index: 3,
-            page_view: PageCacheView::Native,
+            target_data_type_tag: Arc::from("test"),
         };
         let io: Arc<dyn crate::EncodingsIo> =
             Arc::new(SimulatedScheduler::new(bytes::Bytes::new()));
@@ -9377,7 +9512,7 @@ mod tests {
         let context = SchedulerContext::new(io, cache.clone());
 
         scheduler
-            .initialize(&FilterExpression::no_filter(), &context)
+            .initialize(None, &FilterExpression::no_filter(), &context)
             .await
             .unwrap();
 
@@ -9385,11 +9520,41 @@ mod tests {
     }
 
     #[test]
+    fn page_initialization_preserves_optional_buffer_slots() {
+        let initialization = PageInitialization::new([None, Some(20..22), None, Some(10..11)]);
+        assert_eq!(
+            initialization
+                .required_ranges()
+                .cloned()
+                .collect::<Vec<_>>(),
+            [20..22, 10..11]
+        );
+
+        let buffers = initialization
+            .with_buffers(vec![
+                bytes::Bytes::from_static(b"ab"),
+                bytes::Bytes::from_static(b"c"),
+            ])
+            .unwrap();
+        let [first, second, third, fourth] = buffers.try_into_array("test").unwrap();
+        assert!(first.is_none());
+        assert_eq!(second.unwrap(), bytes::Bytes::from_static(b"ab"));
+        assert!(third.is_none());
+        assert_eq!(fourth.unwrap(), bytes::Bytes::from_static(b"c"));
+
+        let error = PageInitialization::new([Some(0..1)])
+            .with_buffers(Vec::new())
+            .unwrap_err();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("1 declared ranges"));
+    }
+
+    #[test]
     fn page_range_mapping_validates_and_splits_ranges() {
         let pages = (0..3)
             .map(|page_index| PageInfoAndScheduler {
                 page_index,
-                num_rows: 10,
+                row_range: (page_index as u64 * 10)..((page_index as u64 + 1) * 10),
                 scheduler: Box::new(SimpleAllNullScheduler::default())
                     as Box<dyn StructuralPageScheduler>,
             })
@@ -9520,7 +9685,11 @@ mod tests {
         };
 
         let io_dyn: Arc<dyn crate::EncodingsIo> = io.clone();
-        let ranges = scheduler.init_ranges().unwrap();
+        let initialization = scheduler.init_layout().unwrap();
+        let ranges = initialization
+            .required_ranges()
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
             ranges,
             vec![rep_start..(rep_start + (rows_in_page + 1) * bytes_per_value)]
@@ -9528,13 +9697,17 @@ mod tests {
         // The field scheduler fetches the declared ranges (coalesced across all
         // pages) and hands the bytes back to the page to finish initialization.
         let buffers = io_dyn.submit_request(ranges, 0).await.unwrap();
+        let buffers = initialization.with_buffers(buffers).unwrap();
         let cached_data = scheduler.init_from_buffers(buffers, &io_dyn).await.unwrap();
         assert!(
             cached_data
+                .clone()
                 .as_arc_any()
                 .downcast_ref::<FullZipCacheableState>()
                 .is_some()
         );
+        assert!(scheduler.cached_state.is_none());
+        scheduler.try_load(&cached_data).unwrap();
         assert!(scheduler.cached_state.is_some());
         assert_eq!(
             io.requests(),
@@ -10684,15 +10857,25 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys())]
-    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys())]
+    #[case::hand_built(hand_built_dictionary_with_out_of_range_null_keys(), 1)]
+    #[case::concatenated(concatenated_dictionary_with_out_of_range_null_keys(), 8)]
     #[tokio::test]
-    async fn test_dictionary_out_of_range_null_keys_round_trip(#[case] dictionary: ArrayRef) {
+    async fn test_dictionary_out_of_range_null_keys_round_trip(
+        #[case] dictionary: ArrayRef,
+        #[case] split_at: usize,
+    ) {
+        let num_rows = dictionary.len();
+        let dictionaries = vec![
+            dictionary.slice(0, split_at),
+            dictionary.slice(split_at, num_rows - split_at),
+        ];
         let test_cases = TestCases::default()
             .with_encoding(TestEncoding::StructuralU32)
-            .with_page_sizes(vec![4096]);
+            .with_page_sizes(vec![1])
+            .with_range(split_at as u64..num_rows as u64)
+            .with_indices(vec![split_at as u64]);
 
-        check_round_trip_encoding_of_data(vec![dictionary], &test_cases, HashMap::new()).await;
+        check_round_trip_encoding_of_data(dictionaries, &test_cases, HashMap::new()).await;
     }
 
     #[test]

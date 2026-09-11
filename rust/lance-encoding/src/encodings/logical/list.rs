@@ -120,23 +120,14 @@ impl StructuralFieldScheduler for StructuralListScheduler {
 
     fn initialize<'a>(
         &'a mut self,
-        filter: &'a FilterExpression,
-        context: &'a SchedulerContext,
-    ) -> BoxFuture<'a, Result<()>> {
-        self.child.initialize(filter, context)
-    }
-
-    fn initialize_ranges<'a>(
-        &'a mut self,
-        requested_ranges: &'a [Range<u64>],
+        requested_ranges: Option<&'a [Range<u64>]>,
         filter: &'a FilterExpression,
         context: &'a SchedulerContext,
     ) -> BoxFuture<'a, Result<()>> {
         // The child (items) column is scheduled with the same top-level row
         // ranges (see `schedule_ranges`); the page repetition index maps those
         // rows to items, so forward the ranges unchanged.
-        self.child
-            .initialize_ranges(requested_ranges, filter, context)
+        self.child.initialize(requested_ranges, filter, context)
     }
 }
 

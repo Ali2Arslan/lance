@@ -518,7 +518,7 @@ async fn test_decode(
         Arc::<DecoderPlugins>::default(),
         io,
         cache,
-        requested_ranges,
+        requested_ranges.as_deref(),
         &FilterExpression::no_filter(),
         &DecoderConfig::default(),
     )
