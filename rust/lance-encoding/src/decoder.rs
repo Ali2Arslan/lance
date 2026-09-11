@@ -212,7 +212,6 @@
 //!  * The "batch overhead" is very small in Lance compared to other formats because it has no
 //!    relation to the way the data is stored.
 
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Once, OnceLock};
@@ -2107,10 +2106,10 @@ impl RequestedRows {
         self
     }
 
-    fn to_ranges(&self) -> Result<Cow<'_, [Range<u64>]>> {
+    fn into_ranges(self) -> Result<Vec<Range<u64>>> {
         match self {
-            Self::Ranges(ranges) => Ok(Cow::Borrowed(ranges)),
-            Self::Indices(indices) => Ok(Cow::Owned(Self::indices_to_ranges(indices)?)),
+            Self::Ranges(ranges) => Ok(ranges),
+            Self::Indices(indices) => Self::indices_to_ranges(&indices),
         }
     }
 
@@ -2323,13 +2322,14 @@ async fn create_scheduler_decoder(
     config: SchedulerDecoderConfig,
 ) -> Result<BoxStream<'static, ReadBatchTask>> {
     let num_rows = requested_rows.num_rows();
+    let is_range_request = matches!(&requested_rows, RequestedRows::Ranges(_));
 
     let is_structural = column_infos[0].is_structural();
     let mode = std::env::var(ENV_LANCE_STRUCTURAL_BATCH_DECODE_SPAWN_MODE);
     let spawn_structural_batch_decode_tasks = match mode.ok().as_deref() {
         Some("always") => true,
         Some("never") => false,
-        _ => matches!(requested_rows, RequestedRows::Ranges(_)),
+        _ => is_range_request,
     };
 
     let (tx, rx) = mpsc::unbounded_channel();
@@ -2350,7 +2350,7 @@ async fn create_scheduler_decoder(
     // happens as part of this call and should be parallelized if reading
     // multiple files.  We pass the rows we are about to schedule so that the
     // structural path only initializes the pages those rows touch.
-    let requested_ranges = requested_rows.to_ranges()?;
+    let requested_ranges = requested_rows.into_ranges()?;
     let mut decode_scheduler = DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
@@ -2360,7 +2360,7 @@ async fn create_scheduler_decoder(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
-        Some(requested_ranges.as_ref()),
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     )
@@ -2377,28 +2377,14 @@ async fn create_scheduler_decoder(
         .unwrap_or_else(|| num_rows <= inline_scheduling_threshold());
 
     if inline_scheduling {
-        match requested_rows {
-            RequestedRows::Ranges(ranges) => {
-                decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-            }
-            RequestedRows::Indices(indices) => {
-                decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-            }
-        }
+        decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
         Ok(decode_stream)
     } else {
         // Spawn the (still synchronous) scheduling work so that decoder
         // messages can stream into the channel while the consumer is
         // already pulling from the decode stream.
         let scheduling = async move {
-            match requested_rows {
-                RequestedRows::Ranges(ranges) => {
-                    decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-                }
-                RequestedRows::Indices(indices) => {
-                    decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-                }
-            }
+            decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io)
         };
         let scheduler_handle = tokio::task::spawn(scheduling);
         Ok(check_scheduler_on_drop(decode_stream, scheduler_handle))
@@ -2494,7 +2480,7 @@ pub fn schedule_and_decode_blocking(
     // Initialize the scheduler.  This is still "asynchronous" but we run it with a current-thread
     // runtime.  Pass the rows we are about to schedule so the structural path
     // only initializes the pages those rows touch.
-    let requested_ranges = requested_rows.to_ranges()?;
+    let requested_ranges = requested_rows.into_ranges()?;
     let mut decode_scheduler = WAITER_RT.block_on(DecodeBatchScheduler::try_new_with_ranges(
         target_schema.as_ref(),
         &column_indices,
@@ -2504,20 +2490,13 @@ pub fn schedule_and_decode_blocking(
         config.decoder_plugins,
         config.io.clone(),
         config.cache,
-        Some(requested_ranges.as_ref()),
+        Some(&requested_ranges),
         &filter,
         &config.decoder_config,
     ))?;
 
     // Schedule the requested rows
-    match requested_rows {
-        RequestedRows::Ranges(ranges) => {
-            decode_scheduler.schedule_ranges(&ranges, &filter, tx, config.io)
-        }
-        RequestedRows::Indices(indices) => {
-            decode_scheduler.schedule_take(&indices, &filter, tx, config.io)
-        }
-    }
+    decode_scheduler.schedule_ranges(&requested_ranges, &filter, tx, config.io);
 
     // Drain the scheduler queue into a vec of decode messages
     let mut messages = Vec::new();
@@ -3120,15 +3099,17 @@ mod tests {
     #[test]
     fn requested_row_indices_convert_to_checked_ranges() {
         let requested_rows = RequestedRows::Indices(vec![1, 2, 5, 8, 9]);
-        let ranges = requested_rows.to_ranges().unwrap();
-        assert_eq!(ranges.as_ref(), [1..3, 5..6, 8..10]);
+        let ranges = requested_rows.into_ranges().unwrap();
+        assert_eq!(ranges, [1..3, 5..6, 8..10]);
 
-        let error = RequestedRows::Indices(vec![2, 2]).to_ranges().unwrap_err();
+        let error = RequestedRows::Indices(vec![2, 2])
+            .into_ranges()
+            .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("not strictly increasing"));
 
         let error = RequestedRows::Indices(vec![u64::MAX])
-            .to_ranges()
+            .into_ranges()
             .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }));
         assert!(error.to_string().contains("u64::MAX"));

@@ -4566,20 +4566,16 @@ struct PageRangeMapping {
     ranges_in_page: Vec<Range<u64>>,
 }
 
-/// Maps global row `ranges` onto a column's pages, yielding the page-local
-/// sub-ranges for every page any range touches.
+/// Visits every intersection between ordered row ranges and ordered pages.
 ///
-/// This is the single place that converts global rows to (page, page-local
-/// rows): `initialize` consumes it to learn which pages to read, and the
-/// scheduling job consumes it to learn what to read from each. `ranges` must be
-/// ascending and non-overlapping (the precondition `schedule_ranges` relies on).
-///
-/// Each range binary-searches its first overlapping page and then walks only
-/// the pages it touches, avoiding a scan through pages between sparse ranges.
-fn map_ranges_to_pages(
+/// Each range binary-searches its first overlapping page and then visits only
+/// the pages it touches. For `R` ranges, `P` pages, and `T` intersections this
+/// takes `O(R log P + T)` time without scanning sparse gaps.
+fn for_each_page_range(
     pages: &[PageInfoAndScheduler],
     ranges: &[Range<u64>],
-) -> Result<Vec<PageRangeMapping>> {
+    mut visit: impl FnMut(usize, Range<u64>),
+) -> Result<()> {
     for (range_idx, range) in ranges.iter().enumerate() {
         if range.start > range.end {
             return Err(Error::invalid_input_source(
@@ -4603,7 +4599,6 @@ fn map_ranges_to_pages(
         }
     }
 
-    let mut result: Vec<PageRangeMapping> = Vec::new();
     for range in ranges {
         let mut page_idx = pages.partition_point(|page| page.row_range.end <= range.start);
         while let Some(page) = pages.get(page_idx) {
@@ -4613,20 +4608,49 @@ fn map_ranges_to_pages(
             let start_in_page = range.start.max(page.row_range.start) - page.row_range.start;
             let end_in_page = range.end.min(page.row_range.end) - page.row_range.start;
             if start_in_page < end_in_page {
-                if let Some(mapping) = result.last_mut()
-                    && mapping.page_idx == page_idx
-                {
-                    mapping.ranges_in_page.push(start_in_page..end_in_page);
-                } else {
-                    result.push(PageRangeMapping {
-                        page_idx,
-                        ranges_in_page: vec![start_in_page..end_in_page],
-                    });
-                }
+                visit(page_idx, start_in_page..end_in_page);
             }
             page_idx += 1;
         }
     }
+    Ok(())
+}
+
+/// Maps global row `ranges` onto a column's pages, yielding the page-local
+/// sub-ranges for every page any range touches.
+///
+/// `ranges` must be ascending and non-overlapping (the precondition
+/// `schedule_ranges` relies on).
+fn map_ranges_to_pages(
+    pages: &[PageInfoAndScheduler],
+    ranges: &[Range<u64>],
+) -> Result<Vec<PageRangeMapping>> {
+    let mut result: Vec<PageRangeMapping> = Vec::with_capacity(ranges.len().min(pages.len()));
+    for_each_page_range(pages, ranges, |page_idx, range_in_page| {
+        if let Some(mapping) = result.last_mut()
+            && mapping.page_idx == page_idx
+        {
+            mapping.ranges_in_page.push(range_in_page);
+        } else {
+            result.push(PageRangeMapping {
+                page_idx,
+                ranges_in_page: vec![range_in_page],
+            });
+        }
+    })?;
+    Ok(result)
+}
+
+fn pages_overlapping_ranges(
+    pages: &[PageInfoAndScheduler],
+    ranges: &[Range<u64>],
+) -> Result<Vec<usize>> {
+    let mut result = Vec::with_capacity(ranges.len().min(pages.len()));
+    for_each_page_range(pages, ranges, |page_idx, _| {
+        if result.last().copied() != Some(page_idx) {
+            result.push(page_idx);
+        }
+    })?;
     Ok(result)
 }
 
@@ -4646,7 +4670,7 @@ async fn read_page_initialization_buffers(
     // to declare their initialization ranges in that order, so retain each
     // range's original position and restore it before initializing pages.
     let mut sorted_ranges = all_ranges.into_iter().enumerate().collect::<Vec<_>>();
-    sorted_ranges.sort_by_key(|(_, range)| (range.start, range.end));
+    sorted_ranges.sort_unstable_by_key(|(_, range)| (range.start, range.end));
     let sorted_requests = sorted_ranges
         .iter()
         .map(|(_, range)| range.clone())
@@ -4699,13 +4723,12 @@ async fn cache_initialized_page(
 impl StructuralPrimitiveFieldScheduler {
     async fn find_cache_misses(
         &mut self,
-        page_mappings: Vec<PageRangeMapping>,
+        page_indices: impl ExactSizeIterator<Item = usize>,
         cache: &Arc<LanceCache>,
     ) -> Result<Vec<PageCacheMiss>> {
         // Serve cache hits in place; the rest are misses we must read.
-        let mut misses = Vec::with_capacity(page_mappings.len());
-        for mapping in page_mappings {
-            let page_idx = mapping.page_idx;
+        let mut misses = Vec::with_capacity(page_indices.len());
+        for page_idx in page_indices {
             let page = &self.page_schedulers[page_idx];
             if !page.scheduler.needs_initialization() {
                 continue;
@@ -4830,21 +4853,19 @@ impl StructuralPrimitiveFieldScheduler {
         requested_ranges: Option<&[Range<u64>]>,
         context: &SchedulerContext,
     ) -> Result<()> {
-        let page_mappings = match requested_ranges {
-            None => self
-                .page_schedulers
-                .iter()
-                .enumerate()
-                .map(|(page_idx, page)| PageRangeMapping {
-                    page_idx,
-                    ranges_in_page: vec![0..(page.row_range.end - page.row_range.start)],
-                })
-                .collect(),
-            Some(ranges) => map_ranges_to_pages(&self.page_schedulers, ranges)?,
+        let cache = context.cache().clone();
+        let misses = match requested_ranges {
+            None => {
+                let num_pages = self.page_schedulers.len();
+                self.find_cache_misses(0..num_pages, &cache).await?
+            }
+            Some(ranges) => {
+                let page_indices = pages_overlapping_ranges(&self.page_schedulers, ranges)?;
+                self.find_cache_misses(page_indices.into_iter(), &cache)
+                    .await?
+            }
         };
 
-        let cache = context.cache().clone();
-        let misses = self.find_cache_misses(page_mappings, &cache).await?;
         if misses.is_empty() {
             return Ok(());
         }
@@ -7688,7 +7709,8 @@ mod tests {
         PageInfoAndScheduler, PageInitialization, PerValueDataBlock, PerValueDecompressor,
         PreambleAction, RunEndsBuilder, RunPosition, RunStorage, SimpleAllNullScheduler,
         StructuralPageScheduler, StructuralPrimitiveFieldScheduler, VariableFullZipDecoder,
-        dense_levels_from_block, map_ranges_to_pages, validate_complex_all_null_levels,
+        dense_levels_from_block, map_ranges_to_pages, pages_overlapping_ranges,
+        validate_complex_all_null_levels,
     };
     use crate::buffer::LanceBuffer;
     use crate::compression::{
@@ -9568,6 +9590,17 @@ mod tests {
         assert_eq!(mappings[1].ranges_in_page, [0..10]);
         assert_eq!(mappings[2].page_idx, 2);
         assert_eq!(mappings[2].ranges_in_page, [0..2]);
+
+        let sparse_mappings = map_ranges_to_pages(&pages, &[1..2, 3..4, 28..29]).unwrap();
+        assert_eq!(sparse_mappings.len(), 2);
+        assert_eq!(sparse_mappings[0].page_idx, 0);
+        assert_eq!(sparse_mappings[0].ranges_in_page, [1..2, 3..4]);
+        assert_eq!(sparse_mappings[1].page_idx, 2);
+        assert_eq!(sparse_mappings[1].ranges_in_page, [8..9]);
+        assert_eq!(
+            pages_overlapping_ranges(&pages, &[1..2, 3..4, 28..29]).unwrap(),
+            [0, 2]
+        );
 
         for (ranges, expected_message) in [
             (vec![Range { start: 2, end: 1 }], "is reversed"),
