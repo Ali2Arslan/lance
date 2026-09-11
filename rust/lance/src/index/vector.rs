@@ -2253,10 +2253,9 @@ mod tests {
         );
     }
 
-    /// `open_index_file` looks up sizes in `IndexMetadata::file_size_map()` by
-    /// bare file name. This pins that a freshly created HNSW index records both
-    /// the main and auxiliary files under those exact names with nonzero sizes,
-    /// which is what lets the open path skip the HEAD.
+    /// `open_index_file` looks up size hints by bare file name. This pins that a
+    /// freshly created HNSW index records both the main and auxiliary files under
+    /// those exact names with nonzero total and metadata suffix sizes.
     #[tokio::test]
     async fn test_hnsw_index_records_file_sizes() {
         use lance_index::{INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME};
@@ -2303,6 +2302,7 @@ mod tests {
         let indices = dataset.load_indices().await.unwrap();
         let index = indices.iter().find(|idx| idx.name == "hnsw").unwrap();
         let file_sizes = index.file_size_map();
+        let metadata_sizes = index.file_metadata_size_map();
 
         assert!(
             file_sizes.get(INDEX_FILE_NAME).copied().unwrap_or(0) > 0,
@@ -2316,6 +2316,14 @@ mod tests {
                 > 0,
             "manifest should record a nonzero {INDEX_AUXILIARY_FILE_NAME} size, got {file_sizes:?}"
         );
+        for file_name in [INDEX_FILE_NAME, INDEX_AUXILIARY_FILE_NAME] {
+            assert!(
+                metadata_sizes
+                    .get(file_name)
+                    .is_some_and(|metadata_size| metadata_size.get() <= file_sizes[file_name]),
+                "manifest should record a valid metadata suffix for {file_name}, got {metadata_sizes:?}"
+            );
+        }
     }
 
     #[tokio::test]

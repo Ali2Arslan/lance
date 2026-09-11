@@ -62,7 +62,7 @@ pub fn index_files_to_table(
         .map(|f| lance_table::format::IndexFile {
             path: f.path,
             size_bytes: f.size_bytes,
-            file_metadata_size_bytes: None,
+            file_metadata_size_bytes: f.file_metadata_size_bytes,
         })
         .collect()
 }
@@ -80,6 +80,7 @@ pub fn table_files_to_index(
         .map(|f| lance_index_core::scalar::IndexFile {
             path: f.path,
             size_bytes: f.size_bytes,
+            file_metadata_size_bytes: f.file_metadata_size_bytes,
         })
         .collect()
 }

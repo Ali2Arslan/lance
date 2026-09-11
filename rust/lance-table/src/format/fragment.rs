@@ -148,6 +148,27 @@ impl DataFile {
         }
     }
 
+    /// Attach the exact metadata suffix size reported by the file writer.
+    pub fn with_file_metadata_size_bytes(mut self, file_metadata_size_bytes: NonZero<u64>) -> Self {
+        self.file_metadata_size_bytes = Some(file_metadata_size_bytes);
+        self
+    }
+
+    /// Estimate the number of physical columns from manifest column mappings.
+    ///
+    /// The file footer remains authoritative. Counting non-negative entries
+    /// keeps malformed or sparse mapping values from becoming read sizes.
+    pub fn estimated_num_columns(&self) -> Option<NonZero<u32>> {
+        let estimated_num_columns = self
+            .column_indices
+            .iter()
+            .filter(|column_index| **column_index >= 0)
+            .count();
+        u32::try_from(estimated_num_columns)
+            .ok()
+            .and_then(NonZero::new)
+    }
+
     /// Create a new `DataFile` whose fields and column indices will be set later.
     pub fn new_unstarted(path: impl Into<String>, file_version: ConcreteFileVersion) -> Self {
         let (file_major_version, file_minor_version) = file_version.to_data_file_numbers();
@@ -1047,5 +1068,13 @@ mod tests {
         data_file
             .validate(&base_path)
             .expect("validation should allow extra columns without field ids");
+    }
+
+    #[test]
+    fn physical_column_estimate_counts_mappings_not_values() {
+        let mut data_file = DataFile::new_unstarted("foo.lance", ConcreteFileVersion::V2_1);
+        data_file.column_indices = Arc::from([0, -1, 7, i32::MAX, -2]);
+
+        assert_eq!(data_file.estimated_num_columns(), NonZero::new(3));
     }
 }

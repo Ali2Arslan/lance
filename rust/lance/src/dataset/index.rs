@@ -197,7 +197,9 @@ impl LanceIndexStoreExt for LanceIndexStore {
         let object_store = dataset.object_store_for_index(index).await?;
         let store =
             Self::with_format_version(object_store, index_dir, Arc::new(cache), format_version);
-        Ok(store.with_file_sizes(index.file_size_map()))
+        Ok(store
+            .with_file_sizes(index.file_size_map())
+            .with_file_metadata_sizes(index.file_metadata_size_map()))
     }
 }
 

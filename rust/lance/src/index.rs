@@ -73,7 +73,7 @@ use vector::details::{
     vector_details_as_json,
 };
 pub(crate) use vector::details::{vector_index_details, vector_index_details_default};
-use vector::ivf::v2::{IVFIndex, IvfStateEntryBox};
+use vector::ivf::v2::{IVFIndex, IvfFileOpenHints, IvfStateEntryBox};
 use vector::utils::get_vector_type;
 
 mod api;
@@ -396,6 +396,18 @@ pub(crate) async fn build_index_metadata_from_segments(
     prune_stale_segment_coverage(dataset, &mut segments, false, false).await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let known_file_hints = segment
+            .known_files()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| {
+                        file.file_metadata_size_bytes
+                            .map(|size| (file.path.clone(), (file.size_bytes, size)))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let (
             uuid,
             fragment_bitmap,
@@ -427,6 +439,13 @@ pub(crate) async fn build_index_metadata_from_segments(
         let mut files = list_index_files_with_sizes(&dataset.object_store, &index_dir).await?;
         if is_inverted_index {
             retain_committed_inverted_files(&mut files);
+        }
+        for file in &mut files {
+            if let Some((known_size, metadata_size)) = known_file_hints.get(&file.path)
+                && *known_size == file.size_bytes
+            {
+                file.file_metadata_size_bytes = Some(*metadata_size);
+            }
         }
         Ok::<_, Error>(IndexMetadata {
             uuid,
@@ -3042,6 +3061,7 @@ impl DatasetIndexInternalExt for Dataset {
             .join(uuid.to_string())
             .join(INDEX_FILE_NAME);
         let file_sizes = index_meta.file_size_map();
+        let file_metadata_sizes = index_meta.file_metadata_size_map();
         let reader: Arc<dyn Reader> = vector::open_index_file(
             object_store.as_ref(),
             &index_file,
@@ -3114,21 +3134,20 @@ impl DatasetIndexInternalExt for Dataset {
             }
 
             (0, 3) | (2, _) => {
+                let file_open_hints = IvfFileOpenHints::new(file_sizes, file_metadata_sizes);
                 let scheduler = ScanScheduler::new(
                     object_store.clone(),
                     SchedulerConfig::max_bandwidth(&object_store),
                 );
-                let cached_size = file_sizes
-                    .get(INDEX_FILE_NAME)
-                    .map(|&size| CachedFileSize::new(size))
-                    .unwrap_or_else(CachedFileSize::unknown);
+                let cached_size = CachedFileSize::new(file_open_hints.file_size(INDEX_FILE_NAME));
                 let file = scheduler.open_file(&index_file, &cached_size).await?;
-                let reader = lance_file::reader::FileReader::try_open(
+                let reader = lance_file::reader::FileReader::try_open_with_metadata_options(
                     file,
                     None,
                     Default::default(),
                     &self.metadata_cache.file_metadata_cache(&index_file),
                     FileReaderOptions::default(),
+                    file_open_hints.metadata_options(INDEX_FILE_NAME),
                 )
                 .await?;
                 let index_metadata = reader
@@ -3156,7 +3175,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_hints,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3169,7 +3188,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_hints,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3188,7 +3207,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_hints,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3202,7 +3221,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_hints,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3216,7 +3235,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_hints,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3231,7 +3250,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_hints,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3244,7 +3263,7 @@ impl DatasetIndexInternalExt for Dataset {
                                 frag_reuse_index,
                                 self.metadata_cache.as_ref(),
                                 index_cache,
-                                file_sizes,
+                                file_open_hints,
                             )
                             .await?;
                             Ok(wrap_ivf(ivf))
@@ -3259,7 +3278,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_hints,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))
@@ -3273,7 +3292,7 @@ impl DatasetIndexInternalExt for Dataset {
                             frag_reuse_index,
                             self.metadata_cache.as_ref(),
                             index_cache,
-                            file_sizes,
+                            file_open_hints,
                         )
                         .await?;
                         Ok(wrap_ivf(ivf))

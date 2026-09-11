@@ -2851,14 +2851,15 @@ async fn write_root_vector_index_from_auxiliary(
         v2_writer.write_batch(&empty_batch).await?;
     }
 
-    let summary = v2_writer.finish().await?;
+    let result = v2_writer.finish_with_metadata_size().await?;
+    let summary = result.summary();
     progress.stage_progress("write_root_index", 1).await?;
     progress.stage_complete("write_root_index").await?;
 
     Ok(IndexFile {
         path: INDEX_FILE_NAME.to_string(),
         size_bytes: summary.size_bytes,
-        file_metadata_size_bytes: None,
+        file_metadata_size_bytes: Some(result.metadata_size_bytes()),
     })
 }
 
