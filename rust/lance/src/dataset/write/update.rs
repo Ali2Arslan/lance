@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,17 +14,18 @@ use crate::dataset::transaction::{Operation, Transaction};
 use crate::dataset::utils::make_rowid_capture_stream;
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Schema as ArrowSchema};
 use datafusion::common::DFSchema;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::logical_expr::ExprSchemable;
-use datafusion::physical_plan::PhysicalExpr;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{PhysicalExpr, SendableRecordBatchStream};
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::StreamExt;
 use lance_arrow::RecordBatchExt;
+use lance_arrow::json::{JsonArray, is_json_field};
 use lance_core::datatypes::BlobHandling;
 use lance_core::error::{InvalidInputSnafu, box_error};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -133,6 +134,16 @@ impl UpdateBuilder {
                 ))
             })?;
 
+        if crate::dataset::optimize::field_contains_blob_v2(field) {
+            return Err(Error::not_supported_source(
+                format!(
+                    "Direct updates to column '{}' containing blob v2 values are not supported",
+                    column.as_ref()
+                )
+                .into(),
+            ));
+        }
+
         // TODO: support nested column references. This is mostly blocked on the
         // ability to insert them into the RecordBatch properly.
         if column.as_ref().contains('.') {
@@ -159,7 +170,16 @@ impl UpdateBuilder {
             .get_type(&df_schema)
             .map_err(box_error)
             .context(InvalidInputSnafu {})?;
-        if dest_type != src_type {
+        // A string assigned to a JSON field is logical JSON, not its LargeBinary storage.
+        // Keep it as UTF-8 here so `apply_updates` can validate and encode it as JSONB.
+        let is_json_string = schema
+            .field_with_name(column.as_ref())
+            .is_ok_and(is_json_field)
+            && matches!(
+                &src_type,
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+            );
+        if dest_type != src_type && !is_json_string {
             expr = match expr {
                 // TODO: remove this branch once DataFusion supports casting List to FSL
                 // This should happen in Arrow 51.0.0
@@ -280,8 +300,25 @@ impl UpdateJob {
 
     async fn execute_impl(self) -> Result<UpdateData> {
         let mut scanner = self.dataset.scan();
+        let legacy_blob_ids = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .filter(|field| field.is_blob() && !field.is_blob_v2())
+            .filter_map(|field| u32::try_from(field.id).ok())
+            .collect::<HashSet<_>>();
+        if !legacy_blob_ids.is_empty() {
+            scanner.blob_handling(BlobHandling::SomeBlobsBinary(legacy_blob_ids));
+        }
+        let has_blob_v2_columns = self
+            .dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+        if has_blob_v2_columns {
+            scanner.with_row_address();
+        }
         scanner.with_row_id();
-        scanner.blob_handling(BlobHandling::AllBinary);
 
         if let Some(expr) = &self.condition {
             scanner.filter_expr(expr.clone());
@@ -296,15 +333,76 @@ impl UpdateJob {
         let (stream, row_id_rx) =
             make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
 
-        let schema = stream.schema();
-
-        let expected_schema = self.dataset.schema().into();
-        if schema.as_ref() != &expected_schema {
+        let scan_schema = stream.schema();
+        let expected_schema: ArrowSchema = self.dataset.schema().into();
+        if !has_blob_v2_columns && scan_schema.as_ref() != &expected_schema {
             return Err(Error::internal(format!(
                 "Expected schema {:?} but got {:?}",
-                expected_schema, schema
+                expected_schema, scan_schema
             )));
         }
+
+        let stream = if has_blob_v2_columns {
+            let rewrite_plan = Arc::new(crate::dataset::optimize::BlobV2BatchRewritePlan::try_new(
+                self.dataset.schema(),
+                scan_schema.as_ref(),
+                false,
+            )?);
+            let output_schema = rewrite_plan.output_schema().clone();
+            let dataset = self.dataset.clone();
+            let transformed = stream.then(move |batch_result| {
+                let dataset = dataset.clone();
+                let rewrite_plan = rewrite_plan.clone();
+                async move {
+                    let batch = batch_result?;
+                    rewrite_plan
+                        .transform_batch(&dataset, batch)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))
+                }
+            });
+            Box::pin(RecordBatchStreamAdapter::new(output_schema, transformed))
+                as SendableRecordBatchStream
+        } else {
+            stream
+        };
+        let schema = stream.schema();
+
+        let updated_blob_columns = self
+            .updates
+            .keys()
+            .filter(|column_name| {
+                self.dataset
+                    .schema()
+                    .field(column_name)
+                    .is_some_and(crate::dataset::optimize::field_contains_blob_v2)
+            })
+            .cloned()
+            .collect::<HashSet<_>>();
+        let updated_blob_column_indices = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(column_idx, field)| {
+                updated_blob_columns
+                    .contains(field.name())
+                    .then_some(column_idx)
+            })
+            .collect::<Vec<_>>();
+        let write_params = WriteParams {
+            allow_external_blob_outside_bases: has_blob_v2_columns,
+            ..Default::default()
+        };
+        let external_base_resolver = if updated_blob_column_indices.is_empty() {
+            None
+        } else {
+            super::blob_v2_external_base_resolver(
+                Some(self.dataset.as_ref()),
+                &write_params,
+                self.dataset.schema(),
+            )
+            .await?
+        };
 
         let updates_ref = self.updates.clone();
         let stream = stream
@@ -317,6 +415,25 @@ impl UpdateJob {
                 Ok(Ok(batch)) => Ok(batch),
                 Ok(Err(err)) => Err(err),
                 Err(e) => Err(DataFusionError::ExecutionJoin(Box::new(e))),
+            })
+            .then(move |batch_result| {
+                let external_base_resolver = external_base_resolver.clone();
+                let updated_blob_column_indices = updated_blob_column_indices.clone();
+                async move {
+                    let batch = batch_result?;
+                    if let Some(resolver) = external_base_resolver.as_deref() {
+                        let updated_blob_batch = batch.project(&updated_blob_column_indices)?;
+                        let selected_rows = vec![true; batch.num_rows()];
+                        crate::dataset::blob::validate_external_blob_references(
+                            resolver,
+                            &updated_blob_batch,
+                            &selected_rows,
+                        )
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                    }
+                    Ok(batch)
+                }
             });
         let stream = RecordBatchStreamAdapter::new(schema, stream);
 
@@ -330,7 +447,7 @@ impl UpdateJob {
             &self.dataset.base,
             self.dataset.schema().clone(),
             Box::pin(stream),
-            WriteParams::default(),
+            write_params,
             None, // TODO: support multiple bases for update
         )
         .await?;
@@ -362,7 +479,7 @@ impl UpdateJob {
 
         // Apply deletions
         let row_id_index = get_row_id_index(&self.dataset).await?;
-        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref());
+        let row_addrs = removed_row_ids.row_addrs(row_id_index.as_deref())?;
         let deletions_result = self.apply_deletions(&row_addrs).await;
         let (old_fragments, removed_fragment_ids) = match deletions_result {
             Ok(v) => v,
@@ -444,6 +561,34 @@ impl UpdateJob {
     ) -> DFResult<RecordBatch> {
         for (column, expr) in updates.iter() {
             let new_values = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
+            let schema = batch.schema();
+            let new_values: ArrayRef = if schema.field_with_name(column).is_ok_and(is_json_field)
+                && matches!(
+                    new_values.data_type(),
+                    DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                ) {
+                let new_values = if new_values.data_type() == &DataType::Utf8View {
+                    arrow_cast::cast(new_values.as_ref(), &DataType::Utf8).map_err(|error| {
+                        DataFusionError::ArrowError(
+                            Box::new(error),
+                            Some(format!(
+                                "convert Utf8View update for JSON column '{column}'"
+                            )),
+                        )
+                    })?
+                } else {
+                    new_values
+                };
+                let json_array = JsonArray::try_from(new_values).map_err(|error| {
+                    DataFusionError::ArrowError(
+                        Box::new(error),
+                        Some(format!("encode update for JSON column '{column}'")),
+                    )
+                })?;
+                Arc::new(json_array.into_inner())
+            } else {
+                new_values
+            };
             batch = batch.replace_column_by_name(column.as_str(), new_values)?;
         }
         Ok(batch)
@@ -538,12 +683,14 @@ mod tests {
         datatypes::{Int64Type, UInt32Type},
     };
     use arrow_array::types::{Float32Type, Int32Type};
-    use arrow_array::{Int64Array, RecordBatchIterator, StringArray, UInt32Array, UInt64Array};
+    use arrow_array::{
+        Int64Array, RecordBatchIterator, StringArray, StructArray, UInt32Array, UInt64Array,
+    };
     use arrow_schema::{Field, Schema as ArrowSchema};
     use arrow_select::concat::concat_batches;
     use futures::{TryStreamExt, future::try_join_all};
     use lance_arrow::ARROW_EXT_NAME_KEY;
-    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field, is_json_field};
+    use lance_arrow::json::{ARROW_JSON_EXT_NAME, is_arrow_json_field};
     use lance_core::ROW_ID;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datagen::{Dimension, RowCount};
@@ -759,8 +906,11 @@ mod tests {
         assert_eq!(fragments[2].metadata.physical_rows, Some(15));
     }
 
+    #[rstest]
+    #[case::utf8(r#"'{"after": true, "n": 2}'"#)]
+    #[case::utf8_view(r#"arrow_cast('{"after": true, "n": 2}', 'Utf8View')"#)]
     #[tokio::test]
-    async fn test_update_json_and_regular_columns() {
+    async fn test_update_json_and_regular_columns(#[case] json_expression: &str) {
         let mut metadata = HashMap::new();
         metadata.insert(
             ARROW_EXT_NAME_KEY.to_string(),
@@ -803,7 +953,7 @@ mod tests {
             .unwrap()
             .set("name", "'updated'")
             .unwrap()
-            .set("meta", r#"jsonb '{"after":true,"n":2}'"#)
+            .set("meta", json_expression)
             .unwrap()
             .build()
             .unwrap()
@@ -832,6 +982,16 @@ mod tests {
 
         assert_eq!(names.value(updated_row_idx), "updated");
         assert_eq!(metas.value(updated_row_idx), r#"{"after":true,"n":2}"#);
+
+        let filtered_batch = updated_dataset
+            .scan()
+            .filter("json_extract(meta, '$.n') = '2'")
+            .unwrap()
+            .try_into_batch()
+            .await
+            .unwrap();
+        assert_eq!(filtered_batch.num_rows(), 1);
+        assert_eq!(filtered_batch["id"].as_primitive::<Int64Type>().value(0), 2);
     }
 
     #[rstest]
@@ -951,8 +1111,8 @@ mod tests {
         // Increase likelihood of contention by throttling the store
         let throttled = Arc::new(ThrottledStoreWrapper {
             config: ThrottleConfig {
-                wait_list_per_call: Duration::from_millis(10),
-                wait_get_per_call: Duration::from_millis(10),
+                wait_list_per_call: Duration::from_millis(1),
+                wait_get_per_call: Duration::from_millis(1),
                 ..Default::default()
             },
         });
@@ -1284,17 +1444,30 @@ mod tests {
     }
 
     #[rstest]
-    #[case::zone_map(BuiltinIndexType::ZoneMap, "i < 100", 100)]
-    #[case::bloom_filter(BuiltinIndexType::BloomFilter, "i = 0", 1)]
+    #[case::zone_map(BuiltinIndexType::ZoneMap, IndexType::ZoneMap, "i", "i < 100", 100)]
+    #[case::bloom_filter(BuiltinIndexType::BloomFilter, IndexType::BloomFilter, "i", "i = 0", 1)]
+    #[case::fm(
+        BuiltinIndexType::Fm,
+        IndexType::Fm,
+        "text",
+        "contains(text, 'needle')",
+        50
+    )]
     #[tokio::test]
     async fn test_addr_domain_index_does_not_cover_rewritten_update_fragment(
-        #[case] index_type: BuiltinIndexType,
+        #[case] builtin: BuiltinIndexType,
+        #[case] index_type: IndexType,
+        #[case] indexed_column: &str,
         #[case] query: &str,
         #[case] expected_rows: usize,
     ) {
         let mut dataset = lance_datagen::gen_batch()
             .col("i", lance_datagen::array::step::<Int32Type>())
             .col("category", lance_datagen::array::step::<Int32Type>())
+            .col(
+                "text",
+                lance_datagen::array::cycle_utf8_literals(&["needle", "haystack"]),
+            )
             .into_ram_dataset_with_params(
                 FragmentCount::from(1),
                 FragmentRowCount::from(100),
@@ -1309,10 +1482,10 @@ mod tests {
 
         dataset
             .create_index(
-                &["i"],
-                IndexType::Scalar,
-                Some("i_idx".to_string()),
-                &ScalarIndexParams::for_builtin(index_type),
+                &[indexed_column],
+                index_type,
+                Some("addr_idx".to_string()),
+                &ScalarIndexParams::for_builtin(builtin),
                 true,
             )
             .await
@@ -1340,7 +1513,10 @@ mod tests {
             .new_dataset;
 
         let indices = dataset.load_indices().await.unwrap();
-        let index = indices.iter().find(|index| index.name == "i_idx").unwrap();
+        let index = indices
+            .iter()
+            .find(|index| index.name == "addr_idx")
+            .unwrap();
         assert_eq!(
             index
                 .fragment_bitmap
@@ -1944,5 +2120,105 @@ mod tests {
 
         let idx_foo = ids.values().iter().position(|&x| x == 0).unwrap();
         assert_eq!(blobs.value(idx_foo), b"foo");
+    }
+
+    #[rstest]
+    #[case::non_empty(0)]
+    #[case::empty(1)]
+    #[case::null(2)]
+    #[tokio::test]
+    async fn test_update_preserves_blob_v2(#[case] selected_id: i64) {
+        use crate::{BlobArrayBuilder, blob_field};
+
+        let make_blobs = || {
+            let mut builder = BlobArrayBuilder::new(3);
+            builder.push_bytes(b"one").unwrap();
+            builder.push_bytes(b"").unwrap();
+            builder.push_null().unwrap();
+            builder.finish().unwrap()
+        };
+        let nested_fields = vec![blob_field("blob", true)];
+        let nested: Arc<StructArray> = Arc::new(
+            StructArray::try_new(nested_fields.clone().into(), vec![make_blobs()], None).unwrap(),
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            blob_field("payload", true),
+            Field::new("info", DataType::Struct(nested_fields.into()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(StringArray::from(vec!["body-0", "body-1", "body-2"])),
+                make_blobs(),
+                nested,
+            ],
+        )
+        .unwrap();
+        let test_dir = TempStrDir::default();
+        let dataset = Arc::new(
+            Dataset::write(
+                RecordBatchIterator::new(vec![Ok(batch)], schema),
+                &test_dir,
+                Some(WriteParams {
+                    data_storage_version: Some(LanceFileVersion::V2_2),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap(),
+        );
+
+        for column in ["payload", "info"] {
+            let error = UpdateBuilder::new(dataset.clone())
+                .set(column, column)
+                .unwrap_err();
+            assert!(matches!(error, Error::NotSupported { .. }));
+            assert!(
+                error.to_string().contains(&format!(
+                    "Direct updates to column '{column}' containing blob v2 values are not supported"
+                )),
+                "unexpected error: {error}"
+            );
+        }
+
+        let result = UpdateBuilder::new(dataset)
+            .update_where(&format!("id = {selected_id}"))
+            .unwrap()
+            .set("body", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(result.rows_updated, 1);
+
+        let mut scanner = result.new_dataset.scan();
+        scanner.blob_handling(BlobHandling::AllBinary);
+        let batch = scanner.try_into_batch().await.unwrap();
+        let ids = batch["id"].as_primitive::<Int64Type>();
+        let bodies = batch["body"].as_string::<i32>();
+        let payloads = batch["payload"].as_binary::<i64>();
+        let nested = batch["info"]
+            .as_struct()
+            .column_by_name("blob")
+            .unwrap()
+            .as_binary::<i64>();
+        let expected = [Some(b"one".as_slice()), Some(b"".as_slice()), None];
+
+        for row_idx in 0..batch.num_rows() {
+            let id = ids.value(row_idx) as usize;
+            let expected_body = if id as i64 == selected_id {
+                "updated"
+            } else {
+                ["body-0", "body-1", "body-2"][id]
+            };
+            assert_eq!(bodies.value(row_idx), expected_body);
+            assert_eq!(payloads.iter().nth(row_idx).unwrap(), expected[id]);
+            assert_eq!(nested.iter().nth(row_idx).unwrap(), expected[id]);
+        }
     }
 }

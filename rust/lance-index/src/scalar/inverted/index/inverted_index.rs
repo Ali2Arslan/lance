@@ -73,7 +73,11 @@ impl InvertedIndex {
         self.partitions
             .first()
             .map(|partition| partition.inverted_list.posting_tail_codec())
-            .unwrap_or_default()
+            .unwrap_or_else(|| {
+                // Empty segments have no partition-level codec metadata, so
+                // derive the codec from the segment's declared format.
+                self.format_version().posting_tail_codec()
+            })
     }
 
     fn to_builder(&self) -> InvertedIndexBuilder {
@@ -197,6 +201,51 @@ impl InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Rebind a modern index within its immutable index/fragment-reuse cache
+    /// namespace. Only reader-free state crosses the request boundary; all
+    /// future posting and document I/O uses the supplied store and remapper.
+    pub(in super::super) fn with_store(
+        &self,
+        store: Arc<dyn IndexStore>,
+        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+    ) -> Result<Option<Self>> {
+        if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
+            return Ok(None);
+        }
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for (priority, part) in self.partitions.iter().enumerate() {
+            let store = store.with_io_priority(priority as u64);
+            let Some(docs) = part.docs.modern() else {
+                return Err(Error::internal("modern FTS partition has legacy documents"));
+            };
+            partitions.push(Arc::new(InvertedPartition {
+                id: part.id,
+                store: store.clone(),
+                tokens: part.tokens.clone(),
+                inverted_list: Arc::new(
+                    part.inverted_list
+                        .with_store(store.clone(), posting_file_path(part.id))?,
+                ),
+                docs: PartitionDocumentStore::Modern(Arc::new(
+                    docs.with_store(store, frag_reuse_index.clone()),
+                )),
+                token_set_format: part.token_set_format,
+            }));
+        }
+        Ok(Some(Self {
+            params: self.params.clone(),
+            store,
+            tokenizer: self.tokenizer.clone(),
+            token_set_format: self.token_set_format,
+            format_version: self.format_version,
+            partitions,
+            corpus_stats: self.corpus_stats.clone(),
+            prewarm_state: self.prewarm_state.clone(),
+            document_projections_resident: self.document_projections_resident.clone(),
+            deleted_fragments: self.deleted_fragments.clone(),
+        }))
+    }
+
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
@@ -252,7 +301,7 @@ impl InvertedIndex {
             partitions: vec![Arc::new(InvertedPartition {
                 id: 0,
                 store,
-                tokens,
+                tokens: Arc::new(tokens),
                 inverted_list,
                 docs: PartitionDocumentStore::Legacy(Arc::new(docs)),
                 token_set_format: TokenSetFormat::Arrow,
@@ -266,6 +315,20 @@ impl InvertedIndex {
 
     pub fn is_legacy(&self) -> bool {
         self.partitions.len() == 1 && self.partitions[0].docs.legacy().is_some()
+    }
+
+    /// Returns whether bounded WAND results can certify exact global top-k membership.
+    ///
+    /// The certificate requires a modern index whose every physical partition
+    /// contains impact metadata. Modern postings without impacts can prune with
+    /// partition-local scores before applying a corpus-wide scorer, so their
+    /// bounded candidate set cannot establish global exactness.
+    pub fn supports_wand_exactness_certificate(&self) -> bool {
+        !self.is_legacy()
+            && self
+                .partitions
+                .iter()
+                .all(|partition| partition.inverted_list.has_impacts)
     }
 
     /// Read only the index's [`InvertedIndexParams`],
@@ -455,6 +518,36 @@ impl Index for InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Return whether both handles share the same runtime prewarm state.
+    ///
+    /// Cloning or rebinding readers preserves this identity; independently
+    /// loading the same index does not. This checks neither cache residency nor
+    /// whether the handles' storage bindings are interchangeable.
+    ///
+    /// ```
+    /// use lance_index::scalar::inverted::InvertedIndex;
+    ///
+    /// fn cloned_handle_shares_state(index: &InvertedIndex) -> bool {
+    ///     index.shares_prewarm_state(&index.clone())
+    /// }
+    /// ```
+    pub fn shares_prewarm_state(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.prewarm_state, &other.prewarm_state)
+    }
+
+    /// Return whether an explicit prewarm prepared everything this query needs.
+    ///
+    /// This is an O(1) routing hint for query planning. It never starts I/O or
+    /// waits for a concurrent prewarm. The projection check also clears a stale
+    /// optimistic hint after cache eviction; an unexpected posting eviction is
+    /// still handled exactly by the normal eager loader.
+    pub(in super::super) fn prewarmed_query_state_ready(&self, with_position: bool) -> bool {
+        let Ok(state) = self.prewarm_state.try_lock() else {
+            return false;
+        };
+        state.satisfies(with_position) && self.has_resident_document_projections()
+    }
+
     pub async fn prewarm_with_options(&self, options: &FtsPrewarmOptions) -> Result<()> {
         self.prewarm_with_options_result(options).await.map(|_| ())
     }
