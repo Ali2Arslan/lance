@@ -1014,9 +1014,10 @@ impl Transaction {
                             && file.file_major_version == new_file.file_major_version
                             && file.file_minor_version == new_file.file_minor_version
                         {
-                            // assign the new file path / size / base to the fragment
+                            // assign the new file path / sizes / base to the fragment
                             file.path = new_file.path.clone();
                             file.file_size_bytes = new_file.file_size_bytes.clone();
+                            file.file_metadata_size_bytes = new_file.file_metadata_size_bytes;
                             file.base_id = new_file.base_id;
                             replaced_in_place = true;
                         }

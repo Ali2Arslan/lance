@@ -129,18 +129,6 @@ impl IndexMetadata {
             .unwrap_or_default()
     }
 
-    /// Returns known Lance metadata suffix sizes by relative file path.
-    pub fn file_metadata_size_map(&self) -> HashMap<String, NonZero<u64>> {
-        self.files
-            .iter()
-            .flatten()
-            .filter_map(|file| {
-                file.file_metadata_size_bytes
-                    .map(|size| (file.path.clone(), size))
-            })
-            .collect()
-    }
-
     /// Returns the total size of all files in this index segment in bytes.
     /// Returns None if file information is not available.
     pub fn total_size_bytes(&self) -> Option<u64> {

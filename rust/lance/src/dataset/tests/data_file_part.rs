@@ -141,9 +141,16 @@ async fn concatenates_parts_in_caller_order_without_reusing_staging_files() {
         .concat_data_file_parts(&target, &ordered_parts)
         .await
         .unwrap();
+    let metadata_size_bytes = data_file.file_metadata_size_bytes;
     let replacement = DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file);
     assert_eq!(replacement.1.path, target.file_name.as_str());
     let dataset = commit(&dataset, replacement).await.unwrap();
+    let committed_file = dataset.manifest.fragments[0]
+        .files
+        .iter()
+        .find(|file| file.path == target.file_name)
+        .unwrap();
+    assert_eq!(committed_file.file_metadata_size_bytes, metadata_size_bytes);
     let batch = dataset.scan().try_into_batch().await.unwrap();
     assert_eq!(
         batch["id"].as_primitive::<Int32Type>().values(),

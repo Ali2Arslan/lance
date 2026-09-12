@@ -31,6 +31,12 @@ use std::num::NonZeroU64;
 use std::pin::Pin;
 use std::{any::Any, sync::Arc};
 
+#[derive(Debug, Clone, Copy)]
+struct IndexFileOpenHint {
+    size_bytes: u64,
+    file_metadata_size_bytes: Option<NonZeroU64>,
+}
+
 /// An index store that serializes scalar indices using the lance format
 ///
 /// Scalar indices are made up of named collections of record batches.  This
@@ -42,13 +48,11 @@ pub struct LanceIndexStore {
     index_dir: Path,
     metadata_cache: Arc<LanceCache>,
     scheduler: Arc<ScanScheduler>,
-    /// Cached file sizes (filename -> size in bytes)
-    /// When set, used to avoid HEAD calls when opening files
+    /// Cached file information keyed by relative path.
+    /// When set, sizes avoid HEAD calls and metadata suffix sizes avoid dependent reads.
     // Partition priority views share this immutable map. Cloning all file names
     // for every partition would make request rebinding quadratic in partitions.
-    file_sizes: Arc<HashMap<String, u64>>,
-    /// Cached metadata suffix sizes for Lance-format files.
-    file_metadata_sizes: Arc<HashMap<String, NonZeroU64>>,
+    files: Arc<HashMap<String, IndexFileOpenHint>>,
     format_version: ConcreteFileVersion,
     /// Base I/O priority for all requests this store submits to `scheduler`.
     io_priority: u64,
@@ -96,8 +100,7 @@ impl LanceIndexStore {
             index_dir,
             metadata_cache,
             scheduler,
-            file_sizes: Arc::default(),
-            file_metadata_sizes: Arc::default(),
+            files: Arc::default(),
             format_version,
             io_priority: 0,
         }
@@ -107,17 +110,35 @@ impl LanceIndexStore {
     ///
     /// The map should contain relative paths (e.g., "index.idx") as keys
     /// and file sizes in bytes as values.
-    pub fn with_file_sizes(mut self, file_sizes: HashMap<String, u64>) -> Self {
-        self.file_sizes = Arc::new(file_sizes);
-        self
+    pub fn with_file_sizes(self, file_sizes: HashMap<String, u64>) -> Self {
+        self.with_index_files(
+            file_sizes
+                .into_iter()
+                .map(|(path, size_bytes)| IndexFile {
+                    path,
+                    size_bytes,
+                    file_metadata_size_bytes: None,
+                })
+                .collect(),
+        )
     }
 
-    /// Set metadata suffix sizes used to avoid dependent footer discovery reads.
-    pub fn with_file_metadata_sizes(
-        mut self,
-        file_metadata_sizes: HashMap<String, NonZeroU64>,
-    ) -> Self {
-        self.file_metadata_sizes = Arc::new(file_metadata_sizes);
+    /// Set cached information for files already recorded in an index manifest.
+    pub fn with_index_files(mut self, files: Vec<IndexFile>) -> Self {
+        self.files = Arc::new(
+            files
+                .into_iter()
+                .map(|file| {
+                    (
+                        file.path,
+                        IndexFileOpenHint {
+                            size_bytes: file.size_bytes,
+                            file_metadata_size_bytes: file.file_metadata_size_bytes,
+                        },
+                    )
+                })
+                .collect(),
+        );
         self
     }
 
@@ -471,20 +492,21 @@ impl IndexStore for LanceIndexStore {
         let path = self.index_file_path(name)?;
         // Use cached file size if available, otherwise unknown (requires HEAD call)
         let cached_size = self
-            .file_sizes
+            .files
             .get(name)
-            .map(|&size| CachedFileSize::new(size))
+            .map(|file| CachedFileSize::new(file.size_bytes))
             .unwrap_or_else(CachedFileSize::unknown);
         let file_scheduler = self
             .scheduler
             .open_file_with_priority(&path, self.io_priority, &cached_size)
             .await?;
-        let metadata_options = self.file_metadata_sizes.get(name).copied().map_or_else(
-            FullMetadataReadOptions::default,
-            |metadata_size_bytes| {
+        let metadata_options = self
+            .files
+            .get(name)
+            .and_then(|file| file.file_metadata_size_bytes)
+            .map_or_else(FullMetadataReadOptions::default, |metadata_size_bytes| {
                 FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
-            },
-        );
+            });
         match versions::open_self_described_reader_with_metadata_options(
             file_scheduler,
             Arc::<DecoderPlugins>::default(),
@@ -529,7 +551,10 @@ impl IndexStore for LanceIndexStore {
                 Ok(IndexFile {
                     path: new_name.to_string(),
                     size_bytes: result.size as u64,
-                    file_metadata_size_bytes: self.file_metadata_sizes.get(name).copied(),
+                    file_metadata_size_bytes: self
+                        .files
+                        .get(name)
+                        .and_then(|file| file.file_metadata_size_bytes),
                 })
             }
             _ => {
@@ -559,7 +584,10 @@ impl IndexStore for LanceIndexStore {
         Ok(IndexFile {
             path: new_name.to_string(),
             size_bytes: result.size as u64,
-            file_metadata_size_bytes: self.file_metadata_sizes.get(name).copied(),
+            file_metadata_size_bytes: self
+                .files
+                .get(name)
+                .and_then(|file| file.file_metadata_size_bytes),
         })
     }
 
@@ -781,8 +809,7 @@ mod tests {
             index_dir,
             Arc::new(LanceCache::no_cache()),
         )
-        .with_file_sizes(file_sizes)
-        .with_file_metadata_sizes(HashMap::from([(file_name.to_string(), metadata_size)]));
+        .with_index_files(vec![index_file]);
         object_store.io_stats_incremental();
         with_hint.open_index_file(file_name).await.unwrap();
         assert_eq!(object_store.io_stats_incremental().read_iops, 1);

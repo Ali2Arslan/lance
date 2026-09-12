@@ -31,7 +31,11 @@ use prost::Message;
 use prost_types::Any;
 
 use crate::{
-    reader::{CachedFileMetadata, FileReader, FullMetadataReadOptions, RawFileMetadataOpen},
+    io::LanceEncodingsIo,
+    reader::{
+        CachedFileMetadata, FileReader, FileReaderOptions, FullMetadataReadOptions,
+        RawFileMetadataOpen,
+    },
     version::ConcreteFileVersion,
     versions,
     writer::{FileWriteResult, FileWriterOptions},
@@ -214,13 +218,8 @@ impl DataFilePart {
 
         let has_blob_v2 = schema.fields_pre_order().any(|field| field.is_blob_v2());
         if has_blob_v2 {
-            validate_blob_descriptors(
-                &input,
-                metadata.as_ref(),
-                schema.as_ref(),
-                blob_ids.as_ref(),
-            )
-            .await?;
+            validate_blob_descriptors(&input, &metadata, schema.as_ref(), blob_ids.as_ref())
+                .await?;
             if blob_target_id.is_none() {
                 return Err(Error::invalid_input(format!(
                     "part at '{}' contains Blob v2 columns but no Blob target ID was provided",
@@ -329,7 +328,7 @@ fn validate_blob_id_range(blob_ids: Option<&Range<u32>>) -> Result<()> {
 
 async fn validate_blob_descriptors(
     input: &EncodedFileInput,
-    metadata: &CachedFileMetadata,
+    metadata: &Arc<CachedFileMetadata>,
     schema: &Schema,
     blob_ids: Option<&Range<u32>>,
 ) -> Result<()> {
@@ -365,15 +364,21 @@ async fn validate_blob_descriptors(
         &blob_schema,
         &field_id_to_column_index,
     )?;
-    let reader = FileReader::try_open_with_metadata_options(
-        input.scheduler(),
+    let options = FileReaderOptions::default();
+    let io = Arc::new(
+        LanceEncodingsIo::new(input.scheduler()).with_read_chunk_size(options.read_chunk_size),
+    );
+    let reader = FileReader::try_open_with_file_metadata(
+        io,
+        input.path().clone(),
         Some(projection),
         Arc::<DecoderPlugins>::default(),
+        metadata.clone(),
         &LanceCache::no_cache(),
-        Default::default(),
-        input.metadata_options,
+        options,
     )
     .await?;
+    debug_assert!(Arc::ptr_eq(reader.metadata(), metadata));
     let mut batches = reader
         .read_stream(
             ReadBatchParams::RangeFull,

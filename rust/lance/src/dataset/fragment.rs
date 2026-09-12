@@ -1221,8 +1221,9 @@ impl FileFragment {
             .unwrap_or_default();
         let estimated_num_columns = data_file.estimated_num_columns();
         let prefer_indexed = metadata_mode == MetadataMode::LazyAllowed
-            && reader_projection.column_indices.len().saturating_mul(4)
-                < estimated_num_columns.map_or(0, |num_columns| num_columns.get() as usize);
+            && estimated_num_columns.is_some_and(|num_columns| {
+                reader_projection.prefers_indexed_metadata(num_columns.get() as usize)
+            });
         let known_schema = self
             .metadata
             .physical_rows
@@ -1254,8 +1255,8 @@ impl FileFragment {
                         metadata_index_options,
                     )
                     .await?;
-                if (reader_projection.column_indices.len() as u32).saturating_mul(4)
-                    >= metadata_index.num_columns()
+                if !reader_projection
+                    .prefers_indexed_metadata(metadata_index.num_columns() as usize)
                 {
                     return Ok(None);
                 }

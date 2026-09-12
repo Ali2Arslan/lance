@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{BinaryHeap, HashMap},
+    collections::BinaryHeap,
     num::NonZeroU64,
     ops::Range,
     sync::{
@@ -86,6 +86,7 @@ use lance_io::{
 };
 use lance_linalg::distance::DistanceType;
 use lance_select::RowAddrTreeMap;
+use lance_table::format::IndexFile as TableIndexFile;
 use object_store::path::Path;
 use prost::Message;
 use roaring::RoaringBitmap;
@@ -798,32 +799,59 @@ impl CacheKey for FileMetadataCacheKey {
 
 #[derive(Debug, Default)]
 pub(crate) struct IvfFileOpenHints {
-    file_sizes: HashMap<String, u64>,
-    metadata_sizes: HashMap<String, NonZeroU64>,
+    files: Vec<TableIndexFile>,
 }
 
 impl IvfFileOpenHints {
-    pub(crate) fn new(
-        file_sizes: HashMap<String, u64>,
-        metadata_sizes: HashMap<String, NonZeroU64>,
-    ) -> Self {
-        Self {
-            file_sizes,
-            metadata_sizes,
-        }
+    pub(crate) fn new(files: Vec<TableIndexFile>) -> Self {
+        Self { files }
     }
 
     pub(crate) fn file_size(&self, name: &str) -> u64 {
-        self.file_sizes.get(name).copied().unwrap_or(0)
+        self.files
+            .iter()
+            .find(|file| file.path == name)
+            .map_or(0, |file| file.size_bytes)
+    }
+
+    pub(crate) fn metadata_size_bytes(&self, name: &str) -> Option<NonZeroU64> {
+        self.files
+            .iter()
+            .find(|file| file.path == name)
+            .and_then(|file| file.file_metadata_size_bytes)
     }
 
     pub(crate) fn metadata_options(&self, name: &str) -> FullMetadataReadOptions {
-        self.metadata_sizes.get(name).copied().map_or_else(
+        self.metadata_size_bytes(name).map_or_else(
             FullMetadataReadOptions::default,
             |metadata_size_bytes| {
                 FullMetadataReadOptions::default().with_metadata_size_bytes(metadata_size_bytes)
             },
         )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IvfFileOpenContext {
+    scheduler: Arc<ScanScheduler>,
+    index_reader: FileReader,
+    storage_reader: Option<FileReader>,
+    hints: IvfFileOpenHints,
+}
+
+impl IvfFileOpenContext {
+    pub(crate) fn new(
+        scheduler: Arc<ScanScheduler>,
+        index_reader: FileReader,
+        storage_reader: Option<FileReader>,
+        hints: IvfFileOpenHints,
+    ) -> Self {
+        Self {
+            scheduler,
+            index_reader,
+            storage_reader,
+            hints,
+        }
     }
 }
 
@@ -1414,11 +1442,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         frag_reuse_index: Option<Arc<CompactFragReuseIndex>>,
         file_metadata_cache: &LanceCache,
         index_cache: LanceCache,
-        file_open_hints: IvfFileOpenHints,
+        file_open_context: IvfFileOpenContext,
     ) -> Result<Self> {
         let io_parallelism = object_store.io_parallelism();
-        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
-        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+        let IvfFileOpenContext {
+            scheduler,
+            index_reader,
+            storage_reader,
+            hints: file_open_hints,
+        } = file_open_context;
 
         let uuid_str = uuid.to_string();
         let uri = index_dir
@@ -1429,31 +1461,22 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
             .clone()
             .join(uuid_str.as_str())
             .join(INDEX_AUXILIARY_FILE_NAME);
-        let index_size = CachedFileSize::new(file_open_hints.file_size(INDEX_FILE_NAME));
-        let aux_size = CachedFileSize::new(file_open_hints.file_size(INDEX_AUXILIARY_FILE_NAME));
-        let open_index = async {
-            FileReader::try_open_with_metadata_options(
-                scheduler.open_file(&uri, &index_size).await?,
-                None,
-                Arc::<DecoderPlugins>::default(),
-                file_metadata_cache,
-                FileReaderOptions::default(),
-                file_open_hints.metadata_options(INDEX_FILE_NAME),
-            )
-            .await
+        let storage_reader = match storage_reader {
+            Some(storage_reader) => storage_reader,
+            None => {
+                let aux_size =
+                    CachedFileSize::new(file_open_hints.file_size(INDEX_AUXILIARY_FILE_NAME));
+                FileReader::try_open_with_metadata_options(
+                    scheduler.open_file(&aux_path, &aux_size).await?,
+                    None,
+                    Arc::<DecoderPlugins>::default(),
+                    file_metadata_cache,
+                    FileReaderOptions::default(),
+                    file_open_hints.metadata_options(INDEX_AUXILIARY_FILE_NAME),
+                )
+                .await?
+            }
         };
-        let open_aux = async {
-            FileReader::try_open_with_metadata_options(
-                scheduler.open_file(&aux_path, &aux_size).await?,
-                None,
-                Arc::<DecoderPlugins>::default(),
-                file_metadata_cache,
-                FileReaderOptions::default(),
-                file_open_hints.metadata_options(INDEX_AUXILIARY_FILE_NAME),
-            )
-            .await
-        };
-        let (index_reader, storage_reader) = tokio::try_join!(open_index, open_aux)?;
         let index_metadata: IndexMetadata = serde_json::from_str(
             index_reader
                 .schema()
@@ -1503,10 +1526,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let use_residual_scratch = Self::use_residual_scratch(&ivf, use_query_residual);
         let rq_search_cache = Self::build_rq_search_cache(&ivf, &storage)?;
 
-        // The scheduler is freshly created above and, at this point, has served
-        // only the open-time reads (file footers, IVF centroids, quantization
-        // metadata) -- partition reads happen later, during queries.  So its
-        // cumulative stats are exactly the one-time index-open I/O.
+        // At this point, the scheduler has served only the open-time reads
+        // (file footers, IVF centroids, quantization metadata) -- partition reads
+        // happen later, during queries.  So its cumulative stats are exactly the
+        // one-time index-open I/O.
         let open_io_stats = scheduler.stats();
 
         let read_projection = Self::read_projection(&index_reader)?;

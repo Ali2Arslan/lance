@@ -437,11 +437,50 @@ enum TailReadPlan {
     EstimatedMetadataIndex(NonZeroU32),
 }
 
-struct InitialTailRead {
+struct TailRead {
     bytes: Bytes,
     file_len: u64,
     offset: u64,
     retention_offset: u64,
+}
+
+impl TailRead {
+    async fn extend_to(&mut self, start: u64, scheduler: &FileScheduler) -> Result<()> {
+        if start > self.file_len {
+            return Err(Error::invalid_input(format!(
+                "metadata tail start {start} is outside file of size {}",
+                self.file_len
+            )));
+        }
+        if start >= self.offset {
+            return Ok(());
+        }
+        let missing_bytes = scheduler.submit_single(start..self.offset, 0).await?;
+        let mut combined = BytesMut::with_capacity(missing_bytes.len() + self.bytes.len());
+        combined.extend_from_slice(&missing_bytes);
+        combined.extend_from_slice(&self.bytes);
+        self.bytes = combined.freeze();
+        self.offset = start;
+        Ok(())
+    }
+
+    fn slice(&self, range: Range<u64>) -> Result<Bytes> {
+        if range.start > range.end || range.start < self.offset || range.end > self.file_len {
+            return Err(Error::invalid_input(format!(
+                "metadata byte range {}..{} is outside loaded tail {}..{}",
+                range.start, range.end, self.offset, self.file_len
+            )));
+        }
+        let start = usize::try_from(range.start - self.offset)
+            .map_err(|_| Error::invalid_input_source("Metadata range start overflows".into()))?;
+        let end = usize::try_from(range.end - self.offset)
+            .map_err(|_| Error::invalid_input_source("Metadata range end overflows".into()))?;
+        Ok(self.bytes.slice(start..end))
+    }
+
+    fn suffix_from(&self, start: u64) -> Result<Bytes> {
+        self.slice(start..self.file_len)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -743,7 +782,7 @@ impl FileReader {
         self.core.read_global_buffer(index).await
     }
 
-    async fn read_tail(scheduler: &FileScheduler, plan: TailReadPlan) -> Result<InitialTailRead> {
+    async fn read_tail(scheduler: &FileScheduler, plan: TailReadPlan) -> Result<TailRead> {
         let file_size = scheduler.reader().size().await? as u64;
         let baseline_read_size = file_size.min(scheduler.reader().block_size() as u64);
         let requested_read_size = match plan {
@@ -757,54 +796,24 @@ impl FileReader {
                 }
             }
             TailReadPlan::EstimatedMetadataIndex(estimated_num_columns) => {
-                let estimated_cmo_size =
-                    u64::from(estimated_num_columns.get()) * COLUMN_METADATA_OFFSET_ENTRY_SIZE;
-                baseline_read_size
-                    .checked_add(estimated_cmo_size)
-                    .unwrap_or(file_size)
+                u64::from(estimated_num_columns.get())
+                    .checked_mul(COLUMN_METADATA_OFFSET_ENTRY_SIZE)
+                    .and_then(|estimated_cmo_size| {
+                        baseline_read_size.checked_add(estimated_cmo_size)
+                    })
+                    .unwrap_or(baseline_read_size)
                     .min(file_size)
             }
         };
         let offset = file_size - requested_read_size;
         // FileScheduler may split this logical range into concurrent physical requests.
         let bytes = scheduler.submit_single(offset..file_size, 0).await?;
-        Ok(InitialTailRead {
+        Ok(TailRead {
             bytes,
             file_len: file_size,
             offset,
             retention_offset: file_size - baseline_read_size,
         })
-    }
-
-    async fn read_range_from_tail_or_scheduler(
-        tail_bytes: &Bytes,
-        tail_offset: u64,
-        scheduler: &FileScheduler,
-        range: Range<u64>,
-    ) -> Result<Bytes> {
-        if range.start > range.end {
-            return Err(Error::invalid_input(format!(
-                "invalid metadata byte range: start={}, end={}",
-                range.start, range.end
-            )));
-        }
-        let tail_end = tail_offset
-            .checked_add(tail_bytes.len() as u64)
-            .ok_or_else(|| Error::invalid_input_source("Tail byte range overflows".into()))?;
-        if range.start >= tail_offset && range.end <= tail_end {
-            let rel_start = (range.start - tail_offset) as usize;
-            let rel_end = (range.end - tail_offset) as usize;
-            Ok(tail_bytes.slice(rel_start..rel_end))
-        } else if range.start < tail_offset && range.end > tail_offset && range.end <= tail_end {
-            let missing_bytes = scheduler.submit_single(range.start..tail_offset, 0).await?;
-            let rel_end = (range.end - tail_offset) as usize;
-            let mut combined = BytesMut::with_capacity((range.end - range.start) as usize);
-            combined.extend_from_slice(&missing_bytes);
-            combined.extend_from_slice(&tail_bytes[..rel_end]);
-            Ok(combined.freeze())
-        } else {
-            scheduler.submit_single(range, 0).await
-        }
     }
 
     fn retained_global_buffers_from_tail(
@@ -953,36 +962,6 @@ impl FileReader {
         Ok(Arc::from(offsets))
     }
 
-    async fn optimistic_tail_read(
-        data: &Bytes,
-        start_pos: u64,
-        scheduler: &FileScheduler,
-        file_len: u64,
-    ) -> Result<Bytes> {
-        let num_bytes_needed = file_len.checked_sub(start_pos).ok_or_else(|| {
-            Error::invalid_input_source(
-                format!(
-                    "Tail read position {} is outside file of size {}",
-                    start_pos, file_len
-                )
-                .into(),
-            )
-        })? as usize;
-        if data.len() >= num_bytes_needed {
-            Ok(data.slice((data.len() - num_bytes_needed)..))
-        } else {
-            let num_bytes_missing = (num_bytes_needed - data.len()) as u64;
-            let start = file_len - num_bytes_needed as u64;
-            let missing_bytes = scheduler
-                .submit_single(start..start + num_bytes_missing, 0)
-                .await?;
-            let mut combined = BytesMut::with_capacity(data.len() + num_bytes_missing as usize);
-            combined.extend(missing_bytes);
-            combined.extend(data);
-            Ok(combined.freeze())
-        }
-    }
-
     fn do_decode_gbo_table(gbo_bytes: &Bytes, footer: &Footer) -> Result<Vec<BufferDescriptor>> {
         let mut global_bufs_cursor = Cursor::new(gbo_bytes);
 
@@ -1011,22 +990,13 @@ impl FileReader {
         Ok(())
     }
 
-    async fn decode_gbo_table(
-        tail_bytes: &Bytes,
+    fn decode_gbo_table(
+        tail: &TailRead,
         file_len: u64,
-        scheduler: &FileScheduler,
         footer: &Footer,
         version: ConcreteFileVersion,
     ) -> Result<Vec<BufferDescriptor>> {
-        // This could, in theory, trigger another IOP but the GBO table should never be large
-        // enough for that to happen
-        let gbo_bytes = Self::optimistic_tail_read(
-            tail_bytes,
-            footer.global_buff_offsets_start,
-            scheduler,
-            file_len,
-        )
-        .await?;
+        let gbo_bytes = tail.suffix_from(footer.global_buff_offsets_start)?;
         let gbo_table = Self::do_decode_gbo_table(&gbo_bytes, footer)?;
         Self::validate_gbo_table(&gbo_table, file_len, version)?;
         Ok(gbo_table)
@@ -1048,19 +1018,14 @@ impl FileReader {
         scheduler: &FileScheduler,
         options: FullMetadataReadOptions,
     ) -> Result<RawFileMetadataOpen> {
-        let InitialTailRead {
-            bytes: tail_bytes,
-            file_len,
-            offset: tail_offset,
-            retention_offset,
-        } = Self::read_tail(
+        let mut tail = Self::read_tail(
             scheduler,
             options
                 .metadata_size_bytes
                 .map_or(TailReadPlan::Baseline, TailReadPlan::ExactMetadata),
         )
         .await?;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let footer = Self::decode_footer(&tail.bytes)?;
         let version =
             ConcreteFileVersion::from_footer_numbers(footer.major_version, footer.minor_version)?;
         if version == ConcreteFileVersion::V1 {
@@ -1070,8 +1035,9 @@ impl FileReader {
             });
         }
 
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, version).await?;
+        tail.extend_to(footer.global_buff_offsets_start, scheduler)
+            .await?;
+        let gbo_table = Self::decode_gbo_table(&tail, tail.file_len, &footer, version)?;
         if gbo_table.is_empty() {
             return Err(Error::internal(
                 "File did not contain any global buffers, schema expected".to_string(),
@@ -1079,24 +1045,24 @@ impl FileReader {
         }
         let schema_start = gbo_table[0].position;
         let schema_size = gbo_table[0].size;
-        let num_footer_bytes = file_len.checked_sub(schema_start).ok_or_else(|| {
+        let num_footer_bytes = tail.file_len.checked_sub(schema_start).ok_or_else(|| {
             Error::invalid_input_source(
                 format!(
                     "Schema position {} is outside file of size {}",
-                    schema_start, file_len
+                    schema_start, tail.file_len
                 )
                 .into(),
             )
         })?;
-        let all_metadata_bytes =
-            Self::optimistic_tail_read(&tail_bytes, schema_start, scheduler, file_len).await?;
-        let schema_bytes = all_metadata_bytes.slice(0..schema_size as usize);
+        tail.extend_to(schema_start, scheduler).await?;
+        let schema_end = schema_start
+            .checked_add(schema_size)
+            .ok_or_else(|| Error::invalid_input_source("Schema byte range overflows".into()))?;
+        let schema_bytes = tail.slice(schema_start..schema_end)?;
         let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
 
-        let column_metadata_start = (footer.column_meta_start - schema_start) as usize;
-        let column_metadata_end = (footer.global_buff_offsets_start - schema_start) as usize;
         let column_metadata_bytes =
-            all_metadata_bytes.slice(column_metadata_start..column_metadata_end);
+            tail.slice(footer.column_meta_start..footer.global_buff_offsets_start)?;
         let column_metadatas = Self::read_all_column_metadata(column_metadata_bytes, &footer)?;
 
         let num_global_buffer_bytes = gbo_table.iter().map(|buf| buf.size).sum::<u64>();
@@ -1110,10 +1076,10 @@ impl FileReader {
         // done.
         let retained_global_buffers = Self::retained_global_buffers_from_tail(
             &gbo_table,
-            &tail_bytes,
-            tail_offset,
-            retention_offset,
-            file_len,
+            &tail.bytes,
+            tail.offset,
+            tail.retention_offset,
+            tail.file_len,
         )?;
 
         Ok(RawFileMetadataOpen::Current {
@@ -1128,7 +1094,7 @@ impl FileReader {
                 num_global_buffer_bytes,
                 num_footer_bytes,
                 footer,
-                file_size_bytes: file_len,
+                file_size_bytes: tail.file_len,
                 retained_global_buffers,
             },
         })
@@ -1139,31 +1105,24 @@ impl FileReader {
         known_schema: Option<(Arc<Schema>, u64)>,
         options: MetadataIndexReadOptions,
     ) -> Result<FileMetadataIndex> {
-        let InitialTailRead {
-            bytes: tail_bytes,
-            file_len,
-            offset: tail_offset,
-            retention_offset,
-        } = Self::read_tail(
+        let mut tail = Self::read_tail(
             scheduler,
             options
                 .estimated_num_columns
                 .map_or(TailReadPlan::Baseline, TailReadPlan::EstimatedMetadataIndex),
         )
         .await?;
-        let footer = Self::decode_footer(&tail_bytes)?;
+        let footer = Self::decode_footer(&tail.bytes)?;
 
         let file_version = Self::current_file_version(&footer)?;
 
-        let gbo_table =
-            Self::decode_gbo_table(&tail_bytes, file_len, scheduler, &footer, file_version);
-        let cmo_table = Self::read_range_from_tail_or_scheduler(
-            &tail_bytes,
-            tail_offset,
-            scheduler,
-            footer.column_meta_offsets_start..footer.global_buff_offsets_start,
-        );
-        let (gbo_table, cmo_table) = futures::try_join!(gbo_table, cmo_table)?;
+        let metadata_index_start = footer
+            .column_meta_offsets_start
+            .min(footer.global_buff_offsets_start);
+        tail.extend_to(metadata_index_start, scheduler).await?;
+        let gbo_table = Self::decode_gbo_table(&tail, tail.file_len, &footer, file_version)?;
+        let cmo_table =
+            tail.slice(footer.column_meta_offsets_start..footer.global_buff_offsets_start)?;
         if gbo_table.is_empty() {
             return Err(Error::internal(
                 "File did not contain any global buffers, schema expected".to_string(),
@@ -1174,14 +1133,9 @@ impl FileReader {
             Some((file_schema, num_rows)) => (file_schema, num_rows),
             None => {
                 let schema_buffer = &gbo_table[0];
-                let schema_range = schema_buffer.checked_range(0, file_len)?;
-                let schema_bytes = Self::read_range_from_tail_or_scheduler(
-                    &tail_bytes,
-                    tail_offset,
-                    scheduler,
-                    schema_range,
-                )
-                .await?;
+                let schema_range = schema_buffer.checked_range(0, tail.file_len)?;
+                tail.extend_to(schema_range.start, scheduler).await?;
+                let schema_bytes = tail.slice(schema_range)?;
                 let (num_rows, schema) = Self::decode_schema(schema_bytes)?;
                 (Arc::new(schema), num_rows)
             }
@@ -1189,10 +1143,10 @@ impl FileReader {
 
         let retained_global_buffers = Self::retained_global_buffers_from_tail(
             &gbo_table,
-            &tail_bytes,
-            tail_offset,
-            retention_offset,
-            file_len,
+            &tail.bytes,
+            tail.offset,
+            tail.retention_offset,
+            tail.file_len,
         )?;
 
         Ok(FileMetadataIndex {
@@ -1202,7 +1156,7 @@ impl FileReader {
             column_metadata_offsets,
             num_columns: footer.num_columns,
             version: file_version,
-            file_size_bytes: file_len,
+            file_size_bytes: tail.file_len,
             retained_global_buffers,
         })
     }
@@ -3727,6 +3681,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_metadata_fallback_extends_one_accumulated_suffix() {
+        let fs = FsFixture::default();
+        let num_user_global_buffers =
+            fs.object_store.block_size() / super::COLUMN_METADATA_OFFSET_ENTRY_SIZE as usize + 8;
+        let write_result = write_file_with_global_buffers(
+            &fs,
+            (0..num_user_global_buffers).map(|_| Bytes::from_static(b"x")),
+        )
+        .await;
+        let summary = write_result.summary();
+        let metadata_size = write_result.metadata_size_bytes();
+        assert!(metadata_size.get() > fs.object_store.block_size() as u64);
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(summary.size_bytes))
+            .await
+            .unwrap();
+
+        fs.object_store.io_stats_incremental();
+        let metadata = FileReader::read_all_metadata(&file_scheduler)
+            .await
+            .unwrap();
+        let stats = fs.object_store.io_stats_incremental();
+
+        assert_eq!(stats.read_iops, 3);
+        assert_eq!(stats.read_bytes, metadata_size.get());
+        assert_eq!(metadata.file_buffers.len(), num_user_global_buffers + 1);
+    }
+
+    #[tokio::test]
+    async fn reader_reuses_decoded_metadata_without_io() {
+        let fs = FsFixture::default();
+        create_some_file(&fs, ConcreteFileVersion::V2_1).await;
+        let file_scheduler = fs
+            .scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::unknown())
+            .await
+            .unwrap();
+        let path = file_scheduler.reader().path().clone();
+        let metadata = Arc::new(
+            FileReader::read_all_metadata(&file_scheduler)
+                .await
+                .unwrap(),
+        );
+
+        fs.object_store.io_stats_incremental();
+        let reader = FileReader::try_open_with_file_metadata(
+            Arc::new(crate::io::LanceEncodingsIo::new(file_scheduler)),
+            path,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            metadata.clone(),
+            &test_cache(),
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+
+        assert!(Arc::ptr_eq(reader.metadata(), &metadata));
+        assert_eq!(fs.object_store.io_stats_incremental().read_iops, 0);
+    }
+
+    #[tokio::test]
     async fn column_count_estimate_removes_cmo_dependency() {
         let fs = FsFixture::default();
         let num_columns =
@@ -4570,7 +4587,10 @@ mod tests {
         assert_eq!(batches.len(), 1);
     }
 
-    async fn write_file_with_global_buffer(fs: &FsFixture, buffer: Bytes) -> FileWriteResult {
+    async fn write_file_with_global_buffers(
+        fs: &FsFixture,
+        buffers: impl IntoIterator<Item = Bytes>,
+    ) -> FileWriteResult {
         let lance_schema =
             lance_core::datatypes::Schema::try_from(&ArrowSchema::new(vec![Field::new(
                 "foo",
@@ -4586,8 +4606,10 @@ mod tests {
         )
         .unwrap();
 
-        let buf_index = file_writer.add_global_buffer(buffer).await.unwrap();
-        assert_eq!(buf_index, 1);
+        for (buffer_index, buffer) in buffers.into_iter().enumerate() {
+            let actual_index = file_writer.add_global_buffer(buffer).await.unwrap();
+            assert_eq!(actual_index as usize, buffer_index + 1);
+        }
 
         file_writer.finish_with_metadata_size().await.unwrap()
     }
@@ -4635,7 +4657,7 @@ mod tests {
         #[case] expected_message: &str,
     ) {
         let fs = FsFixture::default();
-        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+        write_file_with_global_buffers(&fs, [Bytes::from_static(b"hello")]).await;
 
         let mut file_bytes = fs
             .object_store
@@ -4700,7 +4722,7 @@ mod tests {
         };
         let expected_read_iops = if within_window { 0 } else { 1 };
 
-        let write_result = write_file_with_global_buffer(&fs, buffer.clone()).await;
+        let write_result = write_file_with_global_buffers(&fs, [buffer.clone()]).await;
 
         let file_scheduler = fs
             .scheduler
@@ -4839,7 +4861,7 @@ mod tests {
     async fn test_read_global_buffer_out_of_range() {
         let fs = FsFixture::default();
 
-        write_file_with_global_buffer(&fs, Bytes::from_static(b"hello")).await;
+        write_file_with_global_buffers(&fs, [Bytes::from_static(b"hello")]).await;
 
         let file_scheduler = fs
             .scheduler
