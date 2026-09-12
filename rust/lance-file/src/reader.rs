@@ -785,7 +785,7 @@ impl FileReader {
     async fn read_tail(scheduler: &FileScheduler, plan: TailReadPlan) -> Result<TailRead> {
         let file_size = scheduler.reader().size().await? as u64;
         let baseline_read_size = file_size.min(scheduler.reader().block_size() as u64);
-        let requested_read_size = match plan {
+        let planned_read_size = match plan {
             TailReadPlan::Baseline => baseline_read_size,
             TailReadPlan::ExactMetadata(metadata_size_bytes) => {
                 let metadata_size_bytes = metadata_size_bytes.get();
@@ -804,6 +804,17 @@ impl FileReader {
                     .unwrap_or(baseline_read_size)
                     .min(file_size)
             }
+        };
+        let io_buffer_size_bytes = scheduler.io_buffer_size_bytes();
+        // Footer validation happens after this read, so keep advisory overread within
+        // the scheduler's configured unread-I/O budget. With no finite byte budget,
+        // use the authoritative footer-directed path.
+        let requested_read_size = if planned_read_size > baseline_read_size
+            && (io_buffer_size_bytes == 0 || planned_read_size > io_buffer_size_bytes)
+        {
+            baseline_read_size
+        } else {
+            planned_read_size
         };
         let offset = file_size - requested_read_size;
         // FileScheduler may split this logical range into concurrent physical requests.
@@ -2582,7 +2593,11 @@ mod tests {
         encoder::{EncodedBatch, EncodingOptions, encode_batch},
         format::pb21,
     };
-    use lance_io::{stream::RecordBatchStream, utils::CachedFileSize};
+    use lance_io::{
+        scheduler::{ScanScheduler, SchedulerConfig},
+        stream::RecordBatchStream,
+        utils::CachedFileSize,
+    };
     use log::debug;
     use rstest::rstest;
     use tokio::sync::mpsc;
@@ -3678,6 +3693,30 @@ mod tests {
                 "unexpected read count for stale metadata hint {stale_hint}"
             );
         }
+
+        assert!(file_size > metadata_size.get());
+        let bounded_scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig::new(metadata_size.get()),
+        );
+        let bounded_file_scheduler = bounded_scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+        for (hint, expected_read_iops) in [(metadata_size.get(), 1), (file_size, 2)] {
+            fs.object_store.io_stats_incremental();
+            let metadata = FileReader::read_all_metadata_with_options(
+                &bounded_file_scheduler,
+                FullMetadataReadOptions::default()
+                    .with_metadata_size_bytes(NonZeroU64::new(hint).unwrap()),
+            )
+            .await
+            .unwrap();
+            let stats = fs.object_store.io_stats_incremental();
+            assert_eq!(metadata.metadata_size_bytes(), metadata_size.get());
+            assert_eq!(stats.read_iops, expected_read_iops);
+            assert_eq!(stats.read_bytes, metadata_size.get());
+        }
     }
 
     #[tokio::test]
@@ -3812,6 +3851,32 @@ mod tests {
                 estimated_num_columns
             );
         }
+
+        let bounded_scheduler = ScanScheduler::new(
+            fs.object_store.clone(),
+            SchedulerConfig::new(fs.object_store.block_size() as u64),
+        );
+        let bounded_file_scheduler = bounded_scheduler
+            .open_file(&fs.tmp_path, &CachedFileSize::new(file_size))
+            .await
+            .unwrap();
+        fs.object_store.io_stats_incremental();
+        let metadata = FileReader::read_metadata_index_with_schema_and_options(
+            &bounded_file_scheduler,
+            written.schema.clone(),
+            1,
+            MetadataIndexReadOptions::default()
+                .with_estimated_num_columns(NonZeroU32::new(u32::MAX).unwrap()),
+        )
+        .await
+        .unwrap();
+        let stats = fs.object_store.io_stats_incremental();
+        assert_eq!(
+            metadata.column_metadata_offsets,
+            without_estimate.column_metadata_offsets
+        );
+        assert_eq!(stats.read_iops, 2);
+        assert_eq!(stats.read_bytes, without_estimate_stats.read_bytes);
     }
 
     #[tokio::test]
