@@ -674,7 +674,8 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// [`Self::search`] returns, named `_rowaddr` when
     /// [`Self::results_are_row_addresses`] is true and `_rowid` otherwise.
     /// A query yields only the rows where it is true, so null keys appear only
-    /// for `IS NULL`. The order of rows with equal keys is up to the index.
+    /// for `IS NULL` and for a range unbounded at both ends, which is true for
+    /// every row. The order of rows with equal keys is up to the index.
     ///
     /// The stream is complete and exact: it yields every matching row once.
     /// It has no limit, so a consumer that stops reading early owns that

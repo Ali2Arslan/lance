@@ -16,19 +16,24 @@
 mod common;
 
 use std::{
+    cell::OnceCell,
     ops::Bound,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
+use common::{BATCH_SIZE, LOW_CARDINALITY_COUNT, NUM_BATCHES, TOTAL_ROWS};
 use std::hint::black_box;
 
+use arrow::datatypes::{Int64Type, UInt64Type};
 use arrow_schema::SortOptions;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use futures::TryStreamExt;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
+use lance_datafusion::datagen::DatafusionDatagenExt;
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
@@ -841,11 +846,48 @@ async fn ordered_first_k(
     rows.min(ORDERED_FIRST_K)
 }
 
-/// Ordered search reads pages lazily, so this times the first page and its
-/// read-ahead, not the whole index.
+/// Training reads `_rowaddr`, which the generators in `common` do not write.
+async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
+    let stream = gen_batch()
+        .col("value", array::step::<Int64Type>())
+        .col(ROW_ADDR, array::step::<UInt64Type>())
+        .into_df_stream(
+            RowCount::from(BATCH_SIZE),
+            BatchCount::from(NUM_BATCHES as u32),
+        );
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        Path::from_filesystem_path(tempdir.path()).unwrap(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+    let _ = tempdir.keep();
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+    BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Ordered search reads pages lazily, so this times the first page, not the
+/// whole index.
 fn bench_ordered_first_k(c: &mut Criterion) {
     let rt = get_runtime();
-    let index = setup_int_unique_index(rt, false);
+    let lazy_index = OnceCell::new();
+    let index = || {
+        lazy_index
+            .get_or_init(|| rt.block_on(create_int_unique_row_addr_index()))
+            .clone()
+    };
     let range_size = TOTAL_ROWS / 100;
     let start = (TOTAL_ROWS - range_size) / 2;
     let range = SargableQuery::Range(
@@ -870,12 +912,13 @@ fn bench_ordered_first_k(c: &mut Criterion) {
         ("all_rows_desc", None, descending),
         ("range_1pct_asc", Some(&range), ascending),
     ] {
-        assert_eq!(
-            rt.block_on(ordered_first_k(&index, query, options)),
-            ORDERED_FIRST_K,
-            "{name} yielded fewer than {ORDERED_FIRST_K} rows"
-        );
         group.bench_function(BenchmarkId::new("int_unique", name), |b| {
+            let index = index();
+            assert_eq!(
+                rt.block_on(ordered_first_k(&index, query, options)),
+                ORDERED_FIRST_K,
+                "{name} yielded fewer than {ORDERED_FIRST_K} rows"
+            );
             b.to_async(rt).iter(|| {
                 let index = index.clone();
                 async move { black_box(ordered_first_k(&index, query, options).await) }
