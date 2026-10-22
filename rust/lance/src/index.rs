@@ -681,14 +681,18 @@ async fn build_provenance(
 /// must each match the version their entries describe
 /// ([`indexed_data_differs`]). A changed input, or a manifest the comparison
 /// needs that was cleaned up, leaves out every fragment its group produced.
-async fn fresh_fragments(
+pub(crate) async fn fresh_fragments(
     dataset: &Dataset,
     frag_reuse_index: &CompactFragReuseIndex,
     segments: &[IndexMetadata],
 ) -> Result<RoaringBitmap> {
     let mut indexed = HashSet::new();
     for segment in segments {
-        indexed.extend(indexed_field_ids(dataset, &segment.fields)?);
+        indexed.extend(indexed_field_ids(
+            dataset,
+            &segment.fields,
+            &segment.covering_fields,
+        )?);
     }
     let mut history = History::new(dataset).await?;
     // Each followed fragment's version, or `None` once it cannot be shown fresh.
@@ -785,9 +789,9 @@ async fn fresh_fragments(
 /// segment's carried columns can go stale independently of its keyed column, so
 /// checking only the keyed subtree would leave a fragment covered after a carried
 /// column was rewritten, and the segment would answer with the obsolete value.
-fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> {
+fn indexed_field_ids(dataset: &Dataset, fields: &[i32], carried: &[i32]) -> Result<HashSet<i32>> {
     let mut indexed_field_ids = HashSet::new();
-    for field_id in fields {
+    for field_id in fields.iter().chain(carried) {
         let field = dataset.schema().field_by_id(*field_id).ok_or_else(|| {
             Error::invalid_input(format!(
                 "CreateIndex: field id {field_id} does not exist in the current schema"
@@ -802,7 +806,7 @@ fn indexed_field_ids(dataset: &Dataset, fields: &[i32]) -> Result<HashSet<i32>> 
 /// since it was built. `historically_missing_exempt` names fragments compaction
 /// created after the segments were built, whose absence from a segment's
 /// history is expected rather than stale.
-async fn prune_stale_segment_coverage(
+pub(crate) async fn prune_stale_segment_coverage(
     dataset: &Dataset,
     segments: &mut [IndexSegment],
     prune_historically_missing: bool,
@@ -863,7 +867,8 @@ async fn prune_stale_segment_coverage(
             .iter_mut()
             .filter(|segment| segment.dataset_version() == version)
         {
-            let indexed_field_ids = indexed_field_ids(dataset, segment.fields())?;
+            let indexed_field_ids =
+                indexed_field_ids(dataset, segment.fields(), segment.covering_fields())?;
             let stale_fragments = segment
                 .fragment_bitmap()
                 .iter()

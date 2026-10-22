@@ -21,7 +21,7 @@ use lance_index::frag_reuse::{FRAG_REUSE_INDEX_NAME, FragDigest};
 use lance_index::scalar::{
     BatchRowIdRemapper, DEFAULT_MATERIALIZATION_BUDGET_BYTES, RemapUnavailable, RowAddrTranslator,
 };
-use lance_table::format::overlay::staleness::overlay_affects_index;
+use lance_table::format::overlay::staleness::remove_overlay_stale_frags;
 use lance_table::format::{Fragment, IndexFile, IndexMetadata};
 use lance_table::io::manifest::read_manifest_indexes;
 use lance_table::system_index::frag_reuse::ledger::{FragReuseLedger, Mapping};
@@ -327,19 +327,12 @@ async fn remap_index(dataset: &mut Dataset, index_id: &Uuid) -> Result<()> {
     // does not incorporate overlays committed after the source index was built.
     // Exclude those fragments so queries scan their current values instead.
     if let Some(fragment_bitmap) = &mut bitmap_after_remap {
-        for fragment in dataset.manifest.fragments.iter() {
-            let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
-                overlay_affects_index(
-                    overlay,
-                    &curr_index_meta.fields,
-                    curr_index_meta.dataset_version,
-                    dataset.schema(),
-                )
-            });
-            if has_newer_indexed_overlay {
-                fragment_bitmap.remove(fragment.id as u32);
-            }
-        }
+        remove_overlay_stale_frags(
+            fragment_bitmap,
+            &dataset.manifest.fragments,
+            &curr_index_meta,
+            dataset.schema(),
+        );
     }
     let new_dataset_version = if has_unknown_coverage {
         curr_index_meta.dataset_version
@@ -991,19 +984,12 @@ async fn remap_index_tagged(dataset: &mut Dataset, index_id: &Uuid) -> Result<()
     // Overlays committed after the source index was built are not
     // incorporated by the remap; exclude those fragments so queries scan
     // their current values instead (mirrors the v0 path).
-    for fragment in dataset.manifest.fragments.iter() {
-        let has_newer_indexed_overlay = fragment.overlays.iter().any(|overlay| {
-            overlay_affects_index(
-                overlay,
-                &curr_index_meta.fields,
-                curr_index_meta.dataset_version,
-                dataset.schema(),
-            )
-        });
-        if has_newer_indexed_overlay {
-            coverage.remove(fragment.id as u32);
-        }
-    }
+    remove_overlay_stale_frags(
+        &mut coverage,
+        &dataset.manifest.fragments,
+        &curr_index_meta,
+        dataset.schema(),
+    );
 
     // Straddle-only outcome: coverage was dropped but no address moves, so
     // the index files stay as they are and only the swapped bitmap (plus the

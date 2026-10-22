@@ -47,7 +47,7 @@ impl Transaction {
             if index.results_are_row_addrs() {
                 continue;
             }
-            let index_covers_modified_field = index.fields.iter().any(|field_id| {
+            let index_covers_modified_field = index.dependency_fields().iter().any(|field_id| {
                 value_updated_field_set.contains(&u32::try_from(*field_id).unwrap())
             });
             if index_covers_modified_field {
@@ -192,9 +192,10 @@ impl Transaction {
     /// exact id, or a change reported against a struct (or one of its
     /// children) misses an index on a related nested field.
     fn index_depends_on_any(index: &IndexMetadata, field_ids: &[u32], schema: &Schema) -> bool {
+        let dependency_fields = index.dependency_fields();
         field_ids.iter().any(|field_id| {
             i32::try_from(*field_id)
-                .is_ok_and(|field_id| field_affects_index(field_id, &index.fields, schema))
+                .is_ok_and(|field_id| field_affects_index(field_id, &dependency_fields, schema))
         })
     }
 
@@ -284,7 +285,7 @@ impl Transaction {
         let mut emptied = Vec::new();
         for index in indices.iter_mut().filter(|index| !is_system_index(index)) {
             let indexed: HashSet<u32> = index
-                .fields
+                .dependency_fields()
                 .iter()
                 .filter_map(|field| u32::try_from(*field).ok())
                 .collect();
@@ -440,7 +441,7 @@ impl Transaction {
         let fields_modified_set = fields_modified.iter().collect::<HashSet<_>>();
         for index in indices.iter_mut() {
             if index
-                .fields
+                .dependency_fields()
                 .iter()
                 .any(|field_id| fields_modified_set.contains(&u32::try_from(*field_id).unwrap()))
                 && let Some(fragment_bitmap) = &mut index.fragment_bitmap
@@ -544,12 +545,13 @@ impl Transaction {
                 .map(|f| f.id as u32)
                 .collect::<Vec<_>>();
             for index in indices.iter_mut() {
+                let dependency_fields = index.dependency_fields();
                 let is_stale =
                     overlaid_field_versions
                         .iter()
                         .any(|(&field_id, &overlay_version)| {
                             overlay_version > index.dataset_version
-                                && field_affects_index(field_id, &index.fields, schema)
+                                && field_affects_index(field_id, &dependency_fields, schema)
                         });
                 if is_stale && let Some(fragment_bitmap) = &mut index.fragment_bitmap {
                     for id in &fragment_ids {
@@ -573,7 +575,7 @@ impl Transaction {
         // Remove indices for fields no longer in schema
         indices.retain(|existing_index| {
             existing_index
-                .fields
+                .dependency_fields()
                 .iter()
                 .all(|field_id| field_ids.contains(field_id))
                 || is_system_index(existing_index)
@@ -896,8 +898,12 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transaction::test_support::overlay_with_field;
+    use crate::format::overlay::staleness::{
+        collect_overlay_stale_rows_for_segment, remove_overlay_stale_frags,
+    };
+    use crate::transaction::test_support::{overlay_with_field, tagged_entry};
     use chrono::{TimeZone, Utc};
+    use rstest::rstest;
     use uuid::Uuid;
 
     #[test]
@@ -1843,6 +1849,171 @@ mod tests {
         }
 
         lance_schema
+    }
+
+    const KEYED: i32 = 1;
+    const CARRIED: i32 = 2;
+    const UNRELATED: i32 = 3;
+
+    #[derive(Debug, Clone, Copy)]
+    enum DependencySite {
+        PruneUpdatedFragmentIds,
+        RegisterPureRewrite,
+        WithdrawUntaggedRewrite,
+        WithdrawTaggedRewrite,
+        PruneOverlayStaleFields,
+        RetainRelevantIndices,
+        CollectOverlayStaleFrags,
+        CollectOverlayStaleRows,
+        RemoveOverlayStaleFrags,
+    }
+
+    impl DependencySite {
+        fn marks_stale(self, changed: i32) -> bool {
+            let mut index =
+                create_test_index("covered", KEYED, 2, Some(RoaringBitmap::from([0])), false);
+            index.covering_fields = vec![CARRIED];
+            let mut indices = vec![index];
+            let schema = create_test_schema(&[KEYED, CARRIED, UNRELATED]);
+            let live = RoaringBitmap::from([0]);
+            let rewrites = vec![(0, vec![changed as u32])];
+            let mut overlaid = Fragment::new(0);
+            overlaid.overlays = vec![overlay_with_field(changed, 5)];
+            let covers = |indices: &[IndexMetadata], fragment: u64| {
+                indices[0]
+                    .fragment_bitmap
+                    .as_ref()
+                    .unwrap()
+                    .contains(fragment as u32)
+            };
+            match self {
+                Self::PruneUpdatedFragmentIds => {
+                    Transaction::prune_updated_fragment_ids_from_indices(
+                        &mut indices,
+                        &live,
+                        &[changed as u32],
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::RegisterPureRewrite => {
+                    let pure_update_frag_id = 10;
+                    Transaction::register_pure_rewrite_rows_update_frags_in_indices(
+                        &mut indices,
+                        &[pure_update_frag_id],
+                        &[0],
+                        &[changed as u32],
+                        &HashMap::new(),
+                        &schema,
+                    )
+                    .unwrap();
+                    !covers(&indices, pure_update_frag_id)
+                }
+                Self::WithdrawUntaggedRewrite => {
+                    Transaction::withdraw_in_place_rewrites(
+                        &mut indices,
+                        rewrites,
+                        &schema,
+                        &live,
+                        None,
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::WithdrawTaggedRewrite => {
+                    let history = tagged_entry(&[(&[5], &[6])]);
+                    let lineage = TaggedLineage::from_indices_with_ledger(
+                        std::slice::from_ref(&history),
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                    Transaction::withdraw_in_place_rewrites(
+                        &mut indices,
+                        rewrites,
+                        &schema,
+                        &live,
+                        Some(&lineage),
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::PruneOverlayStaleFields => {
+                    let groups = [RewriteGroup {
+                        old_fragments: vec![overlaid],
+                        new_fragments: vec![Fragment::new(7)],
+                    }];
+                    Transaction::prune_overlay_stale_fields_from_indices(
+                        &mut indices,
+                        &groups,
+                        &schema,
+                    );
+                    !covers(&indices, 0)
+                }
+                Self::RetainRelevantIndices => {
+                    let remaining = [KEYED, CARRIED, UNRELATED]
+                        .into_iter()
+                        .filter(|field| *field != changed)
+                        .collect::<Vec<_>>();
+                    Transaction::retain_relevant_indices(
+                        &mut indices,
+                        &create_test_schema(&remaining),
+                        &[Fragment::new(0)],
+                    );
+                    indices.is_empty()
+                }
+                Self::CollectOverlayStaleFrags => {
+                    let mut stale = RoaringBitmap::new();
+                    collect_overlay_stale_frags(
+                        &indices[0],
+                        &HashMap::from([(0, &overlaid)]),
+                        &mut stale,
+                        &schema,
+                    )
+                    .unwrap();
+                    stale.contains(0)
+                }
+                Self::CollectOverlayStaleRows => {
+                    let mut stale = HashMap::new();
+                    collect_overlay_stale_rows_for_segment(
+                        &indices[0],
+                        &HashMap::from([(0, &overlaid)]),
+                        &mut stale,
+                        &schema,
+                    )
+                    .unwrap();
+                    stale.contains_key(&0)
+                }
+                Self::RemoveOverlayStaleFrags => {
+                    let mut coverage = RoaringBitmap::from([0]);
+                    remove_overlay_stale_frags(&mut coverage, &[overlaid], &indices[0], &schema);
+                    !coverage.contains(0)
+                }
+            }
+        }
+    }
+
+    /// An index whose `fields` hold only its keyed column goes stale on a change
+    /// to its keyed or carried column, and not on a change to another column.
+    #[rstest]
+    #[case::prune_updated_fragment_ids(DependencySite::PruneUpdatedFragmentIds)]
+    #[case::register_pure_rewrite(DependencySite::RegisterPureRewrite)]
+    #[case::withdraw_untagged_rewrite(DependencySite::WithdrawUntaggedRewrite)]
+    #[case::withdraw_tagged_rewrite(DependencySite::WithdrawTaggedRewrite)]
+    #[case::prune_overlay_stale_fields(DependencySite::PruneOverlayStaleFields)]
+    #[case::retain_relevant_indices(DependencySite::RetainRelevantIndices)]
+    #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
+    #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
+    #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    fn test_covering_dependency(#[case] site: DependencySite) {
+        for (column, changed, stale) in [
+            ("keyed", KEYED, true),
+            ("carried", CARRIED, true),
+            ("unrelated", UNRELATED, false),
+        ] {
+            assert_eq!(
+                site.marks_stale(changed),
+                stale,
+                "{site:?}: a change to the {column} column"
+            );
+        }
     }
 }
 
