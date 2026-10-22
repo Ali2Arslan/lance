@@ -4546,12 +4546,19 @@ impl Dataset {
 }
 
 impl Dataset {
-    async fn scalar_index_info_with_plugins(
+    // Production passes `IndexDetails::get_plugin`. Tests pass a lookup that
+    // adds plugins the process-wide registry lacks, so `plugin_for` stays until
+    // a registration API replaces `SCALAR_INDEX_PLUGIN_REGISTRY`.
+    pub(crate) async fn scalar_index_info_with_plugins(
         &self,
         indices: &[IndexMetadata],
         plugin_for: impl Fn(&IndexDetails) -> Result<&dyn ScalarIndexPlugin>,
     ) -> Result<ScalarIndexInfo> {
         let schema = self.schema();
+        // Legacy V1 scans materialize index results in `MaterializeIndexExec`,
+        // which panics on the `AtLeast` result a planner's search may return.
+        let registers_planners = self.manifest.data_storage_format.lance_file_format()
+            != lance_file::version::ConcreteFileVersion::V1;
         let mut indexed_fields = Vec::new();
         let mut planners = BTreeMap::new();
         // (column, index_name) → union of every contributing IndexMetadata's
@@ -4561,6 +4568,9 @@ impl Dataset {
         // so the optimizer treats coverage as unknown.
         let mut fragment_bitmaps: HashMap<(String, String), Option<RoaringBitmap>> = HashMap::new();
         for index in indices.iter().filter(|idx| {
+            if idx.keyed_fields().len() > 1 && !registers_planners {
+                return false;
+            }
             // Check if this is an FTS index by looking at index details
             let is_fts_index = if let Some(details) = &idx.index_details {
                 IndexDetails(details.clone()).supports_fts()

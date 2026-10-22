@@ -160,7 +160,9 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     /// Returns a planner for an index keyed on more than one column
     ///
     /// `keys` holds the key columns in key order, each named by its field path. The
-    /// default returns None, so the index takes no part in query optimization.
+    /// default returns None, so the index takes no part in query optimization. The
+    /// [`ScalarIndexPlanner`] docs have an example planner. Lance never calls this
+    /// method for a dataset on legacy V1 storage.
     fn new_planner(
         &self,
         _index_name: String,

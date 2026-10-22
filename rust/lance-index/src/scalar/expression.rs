@@ -19,6 +19,12 @@
 //! consumed, even when the index cannot seek on it. A filter whose root is OR
 //! or NOT skips step 1. Inside an AND, an OR or NOT conjunct reaches the
 //! planners whole.
+//!
+//! The rule reads the filter that [`apply_scalar_indices`] receives.
+//! [`PlannerIndexExt::create_filter_plan`] optimizes the filter first, so the
+//! root can differ from the one the user wrote. For example, the optimizer
+//! turns `NOT (a = 1 AND b = 2)` into an OR. Aliases around the root do not
+//! change the rule, so an aliased OR or NOT root also skips step 1.
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -206,13 +212,48 @@ pub struct ScalarIndexPlan<'a> {
 /// before the per-column parsers, and runs the plan that consumes the most. The
 /// module docs give the full rule.
 ///
+/// The example builds on [`plan_tuple_predicate`]. Its query carries the key
+/// residual, which the index evaluates on the keys it reads. So the planner
+/// consumes the key residual too, and the search returns
+/// [`SearchResult::Exact`]. The row residual stays unconsumed.
+///
+/// [`plan_tuple_predicate`]: crate::scalar::tuple::planner::plan_tuple_predicate
+///
 /// ```
+/// use std::any::Any;
 /// use std::sync::Arc;
 ///
 /// use arrow_schema::{DataType, Field, Fields};
-/// use datafusion_expr::{Expr, col, lit};
+/// use datafusion_expr::{Expr, col, lit, utils::conjunction};
+/// use lance_index::scalar::AnyQuery;
 /// use lance_index::scalar::expression::{ScalarIndexPlan, ScalarIndexPlanner, ScalarIndexSearch};
+/// use lance_index::scalar::tuple::TupleQuery;
 /// use lance_index::scalar::tuple::planner::plan_tuple_predicate;
+///
+/// #[derive(Debug, PartialEq)]
+/// struct KeyQuery {
+///     tuples: TupleQuery,
+///     key_residual: Vec<Expr>,
+/// }
+///
+/// impl AnyQuery for KeyQuery {
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+///
+///     fn format(&self, col: &str) -> String {
+///         self.to_expr(col.to_string()).to_string()
+///     }
+///
+///     fn to_expr(&self, col: String) -> Expr {
+///         let tuples = self.tuples.to_expr(col);
+///         conjunction(std::iter::once(tuples).chain(self.key_residual.iter().cloned())).unwrap()
+///     }
+///
+///     fn dyn_eq(&self, other: &dyn AnyQuery) -> bool {
+///         other.as_any().downcast_ref::<Self>() == Some(self)
+///     }
+/// }
 ///
 /// #[derive(Debug)]
 /// struct TuplePlanner {
@@ -222,16 +263,20 @@ pub struct ScalarIndexPlan<'a> {
 /// impl ScalarIndexPlanner for TuplePlanner {
 ///     fn plan<'a>(&self, conjuncts: &'a [Expr]) -> Option<ScalarIndexPlan<'a>> {
 ///         let tuple = plan_tuple_predicate(conjuncts, &self.keys)?;
+///         let query = KeyQuery {
+///             tuples: tuple.query,
+///             key_residual: tuple.key_residual.iter().map(|&term| term.clone()).collect(),
+///         };
 ///         Some(ScalarIndexPlan {
 ///             search: ScalarIndexSearch {
 ///                 column: self.keys[0].name().clone(),
 ///                 index_name: "tenant_ts_idx".to_string(),
 ///                 index_type: "Tuple".to_string(),
-///                 query: Arc::new(tuple.query),
+///                 query: Arc::new(query),
 ///                 needs_recheck: false,
 ///                 fragment_bitmap: None,
 ///             },
-///             consumed: tuple.consumed,
+///             consumed: [tuple.consumed, tuple.key_residual].concat(),
 ///         })
 ///     }
 /// }
@@ -245,10 +290,15 @@ pub struct ScalarIndexPlan<'a> {
 /// let conjuncts = [
 ///     col("tenant").eq(lit(1)),
 ///     col("ts").gt(lit(10_i64)),
+///     (col("ts") % lit(7_i64)).eq(lit(0_i64)),
 ///     col("status").eq(lit("a")),
 /// ];
 /// let plan = planner.plan(&conjuncts).expect("tenant binds the first key");
-/// assert_eq!(plan.consumed, vec![&conjuncts[0], &conjuncts[1]]);
+/// assert_eq!(plan.consumed, vec![&conjuncts[0], &conjuncts[1], &conjuncts[2]]);
+/// assert_eq!(
+///     plan.search.query.to_expr("tenant".to_string()).to_string(),
+///     "tenant = Int32(1) AND ts > Int64(10) AND ts % Int64(7) = Int64(0)"
+/// );
 /// ```
 pub trait ScalarIndexPlanner: std::fmt::Debug + Send + Sync {
     /// Plan `conjuncts`, the terms of a filter's top-level AND.
@@ -2623,8 +2673,12 @@ fn apply_index_planners(
     index_info: &dyn IndexInformationProvider,
 ) -> Result<Option<IndexedExpression>> {
     let planners = index_info.planners();
+    let mut root = expr;
+    while let Expr::Alias(alias) = root {
+        root = alias.expr.as_ref();
+    }
     let root_is_or_not = matches!(
-        expr,
+        root,
         Expr::Not(_)
             | Expr::BinaryExpr(BinaryExpr {
                 op: Operator::Or,
@@ -2634,7 +2688,7 @@ fn apply_index_planners(
     if planners.is_empty() || root_is_or_not {
         return Ok(None);
     }
-    let conjuncts = split_conjunction(expr)
+    let conjuncts = split_conjunction(root)
         .into_iter()
         .cloned()
         .collect::<Vec<_>>();
@@ -2689,7 +2743,7 @@ fn consumed_mask(conjuncts: &[Expr], plan: &ScalarIndexPlan) -> Result<Vec<bool>
             Some(position) if !consumed[position] => consumed[position] = true,
             _ => {
                 return Err(Error::internal(format!(
-                    "Scalar index planner for '{index_name}' consumed `{conjunct}`, which is not a distinct conjunct of the {} it was offered",
+                    "Scalar index planner for '{index_name}' consumed `{conjunct}`, which is not a distinct member of the {} conjuncts it was offered",
                     conjuncts.len()
                 )));
             }
@@ -5962,6 +6016,7 @@ mod planner_tests {
     use std::any::Any;
 
     use arrow_schema::Schema;
+    use datafusion_expr::{col, lit};
     use lance_core::deepsize::{Context, DeepSizeOf};
     use lance_core::utils::row_addr_remap::RowAddrRemap;
     use lance_select::{RowAddrMask, RowAddrTreeMap};
@@ -6199,6 +6254,42 @@ mod planner_tests {
         assert_eq!(planned.refine_expr, None);
     }
 
+    fn or_root() -> Expr {
+        col("a").eq(lit(1)).or(col("b").eq(lit(2)))
+    }
+
+    fn not_root() -> Expr {
+        Expr::Not(Box::new(col("a").is_null()))
+    }
+
+    fn and_root() -> Expr {
+        col("a").eq(lit(1)).and(col("b").gt(lit(5)))
+    }
+
+    const OR_COLUMN_QUERY: &str = "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))";
+
+    #[rstest]
+    #[case::alias_over_or(1, or_root(), OR_COLUMN_QUERY)]
+    #[case::aliases_over_or(2, or_root(), OR_COLUMN_QUERY)]
+    #[case::alias_over_not(1, not_root(), "NOT([a IS NULL]@a_idx(BTree))")]
+    #[case::aliases_over_not(2, not_root(), "NOT([a IS NULL]@a_idx(BTree))")]
+    #[case::alias_over_and(1, and_root(), AB_QUERY)]
+    #[case::aliases_over_and(2, and_root(), AB_QUERY)]
+    fn aliased_roots_route_like_bare_roots(
+        #[case] aliases: usize,
+        #[case] root: Expr,
+        #[case] index_query: &str,
+    ) {
+        let indices = Indices::new(AB, vec![Box::new(key_planner("ab_idx", AB))]);
+        let filter = (0..aliases).fold(root, |expr, depth| expr.alias(format!("alias_{depth}")));
+        let planned = apply_scalar_indices(filter, &indices).unwrap();
+        assert_eq!(
+            planned.scalar_query.as_ref().map(ToString::to_string),
+            Some(index_query.to_string())
+        );
+        assert_eq!(planned.refine_expr, None);
+    }
+
     #[derive(Debug)]
     struct FixedIndex(fn() -> SearchResult);
 
@@ -6338,12 +6429,26 @@ mod planner_tests {
     }
 
     #[rstest]
-    #[case::no_conjuncts(Forgery::NoConjuncts)]
-    #[case::repeated_conjunct(Forgery::RepeatedConjunct)]
-    #[case::sub_expression(Forgery::SubExpression)]
-    fn rejects_plans_that_misreport_consumed_conjuncts(#[case] forgery: Forgery) {
+    #[case::no_conjuncts(Forgery::NoConjuncts, "consumes no conjuncts")]
+    #[case::repeated_conjunct(
+        Forgery::RepeatedConjunct,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    #[case::sub_expression(
+        Forgery::SubExpression,
+        "not a distinct member of the 2 conjuncts it was offered"
+    )]
+    fn rejects_plans_that_misreport_consumed_conjuncts(
+        #[case] forgery: Forgery,
+        #[case] reason: &str,
+    ) {
         let indices = Indices::new(&[], vec![Box::new(forgery)]);
         let error = plan(&indices, "a = 1 AND b > 5").unwrap_err();
         assert!(matches!(error, Error::Internal { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'forged_idx'") && message.contains(reason),
+            "{message}"
+        );
     }
 }
