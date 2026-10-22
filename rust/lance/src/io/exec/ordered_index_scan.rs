@@ -18,10 +18,11 @@
 //! The scope is the segment's fragment coverage, narrowed by an optional
 //! fragment allow-list.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
-use arrow_schema::{Field, Schema, SchemaRef, SortOptions};
+use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::take::take_record_batch;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
@@ -36,12 +37,16 @@ use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortExpr, expressi
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_core::{Error, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
-use lance_index::{metrics::MetricsCollector, scalar::AnyQuery};
+use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
+use lance_index::scalar::{AnyQuery, ScalarIndex};
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::IndexMetadata;
+use lance_table::format::overlay::staleness::overlay_exclusion_offsets;
 use roaring::RoaringBitmap;
 
 use super::utils::InstrumentedRecordBatchStreamAdapter;
+use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
+use crate::io::deletion::read_dataset_deletion_file;
 use crate::{Dataset, index::DatasetIndexInternalExt};
 
 /// Streams one segment of a B-tree index in key order as two columns: the key,
@@ -49,7 +54,9 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 ///
 /// Deleted rows and rows outside the fragment scope never reach the output, so
 /// they do not use up `fetch`. Rows with equal keys come in the order the
-/// index yields them.
+/// index yields them. A fragment's deletion vector loads the first time a
+/// batch holds one of its rows, so a small `fetch` reads only the vectors of
+/// the fragments its batches reach.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -61,7 +68,7 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 /// # async fn test(dataset: Arc<Dataset>) -> Result<()> {
 /// let segment = dataset.load_indices_by_name("ts_idx").await?.remove(0);
 /// let newest_first = SortOptions { descending: true, nulls_first: false };
-/// let scan = OrderedIndexScanExec::try_new(dataset, segment, None, newest_first, None)?;
+/// let scan = OrderedIndexScanExec::try_new(dataset, segment, None, newest_first, None).await?;
 /// let newest_ten = scan.with_fetch(Some(10));
 /// # Ok(())
 /// # }
@@ -70,6 +77,7 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 pub struct OrderedIndexScanExec {
     dataset: Arc<Dataset>,
     segment: IndexMetadata,
+    index: Arc<dyn ScalarIndex>,
     column: String,
     query: Option<Arc<dyn AnyQuery>>,
     options: SortOptions,
@@ -87,14 +95,29 @@ impl OrderedIndexScanExec {
     /// order. `fragments`, when set, limits the output to rows in those
     /// fragments.
     ///
+    /// This opens the segment and checks that it can stream in key order
+    /// without reading a data page, so a planner that gets an error can keep
+    /// its sort.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] when the segment indexes more or fewer
-    /// than one column or records no fragment coverage. Returns
-    /// [`Error::NotSupported`] when the dataset uses stable row ids and the
-    /// segment stores them instead of row addresses, which segments written
-    /// before the row address migration do.
-    pub fn try_new(
+    /// than one column, names a field the dataset does not have, or records no
+    /// fragment coverage, or when the index rejects `query`.
+    ///
+    /// Returns [`Error::NotSupported`] in these cases:
+    ///
+    /// - The dataset uses stable row ids and the segment stores them instead
+    ///   of row addresses. Segments written before the row address migration
+    ///   do.
+    /// - A data overlay committed after the segment changes the indexed column
+    ///   in a fragment the scan reads.
+    /// - The index cannot search in key order, because it is not a B-tree or
+    ///   its pages are not in key order.
+    ///
+    /// Returns [`Error::Index`] when the index returns a key type other than
+    /// the column's.
+    pub async fn try_new(
         dataset: Arc<Dataset>,
         segment: IndexMetadata,
         query: Option<Arc<dyn AnyQuery>>,
@@ -124,18 +147,24 @@ impl OrderedIndexScanExec {
                 segment.uuid, segment.name
             )));
         }
-        let column = dataset.schema().field_path(field_id)?;
-        let field = dataset
-            .schema()
-            .field_by_id(field_id)
-            .expect("field_path found the field");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(&column, field.data_type(), field.nullable),
+        let schema = dataset.schema();
+        let ancestry = schema.field_ancestry_by_id(field_id).unwrap_or_default();
+        let [.., key] = ancestry.as_slice() else {
+            return Err(Error::invalid_input(format!(
+                "ordered index scan reads field id {field_id}, but segment {} of index '{}' \
+                 names a field the dataset schema does not have",
+                segment.uuid, segment.name
+            )));
+        };
+        let column = schema.field_path_minimal(field_id)?;
+        let nullable = ancestry.iter().any(|field| field.nullable);
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new(&column, key.data_type(), nullable),
             ROW_ADDR_FIELD.clone(),
         ]));
         let ordering = PhysicalSortExpr::new(Arc::new(Column::new(&column, 0)), options);
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new_with_orderings(schema, [[ordering]]),
+            EquivalenceProperties::new_with_orderings(output_schema, [[ordering]]),
             Partitioning::RoundRobinBatch(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -144,9 +173,25 @@ impl OrderedIndexScanExec {
             Some(fragments) => coverage & fragments,
             None => coverage.clone(),
         };
-        Ok(Self {
+
+        // Dropping the stale rows is not enough: a row whose overlay moved its
+        // key into the requested range would be missing from the output.
+        if let Some((version, fragment_id)) = newer_key_overlay(&dataset, &segment, &scope)? {
+            return Err(Error::not_supported(format!(
+                "ordered index scan cannot read segment {} of index '{}' in key order: a data \
+                 overlay committed at version {version} changed column '{column}' in fragment \
+                 {fragment_id} after the segment was built at version {}; sort the rows instead",
+                segment.uuid, segment.name, segment.dataset_version
+            )));
+        }
+
+        let index = dataset
+            .open_scalar_index(&column, &segment.uuid, &NoOpMetricsCollector)
+            .await?;
+        let plan = Self {
             dataset,
             segment,
+            index,
             column,
             query,
             options,
@@ -154,31 +199,58 @@ impl OrderedIndexScanExec {
             fetch: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
-        })
+        };
+        plan.checked_ordered_stream(Arc::new(NoOpMetricsCollector))
+            .await?;
+        Ok(plan)
+    }
+
+    async fn checked_ordered_stream(
+        &self,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        let batches = self
+            .index
+            .search_ordered(self.query.as_deref(), self.options, metrics)
+            .await?;
+        let schema = self.schema();
+        let key_type = schema.field(0).data_type();
+        let returned = batches.schema();
+        let returned_types = returned.fields().iter().map(|field| field.data_type());
+        if !returned_types.eq([key_type, &DataType::UInt64]) {
+            let returned_fields = returned
+                .fields()
+                .iter()
+                .map(|field| format!("{}: {}", field.name(), field.data_type()))
+                .collect::<Vec<_>>();
+            return Err(Error::index(format!(
+                "ordered index scan expects segment {} of index '{}' to return column '{}' as \
+                 {key_type} and row ids as UInt64, but it returned [{}]",
+                self.segment.uuid,
+                self.segment.name,
+                self.column,
+                returned_fields.join(", ")
+            )));
+        }
+        Ok(batches)
     }
 
     async fn live_rows(
         self,
         partition: usize,
     ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
-        let pages_loaded: Arc<dyn MetricsCollector> = Arc::new(PagesLoaded(
+        let pages_loaded = Arc::new(PagesLoaded(
             self.metrics.new_count("pages_loaded", partition),
         ));
-        let (index, deleted) = futures::try_join!(
-            self.dataset
-                .open_scalar_index(&self.column, &self.segment.uuid, pages_loaded.as_ref()),
-            load_deleted_rows(&self.dataset, &self.scope),
-        )?;
-        let batches = index
-            .search_ordered(self.query.as_deref(), self.options, pages_loaded)
-            .await?;
-        let schema = self.schema();
+        let batches = self.checked_ordered_stream(pages_loaded).await?;
         Ok(LiveRows {
+            schema: self.schema(),
             batches,
+            dataset: self.dataset,
             scope: self.scope,
-            deleted,
+            loaded_fragments: RoaringBitmap::new(),
+            deleted: RowAddrTreeMap::new(),
             remaining: self.fetch,
-            schema,
             index_name: self.segment.name,
             metrics: RowMetrics::new(&self.metrics, partition),
         }
@@ -186,27 +258,35 @@ impl OrderedIndexScanExec {
     }
 }
 
-async fn load_deleted_rows(dataset: &Dataset, scope: &RoaringBitmap) -> Result<RowAddrTreeMap> {
-    let mut deleted = RowAddrTreeMap::new();
-    for fragment_id in &(scope - dataset.fragment_bitmap().as_ref()) {
-        deleted.insert_fragment(fragment_id);
-    }
-    let fragments = dataset
-        .get_fragments()
-        .into_iter()
-        .filter(|fragment| scope.contains(fragment.id() as u32));
-    let mut deletion_vectors = stream::iter(fragments)
-        .map(|fragment| async move {
-            let deletions = fragment.get_deletion_vector().await?;
-            Result::Ok((fragment.id() as u32, deletions))
-        })
-        .buffer_unordered(dataset.object_store.io_parallelism());
-    while let Some((fragment_id, deletions)) = deletion_vectors.try_next().await? {
-        if let Some(deletions) = deletions {
-            deleted.insert_bitmap(fragment_id, RoaringBitmap::from(deletions.as_ref()));
+/// The version and fragment of the newest data overlay that was committed
+/// after `segment` and changes indexed rows in a fragment in `scope`.
+fn newer_key_overlay(
+    dataset: &Dataset,
+    segment: &IndexMetadata,
+    scope: &RoaringBitmap,
+) -> Result<Option<(u64, u32)>> {
+    let mut overlaid = overlaid_fragments(dataset.fragments());
+    overlaid.retain(|fragment_id, _| scope.contains(*fragment_id));
+    let mut stale = HashMap::new();
+    collect_overlay_stale_rows_for_segment(segment, &overlaid, &mut stale, dataset.schema())?;
+    let mut newest = None;
+    for (&fragment_id, fragment) in &overlaid {
+        if !stale.contains_key(&fragment_id) {
+            continue;
+        }
+        for overlay in &fragment.overlays {
+            let changed_rows = overlay_exclusion_offsets(
+                std::slice::from_ref(overlay),
+                &segment.fields,
+                segment.dataset_version,
+                dataset.schema(),
+            )?;
+            if !changed_rows.is_empty() {
+                newest = newest.max(Some((overlay.committed_version, fragment_id)));
+            }
         }
     }
-    Ok(deleted)
+    Ok(newest)
 }
 
 struct PagesLoaded(Count);
@@ -223,6 +303,7 @@ struct RowMetrics {
     scanned: Count,
     deleted: Count,
     excluded: Count,
+    deletion_vectors_loaded: Count,
 }
 
 impl RowMetrics {
@@ -231,13 +312,16 @@ impl RowMetrics {
             scanned: metrics.new_count(ROWS_SCANNED_METRIC, partition),
             deleted: metrics.new_count("rows_deleted", partition),
             excluded: metrics.new_count("rows_excluded", partition),
+            deletion_vectors_loaded: metrics.new_count("deletion_vectors_loaded", partition),
         }
     }
 }
 
 struct LiveRows {
     batches: SendableRecordBatchStream,
+    dataset: Arc<Dataset>,
     scope: RoaringBitmap,
+    loaded_fragments: RoaringBitmap,
     deleted: RowAddrTreeMap,
     remaining: Option<usize>,
     schema: SchemaRef,
@@ -252,7 +336,7 @@ impl LiveRows {
                 let Some(batch) = rows.batches.try_next().await? else {
                     break;
                 };
-                let live = rows.filter(&batch)?;
+                let live = rows.filter(&batch).await?;
                 if live.num_rows() > 0 {
                     return Ok(Some((live, rows)));
                 }
@@ -261,7 +345,45 @@ impl LiveRows {
         })
     }
 
-    fn filter(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
+    async fn load_deletions(&mut self, addrs: &[u64]) -> Result<()> {
+        let reached = RoaringBitmap::from_iter(
+            addrs
+                .iter()
+                .map(|&addr| RowAddress::from(addr).fragment_id()),
+        );
+        let unloaded = (reached & &self.scope) - &self.loaded_fragments;
+        let mut deletion_files = Vec::new();
+        for fragment_id in &unloaded {
+            match self.dataset.find_fragment(fragment_id.into()) {
+                None => self.deleted.insert_fragment(fragment_id),
+                Some(fragment) => {
+                    if let Some(deletion_file) = &fragment.deletion_file {
+                        deletion_files.push((fragment_id, deletion_file.clone()));
+                    }
+                }
+            }
+        }
+        let mut vectors = stream::iter(deletion_files)
+            .map(|(fragment_id, deletion_file)| {
+                let dataset = self.dataset.clone();
+                async move {
+                    let vector =
+                        read_dataset_deletion_file(&dataset, fragment_id.into(), &deletion_file)
+                            .await?;
+                    Result::Ok((fragment_id, vector))
+                }
+            })
+            .buffer_unordered(self.dataset.object_store.io_parallelism());
+        while let Some((fragment_id, vector)) = vectors.try_next().await? {
+            self.deleted
+                .insert_bitmap(fragment_id, RoaringBitmap::from(vector.as_ref()));
+            self.metrics.deletion_vectors_loaded.add(1);
+        }
+        self.loaded_fragments |= unloaded;
+        Ok(())
+    }
+
+    async fn filter(&mut self, batch: &RecordBatch) -> Result<RecordBatch> {
         let addrs = batch.column(1).as_primitive::<UInt64Type>();
         if addrs.null_count() > 0 {
             return Err(Error::index(format!(
@@ -270,6 +392,7 @@ impl LiveRows {
                 ScalarValue::try_from_array(batch.column(0), 0)?
             )));
         }
+        self.load_deletions(addrs.values()).await?;
         let mut live = Vec::new();
         let (mut num_deleted, mut num_excluded) = (0, 0);
         for (row, &addr) in addrs.values().iter().enumerate() {
@@ -351,6 +474,13 @@ impl ExecutionPlan for OrderedIndexScanExec {
         }
     }
 
+    fn reset_state(self: Arc<Self>) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self {
+            metrics: ExecutionPlanMetricsSet::new(),
+            ..self.as_ref().clone()
+        }))
+    }
+
     fn execute(
         &self,
         partition: usize,
@@ -389,8 +519,12 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::{Bound, Range};
 
-    use arrow_array::{Int32Array, RecordBatchIterator, UInt64Array, types::Int32Type};
-    use arrow_schema::DataType;
+    use arrow_array::{
+        ArrayRef, Int32Array, RecordBatchIterator, StringArray, StructArray, UInt64Array,
+        types::Int32Type,
+    };
+    use arrow_buffer::NullBuffer;
+    use datafusion::physical_plan::metrics::MetricValue;
     use datafusion::physical_plan::{
         ExecutionPlanProperties, displayable, stream::RecordBatchStreamAdapter,
     };
@@ -398,18 +532,24 @@ mod tests {
     use lance_core::ROW_ADDR;
     use lance_datafusion::exec::{LanceExecutionOptions, analyze_plan};
     use lance_index::IndexType;
-    use lance_index::scalar::btree::BTreeParameters;
+    use lance_index::scalar::btree::{BTreeParameters, train_btree_index};
+    use lance_index::scalar::lance_format::LanceIndexStore;
+    use lance_index::scalar::registry::VALUE_COLUMN_NAME;
     use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
     use rstest::rstest;
+    use uuid::Uuid;
 
     use super::*;
-    use crate::dataset::WriteParams;
+    use crate::dataset::index::LanceIndexStoreExt;
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
     use crate::utils::test::copy_test_data_to_tmp;
 
     const ROWS: i32 = 240;
     const FRAGMENT_ROWS: usize = 60;
     const PAGE_ROWS: u64 = 16;
+    const INDEX_NAME: &str = "key_idx";
 
     const ASC_NULLS_FIRST: SortOptions = SortOptions {
         descending: false,
@@ -430,19 +570,38 @@ mod tests {
 
     type Row = (Option<i32>, u64);
 
+    fn fixture_key(row: i32, nulls: bool) -> Option<i32> {
+        let unique_key_out_of_address_order = row * 7 % ROWS;
+        let null_row = nulls && row % 20 == 3;
+        (!null_row).then_some(unique_key_out_of_address_order)
+    }
+
+    fn fixture_addr(row: i32) -> u64 {
+        let (fragment, offset) = (row as usize / FRAGMENT_ROWS, row as usize % FRAGMENT_ROWS);
+        RowAddress::new_from_parts(fragment as u32, offset as u32).into()
+    }
+
     async fn fixture(stable_row_ids: bool, nulls: bool, delete: Option<&str>) -> Arc<Dataset> {
-        let unique_key_out_of_address_order = |row: i32| row * 7 % ROWS;
-        let null_row = |row: i32| nulls && row % 20 == 3;
-        let keys = Int32Array::from_iter(
-            (0..ROWS).map(|row| (!null_row(row)).then(|| unique_key_out_of_address_order(row))),
-        );
-        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, true)]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(keys)]).unwrap();
+        let keys = Int32Array::from_iter((0..ROWS).map(|row| fixture_key(row, nulls)));
+        let mut dataset = indexed_dataset(key_column("key", keys), "key", stable_row_ids).await;
+        if let Some(predicate) = delete {
+            dataset.delete(predicate).await.unwrap();
+        }
+        Arc::new(dataset)
+    }
+
+    fn key_column(name: &str, keys: Int32Array) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int32, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(keys)]).unwrap()
+    }
+
+    async fn indexed_dataset(batch: RecordBatch, column: &str, stable_row_ids: bool) -> Dataset {
         let params = WriteParams {
             max_rows_per_file: FRAGMENT_ROWS,
             enable_stable_row_ids: stable_row_ids,
             ..Default::default()
         };
+        let schema = batch.schema();
         let mut dataset = Dataset::write(
             RecordBatchIterator::new([Ok(batch)], schema),
             "memory://",
@@ -458,23 +617,20 @@ mod tests {
             .with_params(&serde_json::to_value(btree).unwrap());
         dataset
             .create_index(
-                &["key"],
+                &[column],
                 IndexType::BTree,
-                Some("key_idx".into()),
+                Some(INDEX_NAME.into()),
                 &params,
                 false,
             )
             .await
             .unwrap();
-        if let Some(predicate) = delete {
-            dataset.delete(predicate).await.unwrap();
-        }
-        Arc::new(dataset)
+        dataset
     }
 
     async fn key_segment(dataset: &Dataset) -> IndexMetadata {
         dataset
-            .load_indices_by_name("key_idx")
+            .load_indices_by_name(INDEX_NAME)
             .await
             .unwrap()
             .remove(0)
@@ -516,7 +672,7 @@ mod tests {
         batches
             .iter()
             .flat_map(|batch| {
-                let keys = batch["key"].as_primitive::<Int32Type>();
+                let keys = batch.column(0).as_primitive::<Int32Type>();
                 let addrs = batch[ROW_ADDR].as_primitive::<UInt64Type>();
                 keys.iter()
                     .zip(addrs.values().iter().copied())
@@ -583,6 +739,7 @@ mod tests {
             options,
             allowed.as_ref(),
         )
+        .await
         .unwrap()
         .with_fetch(fetch)
         .unwrap();
@@ -619,11 +776,30 @@ mod tests {
         }
         let addrs = rows.iter().map(|(_, addr)| *addr).collect::<HashSet<_>>();
         assert_eq!(addrs.len(), rows.len(), "a row was emitted twice");
+
+        let mut index_rows = (0..ROWS)
+            .map(|row| (fixture_key(row, nulls), fixture_addr(row)))
+            .filter(|(key, _)| selected(*key))
+            .collect::<Vec<_>>();
+        index_rows.sort_by(|a, b| key_order(&a.0, &b.0, options));
+        let (mut emitted, mut deleted, mut excluded) = (0, 0, 0);
+        for (_, addr) in index_rows {
+            if fetch == Some(emitted) {
+                break;
+            }
+            if !in_scope(addr) {
+                excluded += 1;
+            } else if !live.contains_key(&addr) {
+                deleted += 1;
+            } else {
+                emitted += 1;
+            }
+        }
+        assert_eq!(metric(plan.as_ref(), "rows_deleted"), deleted);
+        assert_eq!(metric(plan.as_ref(), "rows_excluded"), excluded);
         assert_eq!(
             metric(plan.as_ref(), "rows_scanned"),
-            rows.len()
-                + metric(plan.as_ref(), "rows_deleted")
-                + metric(plan.as_ref(), "rows_excluded")
+            rows.len() + deleted + excluded
         );
     }
 
@@ -631,7 +807,7 @@ mod tests {
     async fn fetch_backfills_past_deleted_rows() {
         let dataset = fixture(false, false, Some("key < 4")).await;
         let segment = key_segment(&dataset).await;
-        let plan = || {
+        let plan = || async {
             OrderedIndexScanExec::try_new(
                 dataset.clone(),
                 segment.clone(),
@@ -639,19 +815,20 @@ mod tests {
                 ASC_NULLS_LAST,
                 None,
             )
+            .await
             .unwrap()
             .with_fetch(Some(10))
             .unwrap()
         };
 
-        let keys = run(plan())
+        let keys = run(plan().await)
             .await
             .into_iter()
             .map(|(key, _)| key)
             .collect::<Vec<_>>();
         assert_eq!(keys, (4..14).map(Some).collect::<Vec<_>>());
 
-        let analyzed = analyze_plan(plan(), LanceExecutionOptions::default())
+        let analyzed = analyze_plan(plan().await, LanceExecutionOptions::default())
             .await
             .unwrap();
         let line = analyzed
@@ -693,6 +870,7 @@ mod tests {
         let segment = key_segment(&dataset).await;
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
             OrderedIndexScanExec::try_new(dataset.clone(), segment.clone(), None, options, None)
+                .await
                 .unwrap(),
         );
         let ordering = LexOrdering::new([PhysicalSortExpr::new(
@@ -723,6 +901,7 @@ mod tests {
         );
         let filtered =
             OrderedIndexScanExec::try_new(dataset, segment, Some(Arc::new(range)), options, None)
+                .await
                 .unwrap();
         assert_eq!(
             displayable(&filtered).one_line().to_string().trim(),
@@ -735,15 +914,56 @@ mod tests {
     #[rstest]
     #[case::no_fragment_coverage(|segment: &mut IndexMetadata| segment.fragment_bitmap = None)]
     #[case::two_columns(|segment: &mut IndexMetadata| segment.fields.push(segment.fields[0]))]
+    #[case::unknown_field(|segment: &mut IndexMetadata| segment.fields = vec![999])]
     #[tokio::test]
     async fn malformed_segment_is_rejected(#[case] malform: fn(&mut IndexMetadata)) {
         let dataset = fixture(false, false, None).await;
         let mut segment = key_segment(&dataset).await;
         malform(&mut segment);
-        let error = OrderedIndexScanExec::try_new(dataset, segment, None, ASC_NULLS_FIRST, None)
-            .unwrap_err();
+        let error =
+            OrderedIndexScanExec::try_new(dataset, segment.clone(), None, ASC_NULLS_FIRST, None)
+                .await
+                .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("index 'key_idx'"), "{error}");
+        assert!(
+            error.to_string().contains(&segment.uuid.to_string()),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_type_mismatch_names_the_index_segment_column_and_types() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let names = StringArray::from_iter_values((0..ROWS).map(|row| row.to_string()));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..ROWS)),
+                Arc::new(names),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(indexed_dataset(batch, "key", false).await);
+        let mut segment = key_segment(&dataset).await;
+        segment.fields = vec![dataset.schema().field("name").unwrap().id];
+
+        let error =
+            OrderedIndexScanExec::try_new(dataset, segment.clone(), None, ASC_NULLS_FIRST, None)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::Index { .. }), "{error}");
+        for expected in [
+            "index 'key_idx'",
+            &segment.uuid.to_string(),
+            "column 'name' as Utf8",
+            "it returned [value: Int32, ",
+        ] {
+            assert!(error.to_string().contains(expected), "{expected}: {error}");
+        }
     }
 
     #[tokio::test]
@@ -756,9 +976,441 @@ mod tests {
             .unwrap()
             .remove(0);
         let error = OrderedIndexScanExec::try_new(dataset, segment, None, ASC_NULLS_FIRST, None)
+            .await
             .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("index 'value_idx'"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn pages_out_of_key_order_fail_at_construction() {
+        let dataset = fixture(false, false, None).await;
+        let segment = key_segment(&dataset).await;
+        let mut rows = live_keys(&dataset)
+            .await
+            .into_iter()
+            .map(|(addr, key)| (key.unwrap(), addr))
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        let (low_partition, high_partition) = rows.split_at(8 * PAGE_ROWS as usize);
+        let merged_out_of_order = [high_partition, low_partition].concat();
+        let page_schema = Arc::new(Schema::new(vec![
+            Field::new(VALUE_COLUMN_NAME, DataType::Int32, true),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let pages = RecordBatch::try_new(
+            page_schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(
+                    merged_out_of_order.iter().map(|row| row.0),
+                )),
+                Arc::new(UInt64Array::from_iter_values(
+                    merged_out_of_order.iter().map(|row| row.1),
+                )),
+            ],
+        )
+        .unwrap();
+        let uuid = Uuid::new_v4();
+        let store = LanceIndexStore::from_dataset_for_new(&dataset, &uuid).unwrap();
+        train_btree_index(
+            Box::pin(RecordBatchStreamAdapter::new(
+                page_schema,
+                stream::iter([Ok(pages)]),
+            )),
+            &store,
+            PAGE_ROWS,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let out_of_order = IndexMetadata {
+            uuid,
+            files: None,
+            ..segment.clone()
+        };
+        let mut dataset = dataset.as_ref().clone();
+        let operation = Operation::CreateIndex {
+            new_indices: vec![out_of_order],
+            removed_indices: vec![segment],
+        };
+        dataset
+            .apply_commit(
+                Transaction::new(dataset.manifest.version, operation, None),
+                &Default::default(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let segment = key_segment(&dataset).await;
+        let error =
+            OrderedIndexScanExec::try_new(Arc::new(dataset), segment, None, ASC_NULLS_LAST, None)
+                .await
+                .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(
+            error.to_string().contains("previous max above current min"),
+            "{error}"
+        );
+    }
+
+    async fn overlay_value(
+        dataset: Arc<Dataset>,
+        column: &str,
+        row_key: i32,
+        new_value: i32,
+    ) -> Arc<Dataset> {
+        let (addr, _) = live_keys(&dataset)
+            .await
+            .into_iter()
+            .find(|(_, key)| *key == Some(row_key))
+            .unwrap();
+        let fragment_id = RowAddress::from(addr).fragment_id() as usize;
+        let field_id = dataset.schema().field(column).unwrap().id;
+        let mut overlay = dataset
+            .get_fragment(fragment_id)
+            .unwrap()
+            .write_overlay(&dataset.schema().project_by_ids(&[field_id], true))
+            .await
+            .unwrap();
+        let values = Arc::new(Schema::new(vec![
+            ROW_ADDR_FIELD.clone(),
+            Field::new(column, DataType::Int32, true),
+        ]));
+        let values = RecordBatch::try_new(
+            values,
+            vec![
+                Arc::new(UInt64Array::from(vec![addr])),
+                Arc::new(Int32Array::from(vec![new_value])),
+            ],
+        )
+        .unwrap();
+        overlay.write_batch(&values).await.unwrap();
+        let group = overlay.finish().await.unwrap().unwrap();
+        let read_version = dataset.version().version;
+        let dataset = Dataset::commit(
+            WriteDestination::Dataset(dataset),
+            Operation::DataOverlay {
+                groups: vec![group],
+            },
+            Some(read_version),
+            None,
+            None,
+            Arc::new(Default::default()),
+            false,
+        )
+        .await
+        .unwrap();
+        Arc::new(dataset)
+    }
+
+    #[rstest]
+    #[case::key_moves_into_range(10, 50)]
+    #[case::key_moves_out_of_range(50, 10)]
+    #[tokio::test]
+    async fn newer_key_overlay_is_not_supported(#[case] old_key: i32, #[case] new_key: i32) {
+        let dataset =
+            overlay_value(fixture(false, false, None).await, "key", old_key, new_key).await;
+        let segment = key_segment(&dataset).await;
+        let range = SargableQuery::Range(
+            Bound::Included(ScalarValue::Int32(Some(40))),
+            Bound::Excluded(ScalarValue::Int32(Some(120))),
+        );
+        let error = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            segment.clone(),
+            Some(Arc::new(range)),
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        for expected in [
+            "index 'key_idx'".to_string(),
+            segment.uuid.to_string(),
+            "column 'key'".to_string(),
+            format!("version {}", dataset.version().version),
+        ] {
+            assert!(error.to_string().contains(&expected), "{expected}: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn key_overlay_outside_the_fragment_scope_is_read() {
+        let dataset = overlay_value(fixture(false, false, None).await, "key", 10, 50).await;
+        let overlaid = dataset
+            .fragments()
+            .iter()
+            .find(|fragment| !fragment.overlays.is_empty())
+            .unwrap()
+            .id as u32;
+        let mut allowed = dataset.fragment_bitmap().as_ref().clone();
+        allowed.remove(overlaid);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            ASC_NULLS_LAST,
+            Some(&allowed),
+        )
+        .await
+        .unwrap();
+
+        let rows = run(Arc::new(plan)).await;
+        let mut expected = (0..ROWS)
+            .filter(|row| allowed.contains(RowAddress::from(fixture_addr(*row)).fragment_id()))
+            .map(|row| (fixture_key(row, false), fixture_addr(row)))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(rows, expected);
+    }
+
+    #[rstest]
+    #[case::other_column("other", false)]
+    #[case::index_rebuilt_after_the_overlay("key", true)]
+    #[tokio::test]
+    async fn overlay_the_segment_already_reflects_is_read(
+        #[case] column: &str,
+        #[case] rebuild_index: bool,
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, true),
+            Field::new("other", DataType::Int32, true),
+        ]));
+        let keys = Int32Array::from_iter((0..ROWS).map(|row| fixture_key(row, false)));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(keys),
+                Arc::new(Int32Array::from_iter_values(0..ROWS)),
+            ],
+        )
+        .unwrap();
+        let dataset = Arc::new(indexed_dataset(batch, "key", false).await);
+        let mut dataset = overlay_value(dataset, column, 10, 1000)
+            .await
+            .as_ref()
+            .clone();
+        if rebuild_index {
+            dataset
+                .create_index(
+                    &["key"],
+                    IndexType::BTree,
+                    Some(INDEX_NAME.into()),
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let dataset = Arc::new(dataset);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut expected = live_keys(&dataset)
+            .await
+            .into_iter()
+            .map(|(addr, key)| (key, addr))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(run(Arc::new(plan)).await, expected);
+    }
+
+    #[rstest]
+    #[case::asc_nulls_first(ASC_NULLS_FIRST)]
+    #[case::asc_nulls_last(ASC_NULLS_LAST)]
+    #[case::desc_nulls_first(DESC_NULLS_FIRST)]
+    #[case::desc_nulls_last(DESC_NULLS_LAST)]
+    #[tokio::test]
+    async fn key_under_a_nullable_parent_is_nullable(#[case] options: SortOptions) {
+        let null_parent = |row: i32| row % 20 == 3;
+        let parent = StructArray::new(
+            vec![Field::new("key", DataType::Int32, false)].into(),
+            vec![Arc::new(Int32Array::from_iter_values(0..ROWS)) as ArrayRef],
+            Some(NullBuffer::from_iter(
+                (0..ROWS).map(|row| !null_parent(row)),
+            )),
+        );
+        let schema = Schema::new(vec![Field::new("parent", parent.data_type().clone(), true)]);
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(parent)]).unwrap();
+        let dataset = Arc::new(indexed_dataset(batch, "parent.key", false).await);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            options,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            plan.schema().field(0),
+            &Field::new("parent.key", DataType::Int32, true)
+        );
+
+        let mut expected = (0..ROWS)
+            .map(|row| (!null_parent(row)).then_some(row))
+            .collect::<Vec<_>>();
+        expected.sort_by(|a, b| key_order(a, b, options));
+        let keys = run(Arc::new(plan))
+            .await
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+    }
+
+    #[tokio::test]
+    async fn hyphenated_column_keeps_its_name() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "my-col",
+            DataType::Int32,
+            false,
+        )]));
+        let keys = Int32Array::from_iter_values((0..ROWS).rev());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(keys)]).unwrap();
+        let dataset = Arc::new(indexed_dataset(batch, "my-col", false).await);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap()
+        .with_fetch(Some(3))
+        .unwrap();
+
+        assert_eq!(
+            plan.schema().field(0),
+            &Field::new("my-col", DataType::Int32, false)
+        );
+        assert_eq!(
+            displayable(plan.as_ref()).one_line().to_string().trim(),
+            "OrderedIndexScan: index=key_idx, order=[my-col ASC NULLS LAST], fetch=3"
+        );
+        let keys = run(plan)
+            .await
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect::<Vec<_>>();
+        assert_eq!(keys, [Some(0), Some(1), Some(2)]);
+    }
+
+    fn count_metrics(plan: &dyn ExecutionPlan) -> Vec<(String, usize)> {
+        let mut counts = plan
+            .metrics()
+            .unwrap()
+            .aggregate_by_name()
+            .iter()
+            .map(|metric| metric.value())
+            .filter(|value| {
+                matches!(
+                    value,
+                    MetricValue::OutputRows(_)
+                        | MetricValue::OutputBatches(_)
+                        | MetricValue::Count { .. }
+                )
+            })
+            .map(|value| (value.name().to_string(), value.as_usize()))
+            .collect::<Vec<_>>();
+        counts.sort_unstable();
+        counts
+    }
+
+    #[tokio::test]
+    async fn reset_state_starts_fresh_metrics() {
+        let dataset = fixture(false, false, Some("key < 4")).await;
+        let segment = key_segment(&dataset).await;
+        let plan = || async {
+            OrderedIndexScanExec::try_new(
+                dataset.clone(),
+                segment.clone(),
+                None,
+                ASC_NULLS_LAST,
+                None,
+            )
+            .await
+            .unwrap()
+            .with_fetch(Some(10))
+            .unwrap()
+        };
+
+        let fresh = plan().await;
+        run(fresh.clone()).await;
+        let executed = plan().await;
+        run(executed.clone()).await;
+        let reset = executed.reset_state().unwrap();
+        run(reset.clone()).await;
+
+        assert_eq!(metric(fresh.as_ref(), "rows_deleted"), 4);
+        assert_eq!(count_metrics(reset.as_ref()), count_metrics(fresh.as_ref()));
+    }
+
+    fn key_in_fragment_order(row: i32) -> i32 {
+        row
+    }
+
+    fn key_interleaving_the_first_two_fragments(row: i32) -> i32 {
+        let fragment_rows = FRAGMENT_ROWS as i32;
+        if row < 2 * fragment_rows {
+            row % fragment_rows * 2 + row / fragment_rows
+        } else {
+            row
+        }
+    }
+
+    #[rstest]
+    #[case::fetch_zero(key_in_fragment_order, Some(0), 0)]
+    #[case::keys_in_fragment_order(key_in_fragment_order, Some(10), 1)]
+    #[case::keys_interleaving_two_fragments(key_interleaving_the_first_two_fragments, Some(10), 2)]
+    #[case::no_fetch(key_in_fragment_order, None, 4)]
+    #[tokio::test]
+    async fn deletion_vectors_load_when_a_batch_first_reaches_their_fragment(
+        #[case] key: fn(i32) -> i32,
+        #[case] fetch: Option<usize>,
+        #[case] vectors_loaded: usize,
+    ) {
+        let keys = Int32Array::from_iter_values((0..ROWS).map(key));
+        let mut dataset = indexed_dataset(key_column("key", keys), "key", false).await;
+        dataset.delete("key % 5 = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap()
+        .with_fetch(fetch)
+        .unwrap();
+
+        let keys = run(plan.clone())
+            .await
+            .into_iter()
+            .map(|(key, _)| key.unwrap())
+            .collect::<Vec<_>>();
+        let expected = (0..ROWS)
+            .filter(|key| key % 5 != 0)
+            .take(fetch.unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            metric(plan.as_ref(), "deletion_vectors_loaded"),
+            vectors_loaded
+        );
     }
 
     #[rstest]
@@ -783,7 +1435,9 @@ mod tests {
                 page_schema,
                 stream::iter([Ok(page)]),
             )),
+            dataset: fixture(false, false, None).await,
             scope: RoaringBitmap::from_iter([0]),
+            loaded_fragments: RoaringBitmap::from_iter([0]),
             deleted,
             remaining: Some(1),
             schema: Arc::new(Schema::new(vec![
