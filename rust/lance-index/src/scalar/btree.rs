@@ -32,8 +32,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, IndexOrderingCapability, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -89,6 +89,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
 mod flat;
+mod ordered;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -2865,6 +2866,15 @@ impl ScalarIndex for BTreeIndex {
         )))
     }
 
+    async fn search_ordered(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        options: SortOptions,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.search_ordered_stream(query, options, metrics)
+    }
+
     fn results_are_row_addresses(&self) -> bool {
         self.results_are_row_addresses
     }
@@ -3825,6 +3835,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
     fn provides_exact_answer(&self) -> bool {
         true
+    }
+
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::Bidirectional
     }
 
     fn version(&self) -> u32 {

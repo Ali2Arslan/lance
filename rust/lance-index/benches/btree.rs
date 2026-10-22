@@ -11,6 +11,7 @@
 //! - Range filters with varying selectivity (few/many/most rows match)
 //! - IN filters with varying size (10, 20, 30 values)
 //! - Range filters over pages whose row ids span many fragments
+//! - Ordered search: time to the first 100 rows in key order
 
 mod common;
 
@@ -23,15 +24,17 @@ use std::{
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
+use arrow_schema::SortOptions;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
-use lance_index::scalar::{SargableQuery, ScalarIndex};
+use lance_index::scalar::{AnyQuery, SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
@@ -813,6 +816,75 @@ fn bench_range_many_fragments(c: &mut Criterion) {
     group.finish();
 }
 
+const ORDERED_FIRST_K: usize = 100;
+
+async fn ordered_first_k(
+    index: &Arc<dyn ScalarIndex>,
+    query: Option<&SargableQuery>,
+    options: SortOptions,
+) -> usize {
+    let mut stream = index
+        .search_ordered(
+            query.map(|query| query as &dyn AnyQuery),
+            options,
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let mut rows = 0;
+    while rows < ORDERED_FIRST_K {
+        match stream.try_next().await.unwrap() {
+            Some(batch) => rows += batch.num_rows(),
+            None => break,
+        }
+    }
+    rows.min(ORDERED_FIRST_K)
+}
+
+/// Ordered search reads pages lazily, so this times the first page and its
+/// read-ahead, not the whole index.
+fn bench_ordered_first_k(c: &mut Criterion) {
+    let rt = get_runtime();
+    let index = setup_int_unique_index(rt, false);
+    let range_size = TOTAL_ROWS / 100;
+    let start = (TOTAL_ROWS - range_size) / 2;
+    let range = SargableQuery::Range(
+        Bound::Included(ScalarValue::Int64(Some(start as i64))),
+        Bound::Excluded(ScalarValue::Int64(Some((start + range_size) as i64))),
+    );
+    let ascending = SortOptions {
+        descending: false,
+        nulls_first: true,
+    };
+    let descending = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+
+    let mut group = c.benchmark_group("btree_ordered_first_k");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+    for (name, query, options) in [
+        ("all_rows_asc", None, ascending),
+        ("all_rows_desc", None, descending),
+        ("range_1pct_asc", Some(&range), ascending),
+    ] {
+        assert_eq!(
+            rt.block_on(ordered_first_k(&index, query, options)),
+            ORDERED_FIRST_K,
+            "{name} yielded fewer than {ORDERED_FIRST_K} rows"
+        );
+        group.bench_function(BenchmarkId::new("int_unique", name), |b| {
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move { black_box(ordered_first_k(&index, query, options).await) }
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_btree(c: &mut Criterion) {
     // Run equality benchmarks
     bench_equality(c);
@@ -827,6 +899,8 @@ fn bench_btree(c: &mut Criterion) {
 
     // Run range benchmarks over pages that span many fragments
     bench_range_many_fragments(c);
+
+    bench_ordered_first_k(c);
 }
 
 #[cfg(target_os = "linux")]

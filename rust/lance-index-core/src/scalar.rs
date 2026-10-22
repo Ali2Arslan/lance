@@ -5,7 +5,7 @@
 
 use crate::remapping::{RowAddrTranslator, materialize_remap};
 use arrow_array::{BooleanArray, RecordBatch, UInt64Array};
-use arrow_schema::{DataType, Schema};
+use arrow_schema::{DataType, Schema, SortOptions};
 use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -641,7 +641,6 @@ impl SearchOptions {
         self.track_nulls
     }
 }
-
 /// A trait for a scalar index, a structure that can determine row ids that satisfy scalar queries
 #[async_trait]
 pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
@@ -666,6 +665,49 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
         self.search(query, metrics).await
+    }
+
+    /// Stream the rows that satisfy `query` in the key order of `options`, or
+    /// every row, null keys included, when `query` is `None`.
+    ///
+    /// Each batch has two columns: the key, then the row identifier that
+    /// [`Self::search`] returns, named `_rowaddr` when
+    /// [`Self::results_are_row_addresses`] is true and `_rowid` otherwise.
+    /// A query yields only the rows where it is true, so null keys appear only
+    /// for `IS NULL`. The order of rows with equal keys is up to the index.
+    ///
+    /// The stream is complete and exact: it yields every matching row once.
+    /// It has no limit, so a consumer that stops reading early owns that
+    /// truncation and must not report what it read as the full answer.
+    /// Dropping the stream stops further index reads.
+    ///
+    /// The default returns [`Error::NotSupported`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use arrow_schema::SortOptions;
+    /// # use futures::StreamExt;
+    /// # use lance_index_core::metrics::NoOpMetricsCollector;
+    /// # use lance_index_core::scalar::ScalarIndex;
+    /// # async fn test(index: &dyn ScalarIndex) -> lance_core::Result<()> {
+    /// let options = SortOptions { descending: true, nulls_first: false };
+    /// let mut stream = index
+    ///     .search_ordered(None, options, Arc::new(NoOpMetricsCollector))
+    ///     .await?;
+    /// let largest_keys = stream.next().await;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn search_ordered(
+        &self,
+        _query: Option<&dyn AnyQuery>,
+        _options: SortOptions,
+        _metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        Err(Error::not_supported(format!(
+            "ordered search is not supported by this {} index",
+            self.index_type()
+        )))
     }
 
     /// Returns true if this index reports matches as physical row addresses
