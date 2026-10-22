@@ -3,37 +3,45 @@
 
 //! Plan a conjunctive filter as a [`TupleQuery`] over ordered key columns.
 //!
-//! [`plan_tuple_predicate`] reads each conjunct on its own.
+//! [`plan_tuple_predicate`] reads each conjunct on its own. It returns `None`
+//! when no conjunct binds the first key, and the caller keeps every conjunct.
+//! Otherwise it returns a [`TuplePlan`] that sorts each conjunct by these rules:
 //!
 //! - `key = v`, `key IN (...)`, and `key IS NULL` fix a key to a set of values.
 //!   They bind a leading prefix of keys: key 0, then key 1, and so on, up to the
-//!   first key that no conjunct fixes. When several conjuncts fix one key, the
+//!   first key that no conjunct fixes or whose smallest set would grow the
+//!   prefix past [`MAX_PREFIX_TUPLES`]. When several conjuncts fix one key, the
 //!   one with the smallest set binds it.
 //! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
-//!   `key IS NOT NULL` bound the key after the prefix. The first conjunct with a
-//!   lower bound and the first with an upper bound bind it.
+//!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
+//!   binds only when every finite bound it carries is still open, because a
+//!   conjunct is consumed whole or not at all. In `a > 0 AND a BETWEEN 1 AND 10`,
+//!   `a > 0` binds the lower bound and the `BETWEEN` stays in the key residual.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes OR, NOT, `!=`,
 //!   `NOT IN`, expressions over keys, conjuncts on keys after the range, and a
-//!   second bound on a key that already has one.
-//! - A conjunct that reads any other column goes back to the caller untouched.
+//!   bound on a side that an earlier conjunct already bounds.
+//! - A conjunct that reads any other column goes back to the caller untouched,
+//!   in the row residual. A column qualified by a relation, such as `l.tenant`,
+//!   counts as outside the key, because the keys carry no relation to match it.
 //!
-//! Literals, and casts of literals, are coerced to the key type when the
-//! coercion is lossless. Any other literal leaves its conjunct in the key
-//! residual.
+//! Literals, casts of literals, and `arrow_cast` of literals are coerced to the
+//! key type when the coercion is lossless. In a returned plan, any other literal
+//! leaves its conjunct in the key residual.
 //!
 //! NULL literals follow SQL, where a comparison with NULL is never TRUE.
 //! `key = NULL` and the NULL items of `key IN (...)` match no row, so the
 //! planner drops them from the key's set. `key = NULL` and `key IN (NULL)`
-//! leave an empty set, which selects no rows. A conjunct with a NULL range
-//! bound stays in the key residual. Only `key IS NULL` matches NULL keys.
+//! leave an empty set, which selects no rows. In a returned plan, a conjunct
+//! with a NULL range bound stays in the key residual. Only `key IS NULL`
+//! matches NULL keys.
 
 use std::collections::HashSet;
 use std::ops::Bound;
 
 use arrow_schema::{DataType, Fields};
 use datafusion_common::ScalarValue;
-use datafusion_expr::expr::{Between, BinaryExpr, Cast, InList};
+use datafusion_expr::expr::{Between, BinaryExpr, Cast, InList, ScalarFunction};
 use datafusion_expr::{Expr, Operator};
 use lance_datafusion::expr::safe_coerce_scalar;
 
@@ -43,8 +51,8 @@ use super::{KeyRange, KeyValues, TupleQuery};
 ///
 /// The prefix covers the cross product of its keys' sets, and an index runs one
 /// seek per prefix tuple, so this caps the seeks one query costs. A key whose
-/// set would grow the product past the cap ends the prefix, and its conjunct
-/// stays in the key residual.
+/// set would grow the product past the cap ends the prefix. In a returned plan,
+/// its conjunct stays in the key residual.
 pub const MAX_PREFIX_TUPLES: usize = 8192;
 
 /// A conjunctive filter, split by what a [`TupleQuery`] answers.
@@ -60,7 +68,8 @@ pub struct TuplePlan<'a> {
     /// Conjuncts that read only key columns, constants included, but that
     /// `query` does not express.
     pub key_residual: Vec<&'a Expr>,
-    /// Conjuncts that read a column outside the key.
+    /// Conjuncts that read a column outside the key, including any column
+    /// qualified by a relation.
     pub row_residual: Vec<&'a Expr>,
 }
 
@@ -72,7 +81,19 @@ enum Constraint {
 /// Plan `conjuncts`, the terms of an AND, as one query over `keys`, the index's
 /// key columns in key order.
 ///
-/// Returns `None` when no conjunct binds the first key.
+/// Pass conjuncts that went through [`Planner::optimize_expr`], as
+/// [`create_filter_plan`] does before it plans per-column indices. That pass
+/// coerces literal types, so `at >= '2024-01-01'` on a timestamp key arrives
+/// here with a timestamp literal. This function never parses a string into a
+/// timestamp, so without that pass the raw string leaves its conjunct unplanned.
+///
+/// Returns `None` when no conjunct binds the first key, and the caller keeps
+/// every conjunct. When the smallest set on the first key holds more than
+/// [`MAX_PREFIX_TUPLES`] values, no set binds it, so the result is `None`
+/// unless a range binds that key.
+///
+/// [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
+/// [`create_filter_plan`]: crate::scalar::expression::PlannerIndexExt::create_filter_plan
 ///
 /// ```
 /// use arrow_schema::{DataType, Field, Fields};
@@ -103,7 +124,7 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         let reads_only_keys = conjunct
             .column_refs()
             .iter()
-            .all(|column| keys.find(&column.name).is_some());
+            .all(|column| column.relation.is_none() && keys.find(&column.name).is_some());
         if reads_only_keys {
             key_conjuncts.push((conjunct, constraint(conjunct, keys)));
         } else {
@@ -286,6 +307,15 @@ fn literal(expr: &Expr) -> Option<ScalarValue> {
             Expr::Literal(value, _) => value.cast_to(field.data_type()).ok(),
             _ => None,
         },
+        Expr::ScalarFunction(ScalarFunction { func, args }) if func.name() == "arrow_cast" => {
+            match args.as_slice() {
+                [Expr::Literal(value, _), Expr::Literal(data_type, _)] => {
+                    let data_type = data_type.try_as_str()??.parse::<DataType>().ok()?;
+                    value.cast_to(&data_type).ok()
+                }
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -307,10 +337,11 @@ mod tests {
     };
     use arrow_schema::{Field, Schema, TimeUnit};
     use datafusion::prelude::SessionContext;
-    use datafusion_common::DFSchema;
+    use datafusion_common::{Column, DFSchema};
     use datafusion_expr::utils::split_conjunction;
     use datafusion_expr::{col, lit};
     use itertools::{Itertools, iproduct};
+    use lance_datafusion::planner::Planner;
     use rstest::rstest;
 
     use super::*;
@@ -367,6 +398,9 @@ mod tests {
 
     fn selected_rows(predicate: Expr) -> Vec<bool> {
         let fixture = &*FIXTURE;
+        let predicate = Planner::new(fixture.rows.schema())
+            .optimize_expr(predicate)
+            .unwrap();
         let predicate = fixture
             .session
             .create_physical_expr(predicate, &fixture.schema)
@@ -460,6 +494,10 @@ mod tests {
         planned("TupleQuery[tenant = 1, ts = 10]", &[], &[])
     )]
     #[case::literal_on_left("1 = tenant", planned("TupleQuery[tenant = 1]", &[], &[]))]
+    #[case::arrow_cast_on_first_key(
+        "tenant = arrow_cast(1, 'Int32')",
+        planned("TupleQuery[tenant = 1]", &[], &[])
+    )]
     #[case::in_on_two_keys(
         "tenant IN (1, 2) AND ts IN (10, 20)",
         planned("TupleQuery[tenant IN (1, 2), ts IN (10, 20)]", &[], &[])
@@ -497,6 +535,10 @@ mod tests {
         "tenant = 1 AND ts < 20 AND ts BETWEEN 5 AND 10",
         planned("TupleQuery[tenant = 1, ts < 20]", &[2], &[])
     )]
+    #[case::between_after_lower_bound(
+        "tenant > 10 AND tenant BETWEEN 0 AND 100",
+        planned("TupleQuery[tenant > 10]", &[1], &[])
+    )]
     #[case::is_null_in_prefix(
         "tenant IS NULL AND ts = 10",
         planned("TupleQuery[tenant IS NULL, ts = 10]", &[], &[])
@@ -514,8 +556,8 @@ mod tests {
         planned("TupleQuery[tenant = 1, ts < 10]", &[], &[])
     )]
     #[case::in_with_null("tenant IN (1, NULL)", planned("TupleQuery[tenant = 1]", &[], &[]))]
-    #[case::in_only_null("tenant IN (NULL)", planned("TupleQuery[tenant IN ()]", &[], &[]))]
-    #[case::equals_null("tenant = NULL", planned("TupleQuery[tenant IN ()]", &[], &[]))]
+    #[case::in_only_null("tenant IN (NULL)", planned("TupleQuery[FALSE]", &[], &[]))]
+    #[case::equals_null("tenant = NULL", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::null_range_bound(
         "tenant = 1 AND ts > NULL",
         planned("TupleQuery[tenant = 1]", &[1], &[])
@@ -584,6 +626,10 @@ mod tests {
         "tenant = 1 AND ts = 10 AND at >= '2024-01-01'",
         planned("TupleQuery[tenant = 1, ts = 10]", &[2], &[])
     )]
+    #[case::arrow_cast_string_to_timestamp(
+        "tenant = 1 AND ts = 10 AND at >= arrow_cast('2024-01-01T00:00:00', 'Timestamp(Millisecond, None)')",
+        planned("TupleQuery[tenant = 1, ts = 10, at >= 1704067200000]", &[], &[])
+    )]
     #[case::literal_overflows_key("tenant = 3000000000", None)]
     #[case::float_literal_on_integer_key("tenant = 1.5", None)]
     #[case::or_across_keys("tenant = 1 OR ts = 2", None)]
@@ -595,6 +641,7 @@ mod tests {
     #[case::equality_on_second_key_only("ts = 10", None)]
     #[case::equality_on_later_keys_only("ts = 10 AND at = TIMESTAMP '2024-01-01 00:00:00'", None)]
     #[case::cast_key("CAST(tenant AS BIGINT) = 1", None)]
+    #[case::arrow_cast_of_key("tenant = arrow_cast(ts, 'Int32')", None)]
     #[case::key_compared_to_key("tenant = ts", None)]
     #[case::non_key_only("status = 'a'", None)]
     #[case::cap_8191_tuples(
@@ -614,6 +661,10 @@ mod tests {
         planned(format!("TupleQuery[{}]", in_list("tenant", 3)), &[1], &[])
     )]
     #[case::cap_8193_values_on_one_key(in_list("tenant", 8193), None)]
+    #[case::cap_8193_values_beside_range(
+        format!("{} AND tenant > 5", in_list("tenant", 8193)),
+        planned("TupleQuery[tenant > 5]", &[0], &[])
+    )]
     fn plans_conjunctive_predicate(#[case] predicate: String, #[case] expected: Option<Expected>) {
         let predicate = FIXTURE
             .session
@@ -625,6 +676,42 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         check_plan(&conjuncts, expected);
+    }
+
+    #[rstest]
+    #[case::raw(false, None)]
+    #[case::optimized(true, Some("TupleQuery[at >= 1704067200000]"))]
+    fn string_literal_on_timestamp_key_needs_the_optimizer(
+        #[case] optimize: bool,
+        #[case] expected: Option<&str>,
+    ) {
+        let keys = Fields::from(vec![FIXTURE.keys[2].clone()]);
+        let mut predicate = FIXTURE
+            .session
+            .state()
+            .create_logical_expr("at >= '2024-01-01'", &FIXTURE.schema)
+            .unwrap();
+        if optimize {
+            predicate = Planner::new(FIXTURE.rows.schema())
+                .optimize_expr(predicate)
+                .unwrap();
+        }
+        let plan = plan_tuple_predicate(std::slice::from_ref(&predicate), &keys);
+        assert_eq!(
+            plan.map(|plan| plan.query.to_string()),
+            expected.map(String::from)
+        );
+    }
+
+    #[test]
+    fn qualified_column_never_binds_a_key() {
+        let other_tenant = || Expr::Column(Column::new(Some("l"), "tenant"));
+        check_plan(&[other_tenant().eq(lit(1))], None);
+
+        let conjuncts = [col("tenant").eq(lit(1)), other_tenant().eq(lit(2))];
+        let plan = plan_tuple_predicate(&conjuncts, &FIXTURE.keys).expect("tenant binds key 0");
+        assert_eq!(plan.consumed, vec![&conjuncts[0]]);
+        assert_eq!(plan.row_residual, vec![&conjuncts[1]]);
     }
 
     #[test]

@@ -895,6 +895,9 @@ fn bench_tuple_planning(c: &mut Criterion) {
     ];
 
     let mut group = c.benchmark_group("tuple_planning");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
     group.bench_function("per_column_parse/10_conjuncts", |b| {
         b.iter_batched(
             || predicate.clone(),
