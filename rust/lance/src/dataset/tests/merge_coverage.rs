@@ -1905,9 +1905,9 @@ impl SegmentFreshnessCheck {
     }
 }
 
-/// A segment whose `fields` hold only its keyed column goes stale on a
-/// fragment once its carried column gains a data file there, and not when
-/// another column does.
+/// A segment goes stale on a fragment once its carried column gains a data
+/// file there, and not when another column does, whether or not `fields`
+/// repeats the carried column.
 #[rstest]
 #[case::prune_stale_segment_coverage(SegmentFreshnessCheck::PruneStaleSegmentCoverage)]
 #[case::fresh_fragments(SegmentFreshnessCheck::FreshFragments)]
@@ -1931,23 +1931,27 @@ async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
 
     let vector_field_id = dataset.schema().field_id("vector").unwrap();
     for (carried, stale) in [("payload", true), ("id", false)] {
-        let segment = IndexMetadata {
-            uuid: Uuid::new_v4(),
-            name: "vector_idx".to_string(),
-            fields: vec![vector_field_id],
-            covering_fields: vec![dataset.schema().field_id(carried).unwrap()],
-            dataset_version: built_at,
-            fragment_bitmap: Some(RoaringBitmap::from([0])),
-            index_details: Some(Arc::new(vector_index_details_default())),
-            index_version: IndexType::Vector.version(),
-            created_at: None,
-            base_id: None,
-            files: None,
-        };
-        assert_eq!(
-            check.marks_stale(&dataset, segment).await,
-            stale,
-            "{check:?}: a segment carrying `{carried}` after add_columns wrote `payload`"
-        );
+        let carried_id = dataset.schema().field_id(carried).unwrap();
+        for fields in [vec![vector_field_id, carried_id], vec![vector_field_id]] {
+            let segment = IndexMetadata {
+                uuid: Uuid::new_v4(),
+                name: "vector_idx".to_string(),
+                fields: fields.clone(),
+                covering_fields: vec![carried_id],
+                dataset_version: built_at,
+                fragment_bitmap: Some(RoaringBitmap::from([0])),
+                index_details: Some(Arc::new(vector_index_details_default())),
+                index_version: IndexType::Vector.version(),
+                created_at: None,
+                base_id: None,
+                files: None,
+            };
+            assert_eq!(
+                check.marks_stale(&dataset, segment).await,
+                stale,
+                "{check:?}, fields {fields:?}: a segment carrying `{carried}` after \
+                 add_columns wrote `payload`"
+            );
+        }
     }
 }

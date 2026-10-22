@@ -217,7 +217,8 @@ impl IndexMetadata {
     }
 
     /// Every field whose change can leave this index stale: [`Self::fields`],
-    /// then each of [`Self::covering_fields`] that `fields` does not list.
+    /// then each of [`Self::covering_fields`] that `fields` does not list,
+    /// once.
     ///
     /// The suffix contract repeats every carried column in `fields`, and then
     /// this borrows `fields`. A declaration whose `fields` holds only keyed
@@ -254,11 +255,11 @@ impl IndexMetadata {
             return Cow::Borrowed(&self.fields);
         }
         let mut fields = self.fields.clone();
-        fields.extend(
-            self.covering_fields
-                .iter()
-                .filter(|field| !self.fields.contains(field)),
-        );
+        for field in &self.covering_fields {
+            if !fields.contains(field) {
+                fields.push(*field);
+            }
+        }
         Cow::Owned(fields)
     }
 
@@ -781,6 +782,7 @@ mod tests {
     #[case::suffix(vec![7, 11], vec![11], vec![7, 11], true)]
     #[case::keys_only(vec![7], vec![11], vec![7, 11], false)]
     #[case::partial_overlap(vec![7, 11], vec![11, 13], vec![7, 11, 13], false)]
+    #[case::duplicate_carried(vec![7], vec![11, 11], vec![7, 11], false)]
     fn test_dependency_fields(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,

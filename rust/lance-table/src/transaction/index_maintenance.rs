@@ -1855,6 +1855,26 @@ mod tests {
     const CARRIED: i32 = 2;
     const UNRELATED: i32 = 3;
 
+    /// Released writers repeat each carried column at the end of `fields`;
+    /// the keys-only shape lists it in `covering_fields` alone.
+    #[derive(Debug, Clone, Copy)]
+    enum CoveringShape {
+        Suffix,
+        KeysOnly,
+    }
+
+    impl CoveringShape {
+        fn index(self, keyed: i32, carried: i32) -> IndexMetadata {
+            let mut index =
+                create_test_index("covered", keyed, 2, Some(RoaringBitmap::from([0])), false);
+            if matches!(self, Self::Suffix) {
+                index.fields.push(carried);
+            }
+            index.covering_fields = vec![carried];
+            index
+        }
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum DependencySite {
         PruneUpdatedFragmentIds,
@@ -1869,12 +1889,8 @@ mod tests {
     }
 
     impl DependencySite {
-        fn marks_stale(self, changed: i32) -> bool {
-            let mut index =
-                create_test_index("covered", KEYED, 2, Some(RoaringBitmap::from([0])), false);
-            index.covering_fields = vec![CARRIED];
+        fn marks_stale(self, index: IndexMetadata, schema: &Schema, changed: i32) -> bool {
             let mut indices = vec![index];
-            let schema = create_test_schema(&[KEYED, CARRIED, UNRELATED]);
             let live = RoaringBitmap::from([0]);
             let rewrites = vec![(0, vec![changed as u32])];
             let mut overlaid = Fragment::new(0);
@@ -1903,7 +1919,7 @@ mod tests {
                         &[0],
                         &[changed as u32],
                         &HashMap::new(),
-                        &schema,
+                        schema,
                     )
                     .unwrap();
                     !covers(&indices, pure_update_frag_id)
@@ -1912,7 +1928,7 @@ mod tests {
                     Transaction::withdraw_in_place_rewrites(
                         &mut indices,
                         rewrites,
-                        &schema,
+                        schema,
                         &live,
                         None,
                     );
@@ -1929,7 +1945,7 @@ mod tests {
                     Transaction::withdraw_in_place_rewrites(
                         &mut indices,
                         rewrites,
-                        &schema,
+                        schema,
                         &live,
                         Some(&lineage),
                     );
@@ -1943,13 +1959,14 @@ mod tests {
                     Transaction::prune_overlay_stale_fields_from_indices(
                         &mut indices,
                         &groups,
-                        &schema,
+                        schema,
                     );
                     !covers(&indices, 0)
                 }
                 Self::RetainRelevantIndices => {
-                    let remaining = [KEYED, CARRIED, UNRELATED]
-                        .into_iter()
+                    let remaining = schema
+                        .fields_pre_order()
+                        .map(|field| field.id)
                         .filter(|field| *field != changed)
                         .collect::<Vec<_>>();
                     Transaction::retain_relevant_indices(
@@ -1965,7 +1982,7 @@ mod tests {
                         &indices[0],
                         &HashMap::from([(0, &overlaid)]),
                         &mut stale,
-                        &schema,
+                        schema,
                     )
                     .unwrap();
                     stale.contains(0)
@@ -1976,22 +1993,23 @@ mod tests {
                         &indices[0],
                         &HashMap::from([(0, &overlaid)]),
                         &mut stale,
-                        &schema,
+                        schema,
                     )
                     .unwrap();
                     stale.contains_key(&0)
                 }
                 Self::RemoveOverlayStaleFrags => {
                     let mut coverage = RoaringBitmap::from([0]);
-                    remove_overlay_stale_frags(&mut coverage, &[overlaid], &indices[0], &schema);
+                    remove_overlay_stale_frags(&mut coverage, &[overlaid], &indices[0], schema);
                     !coverage.contains(0)
                 }
             }
         }
     }
 
-    /// An index whose `fields` hold only its keyed column goes stale on a change
-    /// to its keyed or carried column, and not on a change to another column.
+    /// An index goes stale on a change to its keyed or carried column, and not
+    /// on a change to another column, whether or not `fields` repeats the
+    /// carried column.
     #[rstest]
     #[case::prune_updated_fragment_ids(DependencySite::PruneUpdatedFragmentIds)]
     #[case::register_pure_rewrite(DependencySite::RegisterPureRewrite)]
@@ -2003,16 +2021,41 @@ mod tests {
     #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
     #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
     fn test_covering_dependency(#[case] site: DependencySite) {
-        for (column, changed, stale) in [
-            ("keyed", KEYED, true),
-            ("carried", CARRIED, true),
-            ("unrelated", UNRELATED, false),
-        ] {
-            assert_eq!(
-                site.marks_stale(changed),
-                stale,
-                "{site:?}: a change to the {column} column"
-            );
+        let schema = create_test_schema(&[KEYED, CARRIED, UNRELATED]);
+        for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+            for (column, changed, stale) in [
+                ("keyed", KEYED, true),
+                ("carried", CARRIED, true),
+                ("unrelated", UNRELATED, false),
+            ] {
+                assert_eq!(
+                    site.marks_stale(shape.index(KEYED, CARRIED), &schema, changed),
+                    stale,
+                    "{site:?}, {shape:?}: a change to the {column} column"
+                );
+            }
+        }
+    }
+
+    /// Where a check matches whole subtrees, a carried struct goes stale on a
+    /// change to its child and a carried child on a change to its struct.
+    #[rstest]
+    #[case::withdraw_untagged_rewrite(DependencySite::WithdrawUntaggedRewrite)]
+    #[case::prune_overlay_stale_fields(DependencySite::PruneOverlayStaleFields)]
+    #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
+    #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
+    #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    fn test_nested_covering_dependency(#[case] site: DependencySite) {
+        let schema = create_nested_test_schema();
+        let (s, s_x, s_y, b) = (0, 1, 2, 3);
+        for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
+            for (carried, changed, stale) in [(s, s_y, true), (s_x, s, true), (s_x, s_y, false)] {
+                assert_eq!(
+                    site.marks_stale(shape.index(b, carried), &schema, changed),
+                    stale,
+                    "{site:?}, {shape:?}: carrying field {carried}, a change to field {changed}"
+                );
+            }
         }
     }
 }
