@@ -34,6 +34,7 @@
 //! ```
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Bound;
 
@@ -51,7 +52,8 @@ pub mod planner;
 pub enum KeyValues {
     /// The key is NULL.
     Null,
-    /// The key equals one of these non-null values. An empty list matches no key.
+    /// The key equals one of these distinct non-null values. An empty list
+    /// matches no key.
     In(Vec<ScalarValue>),
 }
 
@@ -81,8 +83,8 @@ impl TupleQuery {
     /// # Errors
     ///
     /// Returns [`Error::InvalidInput`] when `prefix` and `range` constrain more
-    /// keys than `keys` holds, or when a value or bound is NULL or does not have
-    /// its key's type.
+    /// keys than `keys` holds, when a value or bound is NULL or does not have
+    /// its key's type, or when a [`KeyValues::In`] repeats a value.
     pub fn try_new(keys: Fields, prefix: Vec<KeyValues>, range: Option<KeyRange>) -> Result<Self> {
         let constrained = prefix.len() + usize::from(range.is_some());
         if constrained > keys.len() {
@@ -95,8 +97,15 @@ impl TupleQuery {
         }
         for (values, key) in prefix.iter().zip(keys.iter()) {
             if let KeyValues::In(values) = values {
+                let mut seen = HashSet::with_capacity(values.len());
                 for value in values {
                     check_value(value, key)?;
+                    if !seen.insert(value) {
+                        return Err(Error::invalid_input(format!(
+                            "TupleQuery repeats value {value:?} for key '{}'",
+                            key.name()
+                        )));
+                    }
                 }
             }
         }
@@ -281,6 +290,18 @@ mod tests {
     ) {
         let error = TupleQuery::try_new(keys(), prefix, range).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
+    #[test]
+    fn try_new_names_a_repeated_value_and_its_key() {
+        let values = [1, 2, 1].map(|v| ScalarValue::Int32(Some(v))).to_vec();
+        let error = TupleQuery::try_new(keys(), vec![KeyValues::In(values)], None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'tenant'") && message.contains("Int32(1)"),
+            "{message}"
+        );
     }
 
     #[rstest]
