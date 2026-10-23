@@ -20,7 +20,7 @@
 //! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
 //!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
 //!   binds only when every finite bound it carries is still open, because a
-//!   conjunct is consumed whole or not at all. So when a direct caller passes
+//!   conjunct is consumed whole or not at all. So in an unoptimized
 //!   `a < 20 AND a BETWEEN 5 AND 10`, the `BETWEEN` stays in the key residual.
 //!   [`Planner::optimize_expr`] splits `BETWEEN` into two bounds, so in
 //!   `a > 0 AND a BETWEEN 1 AND 10`, `a > 0` binds the lower bound, `a <= 10`
@@ -39,13 +39,11 @@
 //!
 //! NULL literals follow SQL, where a comparison with NULL is never TRUE.
 //! `key = NULL`, alone or as an OR term, and the NULL items of `key IN (...)`
-//! match no row, so the planner drops them from the key's set. A second
-//! [`Planner::optimize_expr`] pass folds an OR term `key = NULL` to a NULL
-//! literal. In a filter, `x OR NULL` selects the rows that `x` selects, so the
-//! planner drops a NULL literal OR term too. `key = NULL` and `key IN (NULL)`
-//! leave an empty set, which selects no rows. In a returned plan, a conjunct
-//! with a NULL range bound stays in the key residual. Only `key IS NULL`
-//! matches NULL keys.
+//! match no row, so the planner drops them from the key's set. In a filter,
+//! `x OR NULL` selects the rows that `x` selects, so the planner drops a NULL
+//! literal OR term too. `key = NULL` and `key IN (NULL)` leave an empty set,
+//! which selects no rows. In a returned plan, a conjunct with a NULL range
+//! bound stays in the key residual. Only `key IS NULL` matches NULL keys.
 //!
 //! [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
 
@@ -77,7 +75,7 @@ pub const MAX_PREFIX_TUPLES: usize = 8192;
 pub struct TuplePlan<'a> {
     /// The key tuples to search.
     pub query: TupleQuery,
-    /// Conjuncts that `query` expresses exactly.
+    /// Conjuncts that select exactly the rows `query` selects.
     pub consumed: Vec<&'a Expr>,
     /// Conjuncts that read only key columns, constants included, but that
     /// `query` does not express.
@@ -810,6 +808,13 @@ mod tests {
     )]
     #[case::cast_key("CAST(tenant AS BIGINT) = 1", None)]
     #[case::in_only_null("tenant IN (NULL)", planned("TupleQuery[FALSE]", &[], &[]))]
+    #[case::not_equality("NOT tenant = 1", None)]
+    #[case::not_between("tenant NOT BETWEEN 1 AND 2", None)]
+    #[case::or_with_null_literal(
+        "tenant = 1 OR NULL",
+        planned("TupleQuery[tenant = 1]", &[], &[])
+    )]
+    #[case::or_with_true("tenant = 1 OR TRUE", None)]
     #[case::or_with_lossy_value("tenant = 1 OR tenant = 1.5", None)]
     #[case::or_with_in_term(
         "tenant IN (1, 2, 3, 4) OR tenant = 5",
