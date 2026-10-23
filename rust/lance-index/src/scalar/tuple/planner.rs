@@ -75,7 +75,7 @@ pub const MAX_PREFIX_TUPLES: usize = 8192;
 pub struct TuplePlan<'a> {
     /// The key tuples to search.
     pub query: TupleQuery,
-    /// Conjuncts that select exactly the rows `query` selects.
+    /// Conjuncts whose AND selects exactly the rows `query` selects.
     pub consumed: Vec<&'a Expr>,
     /// Conjuncts that read only key columns, constants included, but that
     /// `query` does not express.
