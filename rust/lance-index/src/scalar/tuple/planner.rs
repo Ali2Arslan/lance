@@ -8,21 +8,23 @@
 //! Otherwise it returns a [`TuplePlan`] that sorts each conjunct by these rules:
 //!
 //! - `key = v`, `key IN (...)`, `key IS NULL`, and an OR whose terms are all
-//!   `key = v` on one key fix a key to a set of values. A bare Boolean key
-//!   means `key = true`, and `NOT key` means `key = false`, alone or as an OR
-//!   term. [`Planner::optimize_expr`] writes `key IN (...)` with up to three
-//!   values as such an OR, `key = true` as `key`, and `key = false` as
-//!   `NOT key`. These conjuncts bind a leading prefix of keys: key 0, then
-//!   key 1, and so on, up to the first key that no conjunct fixes or whose
-//!   smallest set would grow the prefix past [`MAX_PREFIX_TUPLES`]. When
-//!   several conjuncts fix one key, the one with the smallest set binds it.
+//!   `key = v` or `key IN (...)` on one key fix a key to a set of values. A
+//!   bare Boolean key means `key = true`, and `NOT key` means `key = false`,
+//!   alone or as an OR term. [`Planner::optimize_expr`] writes a short
+//!   `key IN (...)` list as such an OR, `key = true` as `key`, `key = false`
+//!   as `NOT key`, and `x = 0.0` on a float key as `x IN (-0.0, 0.0)`. These
+//!   conjuncts bind a leading prefix of keys: key 0, then key 1, and so on, up
+//!   to the first key that no conjunct fixes or whose smallest set would grow
+//!   the prefix past [`MAX_PREFIX_TUPLES`]. When several conjuncts fix one
+//!   key, the one with the smallest set binds it.
 //! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
 //!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
 //!   binds only when every finite bound it carries is still open, because a
-//!   conjunct is consumed whole or not at all. [`Planner::optimize_expr`]
-//!   splits `BETWEEN` into two bounds, so in `a > 0 AND a BETWEEN 1 AND 10`,
-//!   `a > 0` binds the lower bound, `a <= 10` binds the upper bound, and
-//!   `a >= 1` stays in the key residual.
+//!   conjunct is consumed whole or not at all. So when a direct caller passes
+//!   `a < 20 AND a BETWEEN 5 AND 10`, the `BETWEEN` stays in the key residual.
+//!   [`Planner::optimize_expr`] splits `BETWEEN` into two bounds, so in
+//!   `a > 0 AND a BETWEEN 1 AND 10`, `a > 0` binds the lower bound, `a <= 10`
+//!   binds the upper bound, and `a >= 1` stays in the key residual.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes any other OR or
 //!   NOT, `!=`, `NOT IN`, expressions over keys, conjuncts on keys after the
@@ -37,10 +39,13 @@
 //!
 //! NULL literals follow SQL, where a comparison with NULL is never TRUE.
 //! `key = NULL`, alone or as an OR term, and the NULL items of `key IN (...)`
-//! match no row, so the planner drops them from the key's set. `key = NULL`
-//! and `key IN (NULL)` leave an empty set, which selects no rows. In a returned
-//! plan, a conjunct with a NULL range bound stays in the key residual. Only
-//! `key IS NULL` matches NULL keys.
+//! match no row, so the planner drops them from the key's set. A second
+//! [`Planner::optimize_expr`] pass folds an OR term `key = NULL` to a NULL
+//! literal. In a filter, `x OR NULL` selects the rows that `x` selects, so the
+//! planner drops a NULL literal OR term too. `key = NULL` and `key IN (NULL)`
+//! leave an empty set, which selects no rows. In a returned plan, a conjunct
+//! with a NULL range bound stays in the key residual. Only `key IS NULL`
+//! matches NULL keys.
 //!
 //! [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
 
@@ -52,7 +57,6 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::expr::{Between, BinaryExpr, Cast, InList, ScalarFunction};
 use datafusion_expr::utils::split_binary;
 use datafusion_expr::{Expr, Operator};
-use itertools::Itertools;
 use lance_datafusion::expr::safe_coerce_scalar;
 
 use super::{KeyRange, KeyValues, TupleQuery};
@@ -248,16 +252,6 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
             };
             Some(Constraint::Range { key, range })
         }
-        Expr::InList(InList {
-            expr,
-            list,
-            negated: false,
-        }) => {
-            let (key, field) = key_column(expr, keys)?;
-            let values = list.iter().map(literal).collect::<Option<Vec<_>>>()?;
-            let values = key_values(values, field.data_type())?;
-            Some(Constraint::Values { key, values })
-        }
         Expr::Between(Between {
             expr,
             negated: false,
@@ -278,16 +272,14 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
             key: key_column(expr, keys)?.0,
             range: (Bound::Unbounded, Bound::Unbounded),
         }),
-        _ => {
-            let terms = split_binary(conjunct, Operator::Or)
-                .into_iter()
-                .map(|term| equality(term, keys))
-                .collect::<Option<Vec<_>>>()?;
-            let key = terms.iter().map(|(key, _)| *key).all_equal_value().ok()?;
-            let values = terms.into_iter().map(|(_, value)| value);
-            let values = key_values(values, keys[key].data_type())?;
-            Some(Constraint::Values { key, values })
-        }
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Eq | Operator::Or,
+            ..
+        })
+        | Expr::InList(_)
+        | Expr::Column(_)
+        | Expr::Not(_) => key_set(conjunct, keys),
+        _ => None,
     }
 }
 
@@ -298,25 +290,56 @@ fn key_column<'k>(expr: &Expr, keys: &'k Fields) -> Option<(usize, &'k FieldRef)
     }
 }
 
-fn equality(expr: &Expr, keys: &Fields) -> Option<(usize, ScalarValue)> {
+fn key_set(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
     let boolean_key = |expr: &Expr| {
         key_column(expr, keys)
             .filter(|(_, field)| field.data_type() == &DataType::Boolean)
             .map(|(key, _)| key)
     };
-    match expr {
-        Expr::BinaryExpr(BinaryExpr {
-            left,
-            op: Operator::Eq,
-            right,
-        }) => match key_column(left, keys) {
-            Some((key, _)) => Some((key, literal(right)?)),
-            None => Some((key_column(right, keys)?.0, literal(left)?)),
-        },
-        Expr::Column(_) => Some((boolean_key(expr)?, ScalarValue::Boolean(Some(true)))),
-        Expr::Not(expr) => Some((boolean_key(expr)?, ScalarValue::Boolean(Some(false)))),
-        _ => None,
+    let mut key = None;
+    let mut values = Vec::new();
+    for term in split_binary(conjunct, Operator::Or) {
+        let term_key = match term {
+            Expr::Literal(value, _) if value.is_null() => continue,
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                right,
+            }) => {
+                let (term_key, value) = match key_column(left, keys) {
+                    Some((term_key, _)) => (term_key, right),
+                    None => (key_column(right, keys)?.0, left),
+                };
+                values.push(literal(value)?);
+                term_key
+            }
+            Expr::InList(InList {
+                expr,
+                list,
+                negated: false,
+            }) => {
+                for item in list {
+                    values.push(literal(item)?);
+                }
+                key_column(expr, keys)?.0
+            }
+            Expr::Column(_) => {
+                values.push(ScalarValue::Boolean(Some(true)));
+                boolean_key(term)?
+            }
+            Expr::Not(expr) => {
+                values.push(ScalarValue::Boolean(Some(false)));
+                boolean_key(expr)?
+            }
+            _ => return None,
+        };
+        if *key.get_or_insert(term_key) != term_key {
+            return None;
+        }
     }
+    let key = key?;
+    let values = key_values(values, keys[key].data_type())?;
+    Some(Constraint::Values { key, values })
 }
 
 fn key_values(
@@ -523,13 +546,15 @@ mod tests {
         format!("{key} IN ({})", (0..len).join(", "))
     }
 
-    fn conjuncts(predicate: &str, optimize: bool) -> Vec<Expr> {
+    // A SQL filter reaches the planner after two optimizer passes, one when the
+    // scanner parses it and one in `create_filter_plan`.
+    fn conjuncts(predicate: &str, passes: usize) -> Vec<Expr> {
         let mut predicate = FIXTURE
             .session
             .state()
             .create_logical_expr(predicate, &FIXTURE.schema)
             .unwrap();
-        if optimize {
+        for _ in 0..passes {
             predicate = Planner::new(FIXTURE.rows.schema())
                 .optimize_expr(predicate)
                 .unwrap();
@@ -609,7 +634,6 @@ mod tests {
         planned("TupleQuery[tenant = 1, ts < 10]", &[], &[])
     )]
     #[case::in_with_null("tenant IN (1, NULL)", planned("TupleQuery[tenant = 1]", &[], &[]))]
-    #[case::in_only_null("tenant IN (NULL)", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::duplicate_in_values(
         "tenant IN (2, 1, 2)",
         planned("TupleQuery[tenant IN (2, 1)]", &[], &[])
@@ -711,8 +735,12 @@ mod tests {
         format!("{} AND tenant > 5", in_list("tenant", 8193)),
         planned("TupleQuery[tenant > 5]", &[0], &[])
     )]
-    fn plans_conjunctive_predicate(#[case] predicate: String, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts(&predicate, true), &FIXTURE.keys, expected);
+    fn plans_conjunctive_predicate(
+        #[case] predicate: String,
+        #[case] expected: Option<Expected>,
+        #[values(1, 2)] passes: usize,
+    ) {
+        check_plan(&conjuncts(&predicate, passes), &FIXTURE.keys, expected);
     }
 
     #[rstest]
@@ -729,8 +757,16 @@ mod tests {
         planned("TupleQuery[flag IN (true, false), tenant = 1]", &[], &[])
     )]
     #[case::or_across_keys("flag OR tenant = 1", None)]
-    fn plans_predicate_on_boolean_key(#[case] predicate: &str, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts(predicate, true), &FIXTURE.boolean_keys, expected);
+    fn plans_predicate_on_boolean_key(
+        #[case] predicate: &str,
+        #[case] expected: Option<Expected>,
+        #[values(1, 2)] passes: usize,
+    ) {
+        check_plan(
+            &conjuncts(predicate, passes),
+            &FIXTURE.boolean_keys,
+            expected,
+        );
     }
 
     #[rstest]
@@ -773,9 +809,27 @@ mod tests {
         planned("TupleQuery[tenant = 1, ts = 10, at >= 1704067200000]", &[], &[])
     )]
     #[case::cast_key("CAST(tenant AS BIGINT) = 1", None)]
+    #[case::in_only_null("tenant IN (NULL)", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::or_with_lossy_value("tenant = 1 OR tenant = 1.5", None)]
+    #[case::or_with_in_term(
+        "tenant IN (1, 2, 3, 4) OR tenant = 5",
+        planned("TupleQuery[tenant IN (1, 2, 3, 4, 5)]", &[], &[])
+    )]
+    #[case::or_with_not_in_term("tenant NOT IN (1, 2, 3, 4) OR tenant = 5", None)]
     fn plans_unoptimized_predicate(#[case] predicate: &str, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts(predicate, false), &FIXTURE.keys, expected);
+        check_plan(&conjuncts(predicate, 0), &FIXTURE.keys, expected);
+    }
+
+    #[rstest]
+    fn signed_zero_in_list_binds_float_key(#[values(1, 2)] passes: usize) {
+        let keys = Fields::from(vec![Field::new("x", DataType::Float64, true)]);
+        let planner = Planner::new(Arc::new(Schema::new(keys.clone())));
+        let mut filter = planner.parse_filter("x IN (0.0, 1.0)").unwrap();
+        for _ in 0..passes {
+            filter = planner.optimize_expr(filter).unwrap();
+        }
+        let plan = plan_tuple_predicate(std::slice::from_ref(&filter), &keys).expect("x binds");
+        assert_eq!(plan.query.to_string(), "TupleQuery[x IN (-0, 0, 1)]");
     }
 
     #[test]
