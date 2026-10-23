@@ -27,7 +27,7 @@
 
 use std::cmp::Ordering;
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::compute::{and, is_not_null, is_null};
 use arrow_array::{ArrayRef, RecordBatch, cast::AsArray};
@@ -39,6 +39,7 @@ use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchSt
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::{StreamExt, TryStreamExt, future, stream};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index_core::remapping::remap_record_batch_async;
@@ -70,7 +71,7 @@ impl BTreeIndex {
         options: SortOptions,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        check_page_order(&self.page_lookup)?;
+        check_page_order(&self.page_lookup, metrics.as_ref())?;
         let walk = self.plan_walk(query, options)?;
         let id_column = if self.results_are_row_addresses {
             ROW_ADDR
@@ -319,10 +320,46 @@ fn visits(mut pages: Vec<Matches>, full: RowSelection, partial: RowSelection) ->
         .collect()
 }
 
+/// The verdict of [`check_page_order`] on one lookup. It follows from the
+/// lookup rows, so it takes no part in lookup equality.
+#[derive(Debug, Default)]
+pub(super) struct PageOrder(OnceLock<Option<String>>);
+
+impl PartialEq for PageOrder {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl DeepSizeOf for PageOrder {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0
+            .get()
+            .map_or(0, |violation| violation.deep_size_of_children(context))
+    }
+}
+
+fn check_page_order(lookup: &BTreeLookup, metrics: &dyn MetricsCollector) -> Result<()> {
+    let violation = match lookup.page_order.0.get() {
+        Some(violation) => violation,
+        None => {
+            let violation = page_order_violation(lookup)?;
+            metrics.record_comparisons(lookup.batch.num_rows());
+            lookup.page_order.0.get_or_init(|| violation)
+        }
+    };
+    match violation {
+        Some(violation) => Err(Error::not_supported(format!(
+            "ordered search needs B-tree pages in key order, but {violation}"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// A merge of range-partitioned segments concatenates lookups without
 /// checking key order, and training on input sorted nulls last leaves a page
 /// whose min sorts after its max.
-fn check_page_order(lookup: &BTreeLookup) -> Result<()> {
+fn page_order_violation(lookup: &BTreeLookup) -> Result<Option<String>> {
     let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
     let page_ids = lookup.page_numbers()?.values();
     let stored_order = SortOptions {
@@ -359,11 +396,9 @@ fn check_page_order(lookup: &BTreeLookup) -> Result<()> {
         } else {
             continue;
         };
-        return Err(Error::not_supported(format!(
-            "ordered search needs B-tree pages in key order, but {violation}"
-        )));
+        return Ok(Some(violation));
     }
-    Ok(())
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1144,6 +1179,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[rstest]
+    #[case::in_key_order(false)]
+    #[case::out_of_key_order(true)]
+    #[tokio::test]
+    async fn test_ordered_checks_page_order_once_per_lookup(#[case] pages_swapped: bool) {
+        let rows: Vec<Row> = (0..40).map(|i| (Some(i), i as u64)).collect();
+        let (in_order, _tmpdir) = build_index(&rows, 4).await;
+        let page_ids = in_order
+            .page_lookup
+            .page_numbers()
+            .unwrap()
+            .values()
+            .to_vec();
+        let index = if pages_swapped {
+            let swapped: Vec<u32> = [page_ids[1], page_ids[0]]
+                .into_iter()
+                .chain(page_ids[2..].iter().copied())
+                .collect();
+            with_lookup_column(&in_order, 3, Arc::new(UInt32Array::from(swapped)))
+        } else {
+            in_order.as_ref().clone()
+        };
+        index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let mut comparisons = Vec::new();
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let metrics = Arc::new(LocalMetricsCollector::default());
+            let result = index
+                .search_ordered(None, order(false, true), metrics.clone())
+                .await;
+            comparisons.push(metrics.comparisons.load(AtomicOrdering::Relaxed));
+            errors.push(result.err().map(|error| {
+                assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                error.to_string()
+            }));
+        }
+
+        assert_eq!(
+            comparisons,
+            [page_ids.len(), 0],
+            "a plain search leaves the lookup unchecked, and only the first ordered search checks it"
+        );
+        assert_eq!(errors[0].is_some(), pages_swapped);
+        assert_eq!(
+            errors[1], errors[0],
+            "every ordered search gets the same verdict"
+        );
     }
 
     #[tokio::test]

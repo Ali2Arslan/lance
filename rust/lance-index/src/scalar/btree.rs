@@ -746,6 +746,8 @@ pub struct BTreeLookup {
     /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
     /// the front (NULLs first) and are skipped when searching value ranges.
     search_start: usize,
+    /// Ordered search's page order verdict, computed on its first call.
+    page_order: ordered::PageOrder,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -807,6 +809,7 @@ impl BTreeLookup {
             null_pages,
             all_null_pages,
             search_start,
+            page_order: Default::default(),
         })
     }
 
