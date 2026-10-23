@@ -26,7 +26,8 @@
 //! pages have no id order.
 
 use std::cmp::Ordering;
-use std::ops::Bound;
+use std::iter;
+use std::ops::{Bound, Range};
 use std::sync::{Arc, OnceLock};
 
 use arrow::compute::{and, is_not_null, is_null};
@@ -45,12 +46,19 @@ use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index_core::remapping::remap_record_batch_async;
 use tracing::info;
 
-use super::{BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, wrap_bound};
+use super::{
+    BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, partition_point,
+};
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{AnyQuery, SargableQuery, compute_next_prefix};
 
 const READ_AHEAD_PAGES: usize = 2;
+
+const STORED_ORDER: SortOptions = SortOptions {
+    descending: false,
+    nulls_first: true,
+};
 
 #[derive(Clone)]
 enum RowSelection {
@@ -64,6 +72,20 @@ struct PageVisit {
     rows: RowSelection,
 }
 
+type Visits = Box<dyn DoubleEndedIterator<Item = PageVisit> + Send>;
+
+/// The pages a value run reads.
+enum ValuePages {
+    /// The pages of lookup rows `rows`. The pages of rows in `full` hold only
+    /// keys the query selects.
+    Rows {
+        rows: Range<usize>,
+        full: Range<usize>,
+    },
+    /// The pages an equality or `IN` query matches.
+    Matched(Vec<Matches>),
+}
+
 impl BTreeIndex {
     pub(super) fn search_ordered_stream(
         &self,
@@ -72,7 +94,7 @@ impl BTreeIndex {
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
         check_page_order(&self.page_lookup, metrics.as_ref())?;
-        let walk = self.plan_walk(query, options)?;
+        let mut walk = self.plan_walk(query, options)?;
         let id_column = if self.results_are_row_addresses {
             ROW_ADDR
         } else {
@@ -98,7 +120,6 @@ impl BTreeIndex {
         };
         // Read-ahead starts after the first page, so a consumer that stops
         // there pays for one page read.
-        let mut walk = walk.into_iter();
         let first = stream::iter(walk.next()).then(read.clone());
         let rest = stream::iter(walk).map(read).buffered(1 + READ_AHEAD_PAGES);
         let batches = first
@@ -108,11 +129,7 @@ impl BTreeIndex {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
     }
 
-    fn plan_walk(
-        &self,
-        query: Option<&dyn AnyQuery>,
-        options: SortOptions,
-    ) -> Result<Vec<PageVisit>> {
+    fn plan_walk(&self, query: Option<&dyn AnyQuery>, options: SortOptions) -> Result<Visits> {
         let lookup = &self.page_lookup;
         let query = query
             .map(|query| {
@@ -126,18 +143,18 @@ impl BTreeIndex {
                     })
             })
             .transpose()?;
-        let (null_pages, value_pages, predicate) = match query {
+        let (mut null_run, value_pages, predicate) = match query {
             // An unbounded range is the literal `true`, so it selects null keys too.
             None | Some(SargableQuery::Range(Bound::Unbounded, Bound::Unbounded)) => (
-                lookup.pages_null(),
-                lookup.pages_between((Bound::Unbounded, Bound::Unbounded))?,
+                null_pages(lookup),
+                ValuePages::between(lookup, Bound::Unbounded, Bound::Unbounded)?,
                 None,
             ),
             Some(query) => {
-                let null_pages = if matches!(query, SargableQuery::IsNull()) {
-                    lookup.pages_null()
+                let null_run: Visits = if matches!(query, SargableQuery::IsNull()) {
+                    null_pages(lookup)
                 } else {
-                    Vec::new()
+                    Box::new(iter::empty())
                 };
                 let value_pages = self.value_pages(query)?;
                 let predicate = if value_pages.is_empty() {
@@ -145,72 +162,74 @@ impl BTreeIndex {
                 } else {
                     Some(self.compile_predicate(query)?)
                 };
-                (null_pages, value_pages, predicate)
+                (null_run, value_pages, predicate)
             }
         };
 
-        let mut null_run = visits(null_pages, RowSelection::All, RowSelection::Nulls);
         // Indices written before Lance 0.25.2 record a page's min without its
         // nulls, so even a fully covered page can hold null keys.
-        let mut value_run = visits(
-            value_pages,
+        let mut value_run = value_pages.visits(
+            lookup,
             RowSelection::Values(None),
             RowSelection::Values(predicate),
-        );
+        )?;
         if options.descending {
-            null_run.reverse();
-            value_run.reverse();
+            null_run = Box::new(null_run.rev());
+            value_run = Box::new(value_run.rev());
         }
         let (mut walk, mut rest) = if options.nulls_first {
             (null_run, value_run)
         } else {
             (value_run, null_run)
         };
-        let shared_page = match (walk.last(), rest.first()) {
+        let (last, next) = (walk.next_back(), rest.next());
+        let shared_page = match (&last, &next) {
             (Some(last), Some(next)) if last.page == next.page => last.rows.union(&next.rows),
             _ => None,
         };
-        if let Some(rows) = shared_page {
-            walk.pop();
-            rest[0].rows = rows;
-        }
-        walk.append(&mut rest);
-        Ok(walk)
+        let junction = match shared_page {
+            Some(rows) => [next.map(|next| PageVisit { rows, ..next }), None],
+            None => [last, next],
+        };
+        Ok(Box::new(
+            walk.chain(junction.into_iter().flatten()).chain(rest),
+        ))
     }
 
-    fn value_pages(&self, query: &SargableQuery) -> Result<Vec<Matches>> {
+    fn value_pages(&self, query: &SargableQuery) -> Result<ValuePages> {
         let lookup = &self.page_lookup;
         match query {
-            SargableQuery::Equals(value) if !value.is_null() => {
-                lookup.pages_eq(&OrderableScalarValue(value.clone()))
-            }
+            SargableQuery::Equals(value) if !value.is_null() => lookup
+                .pages_eq(&OrderableScalarValue(value.clone()))
+                .map(ValuePages::Matched),
             SargableQuery::Range(start, end) if !is_null_bound(start) && !is_null_bound(end) => {
-                lookup.pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref()))
+                ValuePages::between(lookup, start.as_ref(), end.as_ref())
             }
-            SargableQuery::IsIn(values) => lookup.pages_in(
-                values
-                    .iter()
-                    .filter(|value| !value.is_null())
-                    .cloned()
-                    .map(OrderableScalarValue),
-            ),
+            SargableQuery::IsIn(values) => lookup
+                .pages_in(
+                    values
+                        .iter()
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .map(OrderableScalarValue),
+                )
+                .map(ValuePages::Matched),
             SargableQuery::LikePrefix(
                 prefix @ (ScalarValue::Utf8(Some(text))
                 | ScalarValue::LargeUtf8(Some(text))
                 | ScalarValue::Utf8View(Some(text))),
             ) => {
-                let key = |text: String| {
-                    OrderableScalarValue(match prefix {
-                        ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(text)),
-                        _ => ScalarValue::Utf8(Some(text)),
-                    })
+                let key = |text: String| match prefix {
+                    ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(text)),
+                    _ => ScalarValue::Utf8(Some(text)),
                 };
                 let start = key(text.clone());
                 let end = compute_next_prefix(text).map(key);
-                lookup.pages_between((
+                ValuePages::between(
+                    lookup,
                     Bound::Included(&start),
                     end.as_ref().map_or(Bound::Unbounded, Bound::Excluded),
-                ))
+                )
             }
             SargableQuery::LikePrefix(prefix)
                 if !matches!(
@@ -229,7 +248,7 @@ impl BTreeIndex {
             SargableQuery::Equals(_)
             | SargableQuery::Range(..)
             | SargableQuery::LikePrefix(_)
-            | SargableQuery::IsNull() => Ok(Vec::new()),
+            | SargableQuery::IsNull() => Ok(ValuePages::Matched(Vec::new())),
         }
     }
 
@@ -305,19 +324,111 @@ fn is_null_bound(bound: &Bound<ScalarValue>) -> bool {
     matches!(bound, Bound::Included(value) | Bound::Excluded(value) if value.is_null())
 }
 
-/// Page id order is lookup order once [`check_page_order`] passes.
-fn visits(mut pages: Vec<Matches>, full: RowSelection, partial: RowSelection) -> Vec<PageVisit> {
-    pages.sort_unstable_by_key(Matches::page_id);
-    pages
-        .into_iter()
-        .map(|matches| PageVisit {
-            page: matches.page_id(),
-            rows: match matches {
-                Matches::All(_) => full.clone(),
-                Matches::Some(_) => partial.clone(),
-            },
+/// The pages that hold nulls, in lookup order. Pages of only nulls sort
+/// first, before the pages that also hold keys.
+fn null_pages(lookup: &Arc<BTreeLookup>) -> Visits {
+    let (all_null, partly_null) = (lookup.clone(), lookup.clone());
+    Box::new(
+        (0..all_null.all_null_pages.len())
+            .map(move |i| PageVisit {
+                page: all_null.all_null_pages[i],
+                rows: RowSelection::All,
+            })
+            .chain((0..partly_null.null_pages.len()).map(move |i| PageVisit {
+                page: partly_null.null_pages[i],
+                rows: RowSelection::Nulls,
+            })),
+    )
+}
+
+impl ValuePages {
+    /// The rows [`BTreeLookup::pages_between`] picks for a range. A lookup
+    /// that passes [`check_page_order`] has ascending mins and maxes, so each
+    /// per-row test in `pages_between` holds on a contiguous run of rows, and
+    /// a binary search finds the edge of that run.
+    fn between(
+        lookup: &BTreeLookup,
+        lower: Bound<&ScalarValue>,
+        upper: Bound<&ScalarValue>,
+    ) -> Result<Self> {
+        let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
+        let (start, end) = (lookup.search_start, lookup.batch.num_rows());
+        let first_row = |column: &ArrayRef, value: &ScalarValue, holds: fn(Ordering) -> bool| {
+            let value = value.to_array_of_size(1)?;
+            let compare = make_comparator(column, &value, STORED_ORDER)?;
+            Ok::<_, Error>(partition_point(start, end, |row| !holds(compare(row, 0))))
+        };
+        let (rows_start, full_start) = match lower {
+            Bound::Unbounded => (start, partition_point(start, end, |row| mins.is_null(row))),
+            Bound::Included(value) => (
+                first_row(maxs, value, Ordering::is_ge)?,
+                first_row(mins, value, Ordering::is_ge)?,
+            ),
+            Bound::Excluded(value) => (
+                first_row(maxs, value, Ordering::is_gt)?,
+                first_row(mins, value, Ordering::is_gt)?,
+            ),
+        };
+        // Like `pages_between`, an excluded upper bound still reaches a page
+        // whose min equals it.
+        let (rows_end, full_end) = match upper {
+            Bound::Unbounded => (end, end),
+            Bound::Included(value) => (
+                first_row(mins, value, Ordering::is_gt)?,
+                first_row(maxs, value, Ordering::is_gt)?,
+            ),
+            Bound::Excluded(value) => (
+                first_row(mins, value, Ordering::is_gt)?,
+                first_row(maxs, value, Ordering::is_ge)?,
+            ),
+        };
+        Ok(Self::Rows {
+            rows: rows_start..rows_end,
+            full: full_start..full_end,
         })
-        .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Rows { rows, .. } => rows.is_empty(),
+            Self::Matched(pages) => pages.is_empty(),
+        }
+    }
+
+    /// Page id order is lookup order once [`check_page_order`] passes.
+    fn visits(
+        self,
+        lookup: &BTreeLookup,
+        full: RowSelection,
+        partial: RowSelection,
+    ) -> Result<Visits> {
+        let select = move |is_full: bool| {
+            if is_full {
+                full.clone()
+            } else {
+                partial.clone()
+            }
+        };
+        Ok(match self {
+            Self::Rows {
+                rows,
+                full: full_rows,
+            } => {
+                let page_ids = lookup.page_numbers()?.clone();
+                Box::new(rows.map(move |row| PageVisit {
+                    page: page_ids.value(row),
+                    rows: select(full_rows.contains(&row)),
+                }))
+            }
+            Self::Matched(mut pages) => {
+                pages.sort_unstable_by_key(Matches::page_id);
+                Box::new(pages.into_iter().map(move |matches| PageVisit {
+                    page: matches.page_id(),
+                    rows: select(matches!(matches, Matches::All(_))),
+                }))
+            }
+        })
+    }
 }
 
 /// The verdict of [`check_page_order`] on one lookup. It follows from the
@@ -362,12 +473,8 @@ fn check_page_order(lookup: &BTreeLookup, metrics: &dyn MetricsCollector) -> Res
 fn page_order_violation(lookup: &BTreeLookup) -> Result<Option<String>> {
     let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
     let page_ids = lookup.page_numbers()?.values();
-    let stored_order = SortOptions {
-        descending: false,
-        nulls_first: true,
-    };
-    let min_vs_max = make_comparator(mins, maxs, stored_order)?;
-    let max_vs_next_min = make_comparator(maxs, mins, stored_order)?;
+    let min_vs_max = make_comparator(mins, maxs, STORED_ORDER)?;
+    let max_vs_next_min = make_comparator(maxs, mins, STORED_ORDER)?;
     let value = |array: &ArrayRef, row: usize| ScalarValue::try_from_array(array, row);
     for row in 0..lookup.batch.num_rows() {
         let page = page_ids[row];
