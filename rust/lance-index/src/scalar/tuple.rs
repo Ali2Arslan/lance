@@ -276,10 +276,6 @@ mod tests {
     )]
     #[case::value_of_other_type(vec![KeyValues::In(vec![ScalarValue::Int64(Some(1))])], None)]
     #[case::null_value(vec![KeyValues::In(vec![ScalarValue::Int32(None)])], None)]
-    #[case::repeated_value(
-        vec![KeyValues::In([1, 2, 1].map(|v| ScalarValue::Int32(Some(v))).to_vec())],
-        None
-    )]
     #[case::null_bound(
         vec![KeyValues::Null],
         Some((Bound::Included(ScalarValue::Int64(None)), Bound::Unbounded))
@@ -294,6 +290,18 @@ mod tests {
     ) {
         let error = TupleQuery::try_new(keys(), prefix, range).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+    }
+
+    #[test]
+    fn try_new_names_a_repeated_value_and_its_key() {
+        let values = [1, 2, 1].map(|v| ScalarValue::Int32(Some(v))).to_vec();
+        let error = TupleQuery::try_new(keys(), vec![KeyValues::In(values)], None).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("'tenant'") && message.contains("Int32(1)"),
+            "{message}"
+        );
     }
 
     #[rstest]
