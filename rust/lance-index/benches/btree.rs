@@ -11,27 +11,35 @@
 //! - Range filters with varying selectivity (few/many/most rows match)
 //! - IN filters with varying size (10, 20, 30 values)
 //! - Range filters over pages whose row ids span many fragments
+//! - Ordered search: time to the first 100 rows in key order
 
 mod common;
 
 use std::{
+    cell::OnceCell,
     ops::Bound,
     sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
+use common::{BATCH_SIZE, LOW_CARDINALITY_COUNT, NUM_BATCHES, TOTAL_ROWS};
 use std::hint::black_box;
 
+use arrow::datatypes::{Int64Type, UInt64Type};
+use arrow_schema::SortOptions;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
+use futures::TryStreamExt;
+use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
+use lance_datafusion::datagen::DatafusionDatagenExt;
+use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::scalar::registry::ScalarIndexPlugin;
-use lance_index::scalar::{SargableQuery, ScalarIndex};
+use lance_index::scalar::{AnyQuery, SargableQuery, ScalarIndex};
 use lance_io::object_store::ObjectStore;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
@@ -813,6 +821,113 @@ fn bench_range_many_fragments(c: &mut Criterion) {
     group.finish();
 }
 
+const ORDERED_FIRST_K: usize = 100;
+
+async fn ordered_first_k(
+    index: &Arc<dyn ScalarIndex>,
+    query: Option<&SargableQuery>,
+    options: SortOptions,
+) -> usize {
+    let mut stream = index
+        .search_ordered(
+            query.map(|query| query as &dyn AnyQuery),
+            options,
+            Arc::new(NoOpMetricsCollector),
+        )
+        .await
+        .unwrap();
+    let mut rows = 0;
+    while rows < ORDERED_FIRST_K {
+        match stream.try_next().await.unwrap() {
+            Some(batch) => rows += batch.num_rows(),
+            None => break,
+        }
+    }
+    rows.min(ORDERED_FIRST_K)
+}
+
+/// Training reads `_rowaddr`, which the generators in `common` do not write.
+async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
+    let stream = gen_batch()
+        .col("value", array::step::<Int64Type>())
+        .col(ROW_ADDR, array::step::<UInt64Type>())
+        .into_df_stream(
+            RowCount::from(BATCH_SIZE),
+            BatchCount::from(NUM_BATCHES as u32),
+        );
+    let tempdir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LanceIndexStore::new(
+        Arc::new(ObjectStore::local()),
+        Path::from_filesystem_path(tempdir.path()).unwrap(),
+        Arc::new(LanceCache::no_cache()),
+    ));
+    train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
+        .await
+        .unwrap();
+    let _ = tempdir.keep();
+    let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
+    BTreeIndexPlugin
+        .load_index(
+            store,
+            &details,
+            lance_index::scalar::btree::BTREE_INDEX_VERSION,
+            None,
+            &LanceCache::no_cache(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Ordered search reads pages lazily, so this times the first page, not the
+/// whole index.
+fn bench_ordered_first_k(c: &mut Criterion) {
+    let rt = get_runtime();
+    let lazy_index = OnceCell::new();
+    let index = || {
+        lazy_index
+            .get_or_init(|| rt.block_on(create_int_unique_row_addr_index()))
+            .clone()
+    };
+    let range_size = TOTAL_ROWS / 100;
+    let start = (TOTAL_ROWS - range_size) / 2;
+    let range = SargableQuery::Range(
+        Bound::Included(ScalarValue::Int64(Some(start as i64))),
+        Bound::Excluded(ScalarValue::Int64(Some((start + range_size) as i64))),
+    );
+    let ascending = SortOptions {
+        descending: false,
+        nulls_first: true,
+    };
+    let descending = SortOptions {
+        descending: true,
+        nulls_first: false,
+    };
+
+    let mut group = c.benchmark_group("btree_ordered_first_k");
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(10));
+    for (name, query, options) in [
+        ("all_rows_asc", None, ascending),
+        ("all_rows_desc", None, descending),
+        ("range_1pct_asc", Some(&range), ascending),
+    ] {
+        group.bench_function(BenchmarkId::new("int_unique", name), |b| {
+            let index = index();
+            assert_eq!(
+                rt.block_on(ordered_first_k(&index, query, options)),
+                ORDERED_FIRST_K,
+                "{name} yielded fewer than {ORDERED_FIRST_K} rows"
+            );
+            b.to_async(rt).iter(|| {
+                let index = index.clone();
+                async move { black_box(ordered_first_k(&index, query, options).await) }
+            })
+        });
+    }
+    group.finish();
+}
+
 fn bench_btree(c: &mut Criterion) {
     // Run equality benchmarks
     bench_equality(c);
@@ -827,6 +942,8 @@ fn bench_btree(c: &mut Criterion) {
 
     // Run range benchmarks over pages that span many fragments
     bench_range_many_fragments(c);
+
+    bench_ordered_first_k(c);
 }
 
 #[cfg(target_os = "linux")]
