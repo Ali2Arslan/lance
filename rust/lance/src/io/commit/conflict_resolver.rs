@@ -1293,7 +1293,7 @@ impl<'a> TransactionRebase<'a> {
                     // a fragment that did not exist then (a destination the
                     // rewrite produced afterwards) shows an in-place rewrite
                     // by a tombstoned field in its files, and is then treated
-                    // as rewritten in every indexed field.
+                    // as rewritten in every dependency field.
                     if let (Some(lineage), Some(live), Some(read_fragments)) = (
                         self.current_lineage.as_ref(),
                         self.current_live.as_ref(),
@@ -1306,10 +1306,10 @@ impl<'a> TransactionRebase<'a> {
                         );
                         let read_ids: HashSet<u64> =
                             read_fragments.iter().map(|fragment| fragment.id).collect();
-                        let every_indexed: Vec<u32> = new_indices
+                        let every_dependency_field: Vec<u32> = new_indices
                             .iter()
-                            .flat_map(|index| index.fields.iter())
-                            .filter_map(|field| u32::try_from(*field).ok())
+                            .flat_map(|index| index.dependency_fields().into_owned())
+                            .filter_map(|field| u32::try_from(field).ok())
                             .collect();
                         rewrites.extend(
                             fragments
@@ -1323,7 +1323,7 @@ impl<'a> TransactionRebase<'a> {
                                         })
                                     })
                                 })
-                                .map(|fragment| (fragment.id, every_indexed.clone())),
+                                .map(|fragment| (fragment.id, every_dependency_field.clone())),
                         );
                         Transaction::withdraw_in_place_rewrites(
                             new_indices,
