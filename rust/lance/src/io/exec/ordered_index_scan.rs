@@ -56,9 +56,9 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 /// they do not use up `fetch`. Rows with equal keys come in the order the
 /// index yields them. A fragment's deletion vector loads the first time the
 /// scan reaches one of its rows. Without a `fetch`, the scan reaches whole
-/// batches. With one, it reaches only the in-scope rows the fetch still needs,
-/// and reads further each time deleted rows use those up, so a small `fetch`
-/// reads few vectors.
+/// batches. With one, it first reaches the in-scope rows of a batch that the
+/// fetch still needs, then doubles the in-scope rows it has reached each time
+/// deleted rows use them up.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -411,7 +411,7 @@ impl LiveRows {
                     None => addrs.len(),
                     Some(remaining) => {
                         let checked = live.len() + num_deleted;
-                        let window = (remaining - live.len()).max(checked);
+                        let window = if checked == 0 { remaining } else { checked };
                         addrs[row..]
                             .iter()
                             .enumerate()
@@ -540,6 +540,7 @@ impl ExecutionPlan for OrderedIndexScanExec {
 mod tests {
     use std::cmp::Ordering;
     use std::collections::{HashMap, HashSet};
+    use std::iter::StepBy;
     use std::ops::{Bound, Range};
 
     use arrow_array::{
@@ -1444,11 +1445,12 @@ mod tests {
     #[case::fetch_hundred(0, None, Some(100), 64)]
     #[case::no_fetch(0, None, None, 64)]
     #[case::fetch_one_after_five_deleted_keys(5, None, Some(1), 8)]
-    #[case::fetch_one_after_excluded_fragments(0, Some(32..64), Some(1), 1)]
+    #[case::fetch_one_after_excluded_fragments(0, Some((32..64).step_by(1)), Some(1), 1)]
+    #[case::fetch_one_with_every_other_fragment_excluded(3, Some((0..64).step_by(2)), Some(1), 4)]
     #[tokio::test]
     async fn deletion_vectors_load_for_the_rows_a_fetch_needs(
         #[case] deleted_below: i32,
-        #[case] allowed: Option<Range<u32>>,
+        #[case] allowed: Option<StepBy<Range<u32>>>,
         #[case] fetch: Option<usize>,
         #[case] vectors_loaded: usize,
     ) {
@@ -1509,19 +1511,44 @@ mod tests {
             .into_iter()
             .map(|(key, _)| key.unwrap())
             .collect::<Vec<_>>();
-        let mut expected = live_keys(&dataset)
-            .await
-            .into_iter()
-            .filter(|(addr, _)| {
-                allowed
-                    .as_ref()
-                    .is_none_or(|ids| ids.contains(RowAddress::from(*addr).fragment_id()))
-            })
+        let live = live_keys(&dataset).await;
+        let in_scope = |addr: u64| {
+            allowed
+                .as_ref()
+                .is_none_or(|ids| ids.contains(RowAddress::from(addr).fragment_id()))
+        };
+        let mut expected = live
+            .iter()
+            .filter(|(addr, _)| in_scope(**addr))
             .map(|(_, key)| key.unwrap())
             .collect::<Vec<_>>();
         expected.sort_unstable();
         expected.truncate(fetch.unwrap_or(usize::MAX));
         assert_eq!(keys, expected);
+
+        let (mut emitted, mut deleted, mut excluded) = (0, 0, 0);
+        for key in 0..FRAGMENTS * fragment_rows {
+            if fetch == Some(emitted) {
+                break;
+            }
+            let addr = u64::from(RowAddress::new_from_parts(
+                (key % FRAGMENTS) as u32,
+                (key / FRAGMENTS) as u32,
+            ));
+            if !in_scope(addr) {
+                excluded += 1;
+            } else if live.contains_key(&addr) {
+                emitted += 1;
+            } else {
+                deleted += 1;
+            }
+        }
+        assert_eq!(metric(plan.as_ref(), "rows_excluded"), excluded);
+        assert_eq!(metric(plan.as_ref(), "rows_deleted"), deleted);
+        assert_eq!(
+            metric(plan.as_ref(), "rows_scanned"),
+            emitted + deleted + excluded
+        );
         assert_eq!(
             metric(plan.as_ref(), "pages_loaded"),
             1,
