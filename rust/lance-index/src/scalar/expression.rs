@@ -18,9 +18,10 @@
 //! A conjunct that an index evaluates on its own key columns counts as
 //! consumed, even when the index cannot seek on it. A filter whose root is an
 //! OR or NOT over more than one column skips step 1, so the per-column visitor
-//! can still union two column indices. An OR or NOT root whose column
-//! references are all one column reaches the planners as one conjunct. Inside
-//! an AND, an OR or NOT conjunct reaches the planners whole.
+//! can union two column indices. A nested field such as `s.x` counts as its own
+//! column. An OR or NOT root over at most one column reaches the planners as
+//! one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
+//! whole.
 //!
 //! The rule reads the filter that [`apply_scalar_indices`] receives.
 //! [`PlannerIndexExt::create_filter_plan`] optimizes the filter first, so the
@@ -2688,7 +2689,7 @@ fn apply_index_planners(
                 ..
             })
     );
-    if planners.is_empty() || (root_is_or_not && root.column_refs().len() > 1) {
+    if planners.is_empty() || (root_is_or_not && Planner::column_names_in_expr(root).len() > 1) {
         return Ok(None);
     }
     let conjuncts = split_conjunction(root)
@@ -6018,7 +6019,7 @@ mod tests {
 mod planner_tests {
     use std::any::Any;
 
-    use arrow_schema::Schema;
+    use arrow_schema::{Fields, Schema};
     use datafusion_expr::{col, lit};
     use lance_core::deepsize::{Context, DeepSizeOf};
     use lance_core::utils::row_addr_remap::RowAddrRemap;
@@ -6242,6 +6243,13 @@ mod planner_tests {
         "[NOT flag]@flag_idx(Keys)",
         None
     )]
+    #[case::declined_one_column_or_keeps_column_path(
+        vec![key_planner("ab_idx", AB)],
+        &["c"],
+        "c IN (1, 2)",
+        "OR([c = 1]@c_idx(BTree),[c = 2]@c_idx(BTree))",
+        None
+    )]
     fn routes_conjuncts_to_planners(
         #[case] planners: Vec<KeyPlanner>,
         #[case] btree_columns: &[&str],
@@ -6263,8 +6271,8 @@ mod planner_tests {
         );
     }
 
-    // The filter planner's simplifier pushes NOT below comparisons, so build
-    // the roots directly, as callers of apply_scalar_indices may.
+    // The filter planner's simplifier pushes NOT below comparisons and ANDs, so
+    // build the roots directly, as callers of apply_scalar_indices may.
     #[rstest]
     #[case::or_over_two_columns(
         col("a").eq(lit(1)).or(col("b").eq(lit(2))),
@@ -6283,7 +6291,7 @@ mod planner_tests {
         "[NOT a IS NULL]@ab_idx(Keys)"
     )]
     #[case::and(col("a").eq(lit(1)).and(col("b").gt(lit(5))), AB_QUERY)]
-    fn roots_route_by_column_count(
+    fn aliased_roots_route_like_bare_roots(
         #[case] root: Expr,
         #[case] index_query: &str,
         #[values(0, 1, 2)] aliases: usize,
@@ -6296,6 +6304,30 @@ mod planner_tests {
             Some(index_query.to_string())
         );
         assert_eq!(planned.refine_expr, None);
+    }
+
+    #[test]
+    fn nested_fields_count_as_separate_columns() {
+        let indices = Indices::new(
+            &["s.x", "s.y"],
+            vec![Box::new(key_planner("s_idx", &["s"]))],
+        );
+        let fields = Fields::from(
+            ["x", "y"]
+                .map(|name| Field::new(name, DataType::Int32, true))
+                .to_vec(),
+        );
+        let schema = Schema::new(vec![Field::new("s", DataType::Struct(fields), true)]);
+        let planner = Planner::new(Arc::new(schema));
+        let filter = planner.parse_filter("s.x = 1 OR s.y = 2").unwrap();
+        let plan = planner.create_filter_plan(filter, &indices, true).unwrap();
+        assert_eq!(
+            render(&plan),
+            (
+                Some("OR([s.x = 1]@s.x_idx(BTree),[s.y = 2]@s.y_idx(BTree))".to_string()),
+                None
+            )
+        );
     }
 
     #[derive(Debug)]
