@@ -16,15 +16,18 @@
 //!
 //! The result ANDs the winning plan's search with the searches from step 2.
 //! A conjunct that an index evaluates on its own key columns counts as
-//! consumed, even when the index cannot seek on it. A filter whose root is OR
-//! or NOT skips step 1. Inside an AND, an OR or NOT conjunct reaches the
-//! planners whole.
+//! consumed, even when the index cannot seek on it. A filter whose root is an
+//! OR or NOT over more than one column skips step 1, so the per-column visitor
+//! can still union two column indices. An OR or NOT root whose column
+//! references are all one column reaches the planners as one conjunct. Inside
+//! an AND, an OR or NOT conjunct reaches the planners whole.
 //!
 //! The rule reads the filter that [`apply_scalar_indices`] receives.
 //! [`PlannerIndexExt::create_filter_plan`] optimizes the filter first, so the
 //! root can differ from the one the user wrote. For example, the optimizer
-//! turns `NOT (a = 1 AND b = 2)` into an OR. Aliases around the root do not
-//! change the rule, so an aliased OR or NOT root also skips step 1.
+//! turns `NOT (a = 1 AND b = 2)` into an OR over two columns, which skips
+//! step 1, and it turns `a IN (1, 2)` into `a = 1 OR a = 2`, which reaches the
+//! planners. Aliases around the root do not change the rule.
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -2685,7 +2688,7 @@ fn apply_index_planners(
                 ..
             })
     );
-    if planners.is_empty() || root_is_or_not {
+    if planners.is_empty() || (root_is_or_not && root.column_refs().len() > 1) {
         return Ok(None);
     }
     let conjuncts = split_conjunction(root)
@@ -6129,12 +6132,11 @@ mod planner_tests {
     }
 
     fn plan(indices: &Indices, filter: &str) -> Result<FilterPlan> {
-        let schema = Schema::new(
-            ["a", "b", "c", "d"]
-                .map(|name| Field::new(name, DataType::Int32, true))
-                .to_vec(),
-        );
-        let planner = Planner::new(Arc::new(schema));
+        let mut fields = ["a", "b", "c", "d"]
+            .map(|name| Field::new(name, DataType::Int32, true))
+            .to_vec();
+        fields.push(Field::new("flag", DataType::Boolean, true));
+        let planner = Planner::new(Arc::new(Schema::new(fields)));
         planner.create_filter_plan(planner.parse_filter(filter)?, indices, true)
     }
 
@@ -6219,6 +6221,27 @@ mod planner_tests {
         "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))",
         None
     )]
+    #[case::two_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2)",
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::three_value_in_list_reaches_planners(
+        vec![key_planner("ab_idx", AB)],
+        &[],
+        "a IN (1, 2, 3)",
+        "[a = Int32(1) OR a = Int32(2) OR a = Int32(3)]@ab_idx(Keys)",
+        None
+    )]
+    #[case::not_of_boolean_key_reaches_planners(
+        vec![key_planner("flag_idx", &["flag"])],
+        &[],
+        "NOT flag",
+        "[NOT flag]@flag_idx(Keys)",
+        None
+    )]
     fn routes_conjuncts_to_planners(
         #[case] planners: Vec<KeyPlanner>,
         #[case] btree_columns: &[&str],
@@ -6240,45 +6263,30 @@ mod planner_tests {
         );
     }
 
-    #[test]
-    fn not_root_keeps_column_path() {
-        // The filter planner's simplifier pushes NOT below comparisons, so build
-        // the NOT root directly, as callers of apply_scalar_indices may.
-        let indices = Indices::new(&["a"], vec![Box::new(key_planner("ab_idx", AB))]);
-        let filter = Expr::Not(Box::new(datafusion_expr::col("a").is_null()));
-        let planned = apply_scalar_indices(filter, &indices).unwrap();
-        assert_eq!(
-            planned.scalar_query.as_ref().map(ToString::to_string),
-            Some("NOT([a IS NULL]@a_idx(BTree))".to_string())
-        );
-        assert_eq!(planned.refine_expr, None);
-    }
-
-    fn or_root() -> Expr {
-        col("a").eq(lit(1)).or(col("b").eq(lit(2)))
-    }
-
-    fn not_root() -> Expr {
-        Expr::Not(Box::new(col("a").is_null()))
-    }
-
-    fn and_root() -> Expr {
-        col("a").eq(lit(1)).and(col("b").gt(lit(5)))
-    }
-
-    const OR_COLUMN_QUERY: &str = "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))";
-
+    // The filter planner's simplifier pushes NOT below comparisons, so build
+    // the roots directly, as callers of apply_scalar_indices may.
     #[rstest]
-    #[case::alias_over_or(1, or_root(), OR_COLUMN_QUERY)]
-    #[case::aliases_over_or(2, or_root(), OR_COLUMN_QUERY)]
-    #[case::alias_over_not(1, not_root(), "NOT([a IS NULL]@a_idx(BTree))")]
-    #[case::aliases_over_not(2, not_root(), "NOT([a IS NULL]@a_idx(BTree))")]
-    #[case::alias_over_and(1, and_root(), AB_QUERY)]
-    #[case::aliases_over_and(2, and_root(), AB_QUERY)]
-    fn aliased_roots_route_like_bare_roots(
-        #[case] aliases: usize,
+    #[case::or_over_two_columns(
+        col("a").eq(lit(1)).or(col("b").eq(lit(2))),
+        "OR([a = 1]@a_idx(BTree),[b = 2]@b_idx(BTree))"
+    )]
+    #[case::or_over_one_column(
+        col("a").eq(lit(1)).or(col("a").eq(lit(2))),
+        "[a = Int32(1) OR a = Int32(2)]@ab_idx(Keys)"
+    )]
+    #[case::not_over_two_columns(
+        Expr::Not(Box::new(col("a").is_null().and(col("b").is_null()))),
+        "NOT(AND([a IS NULL]@a_idx(BTree),[b IS NULL]@b_idx(BTree)))"
+    )]
+    #[case::not_over_one_column(
+        Expr::Not(Box::new(col("a").is_null())),
+        "[NOT a IS NULL]@ab_idx(Keys)"
+    )]
+    #[case::and(col("a").eq(lit(1)).and(col("b").gt(lit(5))), AB_QUERY)]
+    fn roots_route_by_column_count(
         #[case] root: Expr,
         #[case] index_query: &str,
+        #[values(0, 1, 2)] aliases: usize,
     ) {
         let indices = Indices::new(AB, vec![Box::new(key_planner("ab_idx", AB))]);
         let filter = (0..aliases).fold(root, |expr, depth| expr.alias(format!("alias_{depth}")));
