@@ -26,8 +26,9 @@
 //! pages have no id order.
 
 use std::cmp::Ordering;
-use std::ops::Bound;
-use std::sync::Arc;
+use std::iter;
+use std::ops::{Bound, Range};
+use std::sync::{Arc, OnceLock};
 
 use arrow::compute::{and, is_not_null, is_null};
 use arrow_array::{ArrayRef, RecordBatch, cast::AsArray};
@@ -39,17 +40,25 @@ use datafusion::physical_plan::{SendableRecordBatchStream, stream::RecordBatchSt
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_physical_expr::PhysicalExpr;
 use futures::{StreamExt, TryStreamExt, future, stream};
+use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index_core::remapping::remap_record_batch_async;
 use tracing::info;
 
-use super::{BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, wrap_bound};
+use super::{
+    BTreeIndex, BTreeLookup, LazyIndexReader, Matches, OrderableScalarValue, partition_point,
+};
 use crate::metrics::MetricsCollector;
 use crate::scalar::registry::VALUE_COLUMN_NAME;
 use crate::scalar::{AnyQuery, SargableQuery, compute_next_prefix};
 
 const READ_AHEAD_PAGES: usize = 2;
+
+const STORED_ORDER: SortOptions = SortOptions {
+    descending: false,
+    nulls_first: true,
+};
 
 #[derive(Clone)]
 enum RowSelection {
@@ -63,6 +72,22 @@ struct PageVisit {
     rows: RowSelection,
 }
 
+type Visits = Box<dyn DoubleEndedIterator<Item = PageVisit> + Send>;
+
+/// A lookup that passed [`check_page_order`]. Each page's min is at most its
+/// max, each max is at most the next page's min, and page ids ascend with
+/// lookup rows.
+#[derive(Clone, Copy)]
+struct CheckedLookup<'a>(&'a Arc<BTreeLookup>);
+
+enum ValuePages {
+    Rows {
+        rows: Range<usize>,
+        covered: Range<usize>,
+    },
+    Matched(Vec<Matches>),
+}
+
 impl BTreeIndex {
     pub(super) fn search_ordered_stream(
         &self,
@@ -70,8 +95,8 @@ impl BTreeIndex {
         options: SortOptions,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        check_page_order(&self.page_lookup)?;
-        let walk = self.plan_walk(query, options)?;
+        let lookup = check_page_order(&self.page_lookup, metrics.as_ref())?;
+        let mut walk = self.plan_walk(lookup, query, options)?;
         let id_column = if self.results_are_row_addresses {
             ROW_ADDR
         } else {
@@ -97,7 +122,6 @@ impl BTreeIndex {
         };
         // Read-ahead starts after the first page, so a consumer that stops
         // there pays for one page read.
-        let mut walk = walk.into_iter();
         let first = stream::iter(walk.next()).then(read.clone());
         let rest = stream::iter(walk).map(read).buffered(1 + READ_AHEAD_PAGES);
         let batches = first
@@ -109,10 +133,10 @@ impl BTreeIndex {
 
     fn plan_walk(
         &self,
+        lookup: CheckedLookup<'_>,
         query: Option<&dyn AnyQuery>,
         options: SortOptions,
-    ) -> Result<Vec<PageVisit>> {
-        let lookup = &self.page_lookup;
+    ) -> Result<Visits> {
         let query = query
             .map(|query| {
                 query
@@ -125,91 +149,94 @@ impl BTreeIndex {
                     })
             })
             .transpose()?;
-        let (null_pages, value_pages, predicate) = match query {
+        let (mut null_run, value_pages, predicate) = match query {
             // An unbounded range is the literal `true`, so it selects null keys too.
             None | Some(SargableQuery::Range(Bound::Unbounded, Bound::Unbounded)) => (
-                lookup.pages_null(),
-                lookup.pages_between((Bound::Unbounded, Bound::Unbounded))?,
+                null_pages(lookup),
+                ValuePages::between(lookup, Bound::Unbounded, Bound::Unbounded)?,
                 None,
             ),
             Some(query) => {
-                let null_pages = if matches!(query, SargableQuery::IsNull()) {
-                    lookup.pages_null()
+                let null_run: Visits = if matches!(query, SargableQuery::IsNull()) {
+                    null_pages(lookup)
                 } else {
-                    Vec::new()
+                    Box::new(iter::empty())
                 };
-                let value_pages = self.value_pages(query)?;
+                let value_pages = Self::value_pages(lookup, query)?;
                 let predicate = if value_pages.is_empty() {
                     None
                 } else {
                     Some(self.compile_predicate(query)?)
                 };
-                (null_pages, value_pages, predicate)
+                (null_run, value_pages, predicate)
             }
         };
 
-        let mut null_run = visits(null_pages, RowSelection::All, RowSelection::Nulls);
         // Indices written before Lance 0.25.2 record a page's min without its
         // nulls, so even a fully covered page can hold null keys.
-        let mut value_run = visits(
-            value_pages,
+        let mut value_run = value_pages.visits(
+            lookup,
             RowSelection::Values(None),
             RowSelection::Values(predicate),
-        );
+        )?;
         if options.descending {
-            null_run.reverse();
-            value_run.reverse();
+            null_run = Box::new(null_run.rev());
+            value_run = Box::new(value_run.rev());
         }
         let (mut walk, mut rest) = if options.nulls_first {
             (null_run, value_run)
         } else {
             (value_run, null_run)
         };
-        let shared_page = match (walk.last(), rest.first()) {
+        let (last, next) = (walk.next_back(), rest.next());
+        let shared_page = match (&last, &next) {
             (Some(last), Some(next)) if last.page == next.page => last.rows.union(&next.rows),
             _ => None,
         };
-        if let Some(rows) = shared_page {
-            walk.pop();
-            rest[0].rows = rows;
-        }
-        walk.append(&mut rest);
-        Ok(walk)
+        let junction = match shared_page {
+            Some(rows) => [next.map(|next| PageVisit { rows, ..next }), None],
+            None => [last, next],
+        };
+        Ok(Box::new(
+            walk.chain(junction.into_iter().flatten()).chain(rest),
+        ))
     }
 
-    fn value_pages(&self, query: &SargableQuery) -> Result<Vec<Matches>> {
-        let lookup = &self.page_lookup;
+    fn value_pages(lookup: CheckedLookup<'_>, query: &SargableQuery) -> Result<ValuePages> {
         match query {
-            SargableQuery::Equals(value) if !value.is_null() => {
-                lookup.pages_eq(&OrderableScalarValue(value.clone()))
-            }
+            SargableQuery::Equals(value) if !value.is_null() => lookup
+                .0
+                .pages_eq(&OrderableScalarValue(value.clone()))
+                .map(ValuePages::Matched),
             SargableQuery::Range(start, end) if !is_null_bound(start) && !is_null_bound(end) => {
-                lookup.pages_between((wrap_bound(start).as_ref(), wrap_bound(end).as_ref()))
+                ValuePages::between(lookup, start.as_ref(), end.as_ref())
             }
-            SargableQuery::IsIn(values) => lookup.pages_in(
-                values
-                    .iter()
-                    .filter(|value| !value.is_null())
-                    .cloned()
-                    .map(OrderableScalarValue),
-            ),
+            SargableQuery::IsIn(values) => lookup
+                .0
+                .pages_in(
+                    values
+                        .iter()
+                        .filter(|value| !value.is_null())
+                        .cloned()
+                        .map(OrderableScalarValue),
+                )
+                .map(ValuePages::Matched),
             SargableQuery::LikePrefix(
                 prefix @ (ScalarValue::Utf8(Some(text))
                 | ScalarValue::LargeUtf8(Some(text))
                 | ScalarValue::Utf8View(Some(text))),
             ) => {
-                let key = |text: String| {
-                    OrderableScalarValue(match prefix {
-                        ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(text)),
-                        _ => ScalarValue::Utf8(Some(text)),
-                    })
+                let key = |text: String| match prefix {
+                    ScalarValue::LargeUtf8(_) => ScalarValue::LargeUtf8(Some(text)),
+                    _ => ScalarValue::Utf8(Some(text)),
                 };
                 let start = key(text.clone());
                 let end = compute_next_prefix(text).map(key);
-                lookup.pages_between((
+                ValuePages::between(
+                    lookup,
                     Bound::Included(&start),
                     end.as_ref().map_or(Bound::Unbounded, Bound::Excluded),
-                ))
+                )
             }
             SargableQuery::LikePrefix(prefix)
                 if !matches!(
@@ -228,7 +255,7 @@ impl BTreeIndex {
             SargableQuery::Equals(_)
             | SargableQuery::Range(..)
             | SargableQuery::LikePrefix(_)
-            | SargableQuery::IsNull() => Ok(Vec::new()),
+            | SargableQuery::IsNull() => Ok(ValuePages::Matched(Vec::new())),
         }
     }
 
@@ -304,33 +331,145 @@ fn is_null_bound(bound: &Bound<ScalarValue>) -> bool {
     matches!(bound, Bound::Included(value) | Bound::Excluded(value) if value.is_null())
 }
 
-/// Page id order is lookup order once [`check_page_order`] passes.
-fn visits(mut pages: Vec<Matches>, full: RowSelection, partial: RowSelection) -> Vec<PageVisit> {
-    pages.sort_unstable_by_key(Matches::page_id);
-    pages
-        .into_iter()
-        .map(|matches| PageVisit {
-            page: matches.page_id(),
-            rows: match matches {
-                Matches::All(_) => full.clone(),
-                Matches::Some(_) => partial.clone(),
-            },
+fn null_pages(lookup: CheckedLookup<'_>) -> Visits {
+    let (all_null, partly_null) = (lookup.0.clone(), lookup.0.clone());
+    Box::new(
+        (0..all_null.all_null_pages.len())
+            .map(move |i| PageVisit {
+                page: all_null.all_null_pages[i],
+                rows: RowSelection::All,
+            })
+            .chain((0..partly_null.null_pages.len()).map(move |i| PageVisit {
+                page: partly_null.null_pages[i],
+                rows: RowSelection::Nulls,
+            })),
+    )
+}
+
+impl ValuePages {
+    fn between(
+        lookup: CheckedLookup<'_>,
+        lower: Bound<&ScalarValue>,
+        upper: Bound<&ScalarValue>,
+    ) -> Result<Self> {
+        let lookup = lookup.0;
+        let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
+        let (start, end) = (lookup.search_start, lookup.batch.num_rows());
+        if start >= end {
+            return Ok(Self::Matched(Vec::new()));
+        }
+        let first_row = |column: &ArrayRef, value: &ScalarValue, holds: fn(Ordering) -> bool| {
+            let value = value.to_array_of_size(1)?;
+            let compare = make_comparator(column, &value, STORED_ORDER)?;
+            Ok::<_, Error>(partition_point(start, end, |row| !holds(compare(row, 0))))
+        };
+        let (rows_start, covered_start) = match lower {
+            Bound::Unbounded => (start, partition_point(start, end, |row| mins.is_null(row))),
+            Bound::Included(value) => (
+                first_row(maxs, value, Ordering::is_ge)?,
+                first_row(mins, value, Ordering::is_ge)?,
+            ),
+            Bound::Excluded(value) => (
+                first_row(maxs, value, Ordering::is_gt)?,
+                first_row(mins, value, Ordering::is_gt)?,
+            ),
+        };
+        let (rows_end, covered_end) = match upper {
+            Bound::Unbounded => (end, end),
+            Bound::Included(value) => (
+                first_row(mins, value, Ordering::is_gt)?,
+                first_row(maxs, value, Ordering::is_gt)?,
+            ),
+            Bound::Excluded(value) => (
+                first_row(mins, value, Ordering::is_gt)?,
+                first_row(maxs, value, Ordering::is_ge)?,
+            ),
+        };
+        Ok(Self::Rows {
+            rows: rows_start..rows_end,
+            covered: covered_start..covered_end,
         })
-        .collect()
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Rows { rows, .. } => rows.is_empty(),
+            Self::Matched(pages) => pages.is_empty(),
+        }
+    }
+
+    /// Page id order is lookup order once [`check_page_order`] passes.
+    fn visits(
+        self,
+        lookup: CheckedLookup<'_>,
+        full: RowSelection,
+        partial: RowSelection,
+    ) -> Result<Visits> {
+        let select = move |is_full: bool| {
+            if is_full {
+                full.clone()
+            } else {
+                partial.clone()
+            }
+        };
+        Ok(match self {
+            Self::Rows { rows, covered } => {
+                let page_ids = lookup.0.page_numbers()?.clone();
+                Box::new(rows.map(move |row| PageVisit {
+                    page: page_ids.value(row),
+                    rows: select(covered.contains(&row)),
+                }))
+            }
+            Self::Matched(mut pages) => {
+                pages.sort_unstable_by_key(Matches::page_id);
+                Box::new(pages.into_iter().map(move |matches| PageVisit {
+                    page: matches.page_id(),
+                    rows: select(matches!(matches, Matches::All(_))),
+                }))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct PageOrderVerdict(OnceLock<Option<String>>);
+
+impl DeepSizeOf for PageOrderVerdict {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        self.0
+            .get()
+            .map_or(0, |violation| violation.deep_size_of_children(context))
+    }
+}
+
+fn check_page_order<'a>(
+    lookup: &'a Arc<BTreeLookup>,
+    metrics: &dyn MetricsCollector,
+) -> Result<CheckedLookup<'a>> {
+    let violation = match lookup.page_order.0.get() {
+        Some(violation) => violation,
+        None => {
+            let (violation, rows_compared) = page_order_violation(lookup)?;
+            metrics.record_comparisons(rows_compared);
+            lookup.page_order.0.get_or_init(|| violation)
+        }
+    };
+    match violation {
+        Some(violation) => Err(Error::not_supported(format!(
+            "ordered search needs B-tree pages in key order, but {violation}"
+        ))),
+        None => Ok(CheckedLookup(lookup)),
+    }
 }
 
 /// A merge of range-partitioned segments concatenates lookups without
 /// checking key order, and training on input sorted nulls last leaves a page
 /// whose min sorts after its max.
-fn check_page_order(lookup: &BTreeLookup) -> Result<()> {
+fn page_order_violation(lookup: &BTreeLookup) -> Result<(Option<String>, usize)> {
     let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
     let page_ids = lookup.page_numbers()?.values();
-    let stored_order = SortOptions {
-        descending: false,
-        nulls_first: true,
-    };
-    let min_vs_max = make_comparator(mins, maxs, stored_order)?;
-    let max_vs_next_min = make_comparator(maxs, mins, stored_order)?;
+    let min_vs_max = make_comparator(mins, maxs, STORED_ORDER)?;
+    let max_vs_next_min = make_comparator(maxs, mins, STORED_ORDER)?;
     let value = |array: &ArrayRef, row: usize| ScalarValue::try_from_array(array, row);
     for row in 0..lookup.batch.num_rows() {
         let page = page_ids[row];
@@ -359,11 +498,9 @@ fn check_page_order(lookup: &BTreeLookup) -> Result<()> {
         } else {
             continue;
         };
-        return Err(Error::not_supported(format!(
-            "ordered search needs B-tree pages in key order, but {violation}"
-        )));
+        return Ok((Some(violation), row + 1));
     }
-    Ok(())
+    Ok((None, lookup.batch.num_rows()))
 }
 
 #[cfg(test)]
@@ -390,10 +527,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::{
-        BTREE_PAGES_NAME, BTreeIndex, merge_metadata_files, part_lookup_file_path,
-        part_page_data_file_path, train_btree_index,
+        BTREE_PAGES_NAME, BTreeIndex, Matches, OrderableScalarValue, merge_metadata_files,
+        part_lookup_file_path, part_page_data_file_path, train_btree_index,
     };
-    use super::READ_AHEAD_PAGES;
+    use super::{READ_AHEAD_PAGES, RowSelection, ValuePages, check_page_order};
     use crate::frag_reuse::{FragReuseIndex, FragReuseIndexDetails, FragReuseIndexHandle};
     use crate::metrics::{LocalMetricsCollector, MetricsCollector, NoOpMetricsCollector};
     use crate::progress::noop_progress;
@@ -824,6 +961,96 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_ordered_range_walk_picks_the_pages_search_picks() {
+        let mut indices = Vec::new();
+        let mut dirs = Vec::new();
+        for fixture in [
+            Fixture::Paged(1),
+            Fixture::Paged(7),
+            Fixture::Paged(4096),
+            Fixture::SinglePage,
+            Fixture::AllNull,
+            Fixture::Empty,
+        ] {
+            let (rows, page_size) = fixture.rows_and_page_size();
+            let (index, dir) = build_index(&rows, page_size).await;
+            indices.push((format!("{fixture:?}"), index));
+            dirs.push(dir);
+        }
+        let ties: Vec<Row> = (0..240).map(|i| (Some(i as i32 / 60), i)).collect();
+        let (index, dir) = build_index(&ties, 4).await;
+        indices.push(("ties across pages".to_string(), index));
+        dirs.push(dir);
+        let straddling: Vec<Row> = [None, None, None, None]
+            .into_iter()
+            .chain([Some(1), Some(1), Some(1), Some(1), Some(2), Some(3)])
+            .zip(100..)
+            .collect();
+        let (paged, dir) = build_index(&straddling, 3).await;
+        dirs.push(dir);
+        assert_eq!(
+            paged
+                .page_lookup
+                .batch
+                .column(0)
+                .as_primitive::<Int32Type>(),
+            &Int32Array::from(vec![None, None, Some(1), Some(3)]),
+            "pages [N N N] [N 1 1] [1 1 2] [3]"
+        );
+        let legacy_mins = Int32Array::from(vec![None, Some(1), Some(1), Some(3)]);
+        let legacy = with_lookup_column(&paged, 0, Arc::new(legacy_mins));
+        indices.push(("legacy page stats".to_string(), Arc::new(legacy)));
+
+        for (name, index) in &indices {
+            let lookup = check_page_order(&index.page_lookup, &NoOpMetricsCollector).unwrap();
+            let batch = &index.page_lookup.batch;
+            let mut keys: Vec<i32> = [batch.column(0), batch.column(1)]
+                .into_iter()
+                .flat_map(|column| column.as_primitive::<Int32Type>().iter().flatten())
+                .flat_map(|key| [key - 1, key, key + 1])
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            let bounds: Vec<Bound<ScalarValue>> = std::iter::once(Bound::Unbounded)
+                .chain(keys.iter().flat_map(|&key| {
+                    let key = ScalarValue::Int32(Some(key));
+                    [Bound::Included(key.clone()), Bound::Excluded(key)]
+                }))
+                .chain([Bound::Included(ScalarValue::Int64(Some(0)))])
+                .collect();
+            for lower in &bounds {
+                for upper in &bounds {
+                    let key = |bound: &Bound<ScalarValue>| bound.clone().map(OrderableScalarValue);
+                    let expected = index
+                        .page_lookup
+                        .pages_between((key(lower).as_ref(), key(upper).as_ref()));
+                    let walked = ValuePages::between(lookup, lower.as_ref(), upper.as_ref())
+                        .and_then(|pages| {
+                            pages.visits(lookup, RowSelection::All, RowSelection::Nulls)
+                        })
+                        .map(|visits| {
+                            visits
+                                .map(|visit| match visit.rows {
+                                    RowSelection::All => Matches::All(visit.page),
+                                    _ => Matches::Some(visit.page),
+                                })
+                                .collect::<Vec<_>>()
+                        });
+                    match (walked, expected) {
+                        (Ok(walked), Ok(expected)) => {
+                            assert_eq!(walked, expected, "{name}, {lower:?} to {upper:?}")
+                        }
+                        (Err(_), Err(_)) => {}
+                        (walked, expected) => panic!(
+                            "{name}, {lower:?} to {upper:?}: walk {walked:?}, search {expected:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     #[rstest]
     #[case::ascending(false, vec![Some(0), Some(20), Some(39)])]
     #[case::descending(true, vec![Some(39), Some(20), Some(0)])]
@@ -1144,6 +1371,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[rstest]
+    #[case::in_key_order(false, 10)]
+    #[case::out_of_key_order(true, 2)]
+    #[tokio::test]
+    async fn test_ordered_checks_page_order_once_per_lookup(
+        #[case] pages_swapped: bool,
+        #[case] rows_compared: usize,
+    ) {
+        let rows: Vec<Row> = (0..40).map(|i| (Some(i), i as u64)).collect();
+        let (in_order, _tmpdir) = build_index(&rows, 4).await;
+        let page_ids = in_order
+            .page_lookup
+            .page_numbers()
+            .unwrap()
+            .values()
+            .to_vec();
+        let index = if pages_swapped {
+            let swapped: Vec<u32> = [page_ids[1], page_ids[0]]
+                .into_iter()
+                .chain(page_ids[2..].iter().copied())
+                .collect();
+            with_lookup_column(&in_order, 3, Arc::new(UInt32Array::from(swapped)))
+        } else {
+            in_order.as_ref().clone()
+        };
+        index
+            .search(
+                &SargableQuery::Equals(ScalarValue::Int32(Some(5))),
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
+
+        let mut comparisons = Vec::new();
+        let mut errors = Vec::new();
+        for _ in 0..2 {
+            let metrics = Arc::new(LocalMetricsCollector::default());
+            let result = index
+                .search_ordered(None, order(false, true), metrics.clone())
+                .await;
+            comparisons.push(metrics.comparisons.load(AtomicOrdering::Relaxed));
+            errors.push(result.err().map(|error| {
+                assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+                error.to_string()
+            }));
+        }
+
+        assert_eq!(
+            comparisons,
+            [rows_compared, 0],
+            "a plain search leaves the lookup unchecked, and only the first ordered search checks it"
+        );
+        assert_eq!(errors[0].is_some(), pages_swapped);
+        assert_eq!(
+            errors[1], errors[0],
+            "every ordered search gets the same verdict"
+        );
     }
 
     #[tokio::test]
