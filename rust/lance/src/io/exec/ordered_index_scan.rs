@@ -54,9 +54,11 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 ///
 /// Deleted rows and rows outside the fragment scope never reach the output, so
 /// they do not use up `fetch`. Rows with equal keys come in the order the
-/// index yields them. A fragment's deletion vector loads the first time a
-/// batch holds one of its rows, so a small `fetch` reads only the vectors of
-/// the fragments its batches reach.
+/// index yields them. A fragment's deletion vector loads the first time the
+/// scan checks one of its rows. Without a `fetch`, the scan loads the vectors
+/// a whole batch needs at once. With one, it loads them for as many rows as
+/// the fetch still needs, and doubles that prefix of the batch each time
+/// deleted or excluded rows use it up, so a small `fetch` reads few vectors.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -392,12 +394,20 @@ impl LiveRows {
                 ScalarValue::try_from_array(batch.column(0), 0)?
             )));
         }
-        self.load_deletions(addrs.values()).await?;
+        let addrs = addrs.values();
         let mut live = Vec::new();
         let (mut num_deleted, mut num_excluded) = (0, 0);
-        for (row, &addr) in addrs.values().iter().enumerate() {
+        let mut loaded = 0;
+        for (row, &addr) in addrs.iter().enumerate() {
             if self.remaining == Some(live.len()) {
                 break;
+            }
+            if row == loaded {
+                loaded = match self.remaining {
+                    None => addrs.len(),
+                    Some(remaining) => (row + (remaining - live.len()).max(row)).min(addrs.len()),
+                };
+                self.load_deletions(&addrs[row..loaded]).await?;
             }
             if !self.scope.contains(RowAddress::from(addr).fragment_id()) {
                 num_excluded += 1;
@@ -532,7 +542,9 @@ mod tests {
     use lance_core::ROW_ADDR;
     use lance_datafusion::exec::{LanceExecutionOptions, analyze_plan};
     use lance_index::IndexType;
-    use lance_index::scalar::btree::{BTreeParameters, train_btree_index};
+    use lance_index::scalar::btree::{
+        BTreeParameters, DEFAULT_BTREE_BATCH_SIZE, train_btree_index,
+    };
     use lance_index::scalar::lance_format::LanceIndexStore;
     use lance_index::scalar::registry::VALUE_COLUMN_NAME;
     use lance_index::scalar::{BuiltinIndexType, SargableQuery, ScalarIndexParams};
@@ -1407,6 +1419,82 @@ mod tests {
             .take(fetch.unwrap_or(usize::MAX))
             .collect::<Vec<_>>();
         assert_eq!(keys, expected);
+        assert_eq!(
+            metric(plan.as_ref(), "deletion_vectors_loaded"),
+            vectors_loaded
+        );
+    }
+
+    #[rstest]
+    #[case::fetch_one(Some(1), 2)]
+    #[case::fetch_ten(Some(10), 20)]
+    #[case::fetch_hundred(Some(100), 64)]
+    #[case::no_fetch(None, 64)]
+    #[tokio::test]
+    async fn deletion_vectors_load_for_the_rows_a_fetch_needs(
+        #[case] fetch: Option<usize>,
+        #[case] vectors_loaded: usize,
+    ) {
+        const FRAGMENTS: i32 = 64;
+        let rows = DEFAULT_BTREE_BATCH_SIZE as i32;
+        let fragment_rows = rows / FRAGMENTS;
+        // Row `r` sits at offset `r % 64` of fragment `r / 64`, so consecutive
+        // keys fall in consecutive fragments, and key `65 * f` is at offset `f`
+        // of fragment `f`.
+        let keys = Int32Array::from_iter_values(
+            (0..rows).map(|row| row % fragment_rows * FRAGMENTS + row / fragment_rows),
+        );
+        let batch = key_column("key", keys);
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: fragment_rows as usize,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["key"],
+                IndexType::BTree,
+                Some(INDEX_NAME.into()),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                false,
+            )
+            .await
+            .unwrap();
+        dataset.delete("key % 65 = 0").await.unwrap();
+        let dataset = Arc::new(dataset);
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            key_segment(&dataset).await,
+            None,
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap()
+        .with_fetch(fetch)
+        .unwrap();
+
+        let keys = run(plan.clone())
+            .await
+            .into_iter()
+            .map(|(key, _)| key.unwrap())
+            .collect::<Vec<_>>();
+        let expected = (0..rows)
+            .filter(|key| key % 65 != 0)
+            .take(fetch.unwrap_or(usize::MAX))
+            .collect::<Vec<_>>();
+        assert_eq!(keys, expected);
+        assert_eq!(
+            metric(plan.as_ref(), "pages_loaded"),
+            1,
+            "the index is one page"
+        );
         assert_eq!(
             metric(plan.as_ref(), "deletion_vectors_loaded"),
             vectors_loaded
