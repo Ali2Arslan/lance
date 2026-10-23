@@ -55,10 +55,10 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 /// Deleted rows and rows outside the fragment scope never reach the output, so
 /// they do not use up `fetch`. Rows with equal keys come in the order the
 /// index yields them. A fragment's deletion vector loads the first time the
-/// scan checks one of its rows. Without a `fetch`, the scan loads the vectors
-/// a whole batch needs at once. With one, it loads them for as many rows as
-/// the fetch still needs, and doubles that prefix of the batch each time
-/// deleted or excluded rows use it up, so a small `fetch` reads few vectors.
+/// scan reaches one of its rows. Without a `fetch`, the scan reaches whole
+/// batches. With one, it reaches only the in-scope rows the fetch still needs,
+/// and reads further each time deleted rows use those up, so a small `fetch`
+/// reads few vectors.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -397,21 +397,34 @@ impl LiveRows {
         let addrs = addrs.values();
         let mut live = Vec::new();
         let (mut num_deleted, mut num_excluded) = (0, 0);
-        let mut loaded = 0;
+        let mut prefix_end = 0;
         for (row, &addr) in addrs.iter().enumerate() {
             if self.remaining == Some(live.len()) {
                 break;
             }
-            if row == loaded {
-                loaded = match self.remaining {
-                    None => addrs.len(),
-                    Some(remaining) => (row + (remaining - live.len()).max(row)).min(addrs.len()),
-                };
-                self.load_deletions(&addrs[row..loaded]).await?;
-            }
             if !self.scope.contains(RowAddress::from(addr).fragment_id()) {
                 num_excluded += 1;
-            } else if self.deleted.contains(addr) {
+                continue;
+            }
+            if row >= prefix_end {
+                prefix_end = match self.remaining {
+                    None => addrs.len(),
+                    Some(remaining) => {
+                        let checked = live.len() + num_deleted;
+                        let window = (remaining - live.len()).max(checked);
+                        addrs[row..]
+                            .iter()
+                            .enumerate()
+                            .filter(|&(_, &addr)| {
+                                self.scope.contains(RowAddress::from(addr).fragment_id())
+                            })
+                            .nth(window - 1)
+                            .map_or(addrs.len(), |(offset, _)| row + offset + 1)
+                    }
+                };
+                self.load_deletions(&addrs[row..prefix_end]).await?;
+            }
+            if self.deleted.contains(addr) {
                 num_deleted += 1;
             } else {
                 live.push(row as u32);
@@ -1426,24 +1439,28 @@ mod tests {
     }
 
     #[rstest]
-    #[case::fetch_one(Some(1), 2)]
-    #[case::fetch_ten(Some(10), 20)]
-    #[case::fetch_hundred(Some(100), 64)]
-    #[case::no_fetch(None, 64)]
+    #[case::fetch_one(0, None, Some(1), 2)]
+    #[case::fetch_ten(0, None, Some(10), 20)]
+    #[case::fetch_hundred(0, None, Some(100), 64)]
+    #[case::no_fetch(0, None, None, 64)]
+    #[case::fetch_one_after_five_deleted_keys(5, None, Some(1), 8)]
+    #[case::fetch_one_after_excluded_fragments(0, Some(32..64), Some(1), 1)]
     #[tokio::test]
     async fn deletion_vectors_load_for_the_rows_a_fetch_needs(
+        #[case] deleted_below: i32,
+        #[case] allowed: Option<Range<u32>>,
         #[case] fetch: Option<usize>,
         #[case] vectors_loaded: usize,
     ) {
         const FRAGMENTS: i32 = 64;
-        let rows = DEFAULT_BTREE_BATCH_SIZE as i32;
-        let fragment_rows = rows / FRAGMENTS;
-        // Row `r` sits at offset `r % 64` of fragment `r / 64`, so consecutive
-        // keys fall in consecutive fragments, and key `65 * f` is at offset `f`
-        // of fragment `f`.
-        let keys = Int32Array::from_iter_values(
-            (0..rows).map(|row| row % fragment_rows * FRAGMENTS + row / fragment_rows),
+        let fragment_rows = DEFAULT_BTREE_BATCH_SIZE as i32 / FRAGMENTS;
+        assert_eq!(
+            fragment_rows, FRAGMENTS,
+            "each fragment holds as many rows as there are fragments"
         );
+        let keys = Int32Array::from_iter_values((0..FRAGMENTS).flat_map(|fragment| {
+            (0..fragment_rows).map(move |offset| offset * FRAGMENTS + fragment)
+        }));
         let batch = key_column("key", keys);
         let schema = batch.schema();
         let mut dataset = Dataset::write(
@@ -1466,14 +1483,21 @@ mod tests {
             )
             .await
             .unwrap();
-        dataset.delete("key % 65 = 0").await.unwrap();
+        let one_per_fragment = FRAGMENTS + 1;
+        dataset
+            .delete(&format!(
+                "key % {one_per_fragment} = 0 OR key < {deleted_below}"
+            ))
+            .await
+            .unwrap();
         let dataset = Arc::new(dataset);
+        let allowed = allowed.map(RoaringBitmap::from_iter);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
             key_segment(&dataset).await,
             None,
             ASC_NULLS_LAST,
-            None,
+            allowed.as_ref(),
         )
         .await
         .unwrap()
@@ -1485,10 +1509,18 @@ mod tests {
             .into_iter()
             .map(|(key, _)| key.unwrap())
             .collect::<Vec<_>>();
-        let expected = (0..rows)
-            .filter(|key| key % 65 != 0)
-            .take(fetch.unwrap_or(usize::MAX))
+        let mut expected = live_keys(&dataset)
+            .await
+            .into_iter()
+            .filter(|(addr, _)| {
+                allowed
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(RowAddress::from(*addr).fragment_id()))
+            })
+            .map(|(_, key)| key.unwrap())
             .collect::<Vec<_>>();
+        expected.sort_unstable();
+        expected.truncate(fetch.unwrap_or(usize::MAX));
         assert_eq!(keys, expected);
         assert_eq!(
             metric(plan.as_ref(), "pages_loaded"),
