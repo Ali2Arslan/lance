@@ -431,18 +431,10 @@ impl ValuePages {
     }
 }
 
-/// The verdict of [`check_page_order`] on one lookup. It follows from the
-/// lookup rows, so it takes no part in lookup equality.
 #[derive(Debug, Default)]
-pub(super) struct PageOrder(OnceLock<Option<String>>);
+pub(super) struct PageOrderVerdict(OnceLock<Option<String>>);
 
-impl PartialEq for PageOrder {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl DeepSizeOf for PageOrder {
+impl DeepSizeOf for PageOrderVerdict {
     fn deep_size_of_children(&self, context: &mut Context) -> usize {
         self.0
             .get()
@@ -457,8 +449,8 @@ fn check_page_order<'a>(
     let violation = match lookup.page_order.0.get() {
         Some(violation) => violation,
         None => {
-            let violation = page_order_violation(lookup)?;
-            metrics.record_comparisons(lookup.batch.num_rows());
+            let (violation, rows_compared) = page_order_violation(lookup)?;
+            metrics.record_comparisons(rows_compared);
             lookup.page_order.0.get_or_init(|| violation)
         }
     };
@@ -473,7 +465,7 @@ fn check_page_order<'a>(
 /// A merge of range-partitioned segments concatenates lookups without
 /// checking key order, and training on input sorted nulls last leaves a page
 /// whose min sorts after its max.
-fn page_order_violation(lookup: &BTreeLookup) -> Result<Option<String>> {
+fn page_order_violation(lookup: &BTreeLookup) -> Result<(Option<String>, usize)> {
     let (mins, maxs) = (lookup.batch.column(0), lookup.batch.column(1));
     let page_ids = lookup.page_numbers()?.values();
     let min_vs_max = make_comparator(mins, maxs, STORED_ORDER)?;
@@ -506,9 +498,9 @@ fn page_order_violation(lookup: &BTreeLookup) -> Result<Option<String>> {
         } else {
             continue;
         };
-        return Ok(Some(violation));
+        return Ok((Some(violation), row + 1));
     }
-    Ok(None)
+    Ok((None, lookup.batch.num_rows()))
 }
 
 #[cfg(test)]
@@ -1382,10 +1374,13 @@ mod tests {
     }
 
     #[rstest]
-    #[case::in_key_order(false)]
-    #[case::out_of_key_order(true)]
+    #[case::in_key_order(false, 10)]
+    #[case::out_of_key_order(true, 2)]
     #[tokio::test]
-    async fn test_ordered_checks_page_order_once_per_lookup(#[case] pages_swapped: bool) {
+    async fn test_ordered_checks_page_order_once_per_lookup(
+        #[case] pages_swapped: bool,
+        #[case] rows_compared: usize,
+    ) {
         let rows: Vec<Row> = (0..40).map(|i| (Some(i), i as u64)).collect();
         let (in_order, _tmpdir) = build_index(&rows, 4).await;
         let page_ids = in_order
@@ -1427,7 +1422,7 @@ mod tests {
 
         assert_eq!(
             comparisons,
-            [page_ids.len(), 0],
+            [rows_compared, 0],
             "a plain search leaves the lookup unchecked, and only the first ordered search checks it"
         );
         assert_eq!(errors[0].is_some(), pages_swapped);

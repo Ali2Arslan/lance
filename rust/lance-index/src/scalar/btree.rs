@@ -735,7 +735,7 @@ where
 ///   without a native fast path (struct-backed intervals, booleans) fall back to the
 ///   boxed [`make_comparator`] via `scan_fallback`.
 /// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
-#[derive(Debug, PartialEq, DeepSizeOf)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
     batch: RecordBatch,
@@ -746,8 +746,13 @@ pub struct BTreeLookup {
     /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
     /// the front (NULLs first) and are skipped when searching value ranges.
     search_start: usize,
-    /// Ordered search's page order verdict, computed on its first call.
-    page_order: ordered::PageOrder,
+    page_order: ordered::PageOrderVerdict,
+}
+
+impl PartialEq for BTreeLookup {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch == other.batch
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
