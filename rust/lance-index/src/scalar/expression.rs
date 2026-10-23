@@ -18,9 +18,9 @@
 //! A conjunct that an index evaluates on its own key columns counts as
 //! consumed, even when the index cannot seek on it. A filter whose root is an
 //! OR or NOT over more than one column skips step 1, so the per-column visitor
-//! can union two column indices. A nested field such as `s.x` counts as its own
-//! column. An OR or NOT root over at most one column reaches the planners as
-//! one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
+//! can combine two column indices. A nested field such as `s.x` counts as its
+//! own column. An OR or NOT root over at most one column reaches the planners
+//! as one conjunct. Inside an AND, an OR or NOT conjunct reaches the planners
 //! whole.
 //!
 //! The rule reads the filter that [`apply_scalar_indices`] receives.
