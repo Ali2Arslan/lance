@@ -1110,9 +1110,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 }
             }
         }
-        // Cardinality alone does not prove `covering_fields` is really the
-        // trailing slice of `fields`; delegate that to the same rule a
-        // committed `IndexMetadata` is held to, rather than re-deriving it.
+        // Hold the covering declaration to the same rule a committed
+        // `IndexMetadata` is held to, rather than re-deriving it.
         IndexMetadata {
             uuid: segment.uuid(),
             fields: segment.fields().to_vec(),
@@ -2035,8 +2034,8 @@ pub(crate) async fn remap_index(
         .ok_or_else(|| Error::index(format!("Index with id {} does not exist", index_id)))?;
     let matched = &matched;
 
-    // Corrupt metadata fails closed before anything else: a declaration that is
-    // not a valid suffix of `fields` cannot be reasoned about at all, and the
+    // Corrupt metadata fails closed before anything else: a declaration that
+    // breaks the covering rules cannot be reasoned about at all, and the
     // withdrawal below would otherwise swallow it as an ordinary covered index.
     matched.validate_covering_fields()?;
 
@@ -9093,6 +9092,65 @@ mod tests {
 
         dataset.drop_index(&plain.name).await.unwrap();
         assert_eq!(covering_bits(&dataset), (0, 0));
+    }
+
+    /// A segment keyed on `a` and `b` that carries `a` is composite, so it
+    /// cannot commit as an index on `a`.
+    #[rstest]
+    #[case::keys_only(&["a"], &["b"], true)]
+    #[case::carries_its_leading_key(&["a", "b"], &["a"], false)]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_reads_keys_like_the_manifest(
+        #[case] fields: &[&str],
+        #[case] covering_fields: &[&str],
+        #[case] commits: bool,
+    ) {
+        let mut dataset = write_btree_table("memory://", &[]).await;
+        let ids = |names: &[&str]| -> Vec<i32> {
+            names
+                .iter()
+                .map(|name| dataset.schema().field_id(name).unwrap())
+                .collect()
+        };
+        let a = dataset.schema().field_id("a").unwrap();
+        let segment = IndexMetadata {
+            fields: ids(fields),
+            covering_fields: ids(covering_fields),
+            ..dataset
+                .create_index_builder(
+                    &["a"],
+                    IndexType::BTree,
+                    &ScalarIndexParams::for_builtin(BuiltinIndexType::BTree),
+                )
+                .execute_uncommitted()
+                .await
+                .unwrap()
+        };
+
+        let committed = dataset
+            .commit_existing_index_segments("a_idx", "a", vec![segment.clone()])
+            .await;
+
+        if !commits {
+            let error = committed.unwrap_err();
+            assert!(
+                error.to_string().contains("expected keyed field"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        committed.unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored[0].keyed_field(), Some(a));
+        assert_eq!(stored[0].covering_fields, segment.covering_fields);
+        let covering = FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS;
+        assert_eq!(covering_bits(&dataset), (covering, covering));
     }
 
     /// A commit that loses a race retries against the winner's index list. The

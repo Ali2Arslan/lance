@@ -302,7 +302,7 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
         dataset_version=dataset_with_index.version,
         fragment_ids=set([f.fragment_id for f in dataset_with_index.get_fragments()]),
         index_version=0,
-        covering_fields=[field_id],  # covers the only field -- degenerate
+        covering_fields=[field_id, field_id],
     )
 
     create_index_op = lance.LanceOperation.CreateIndex(
@@ -310,7 +310,7 @@ def test_commit_index_rejects_invalid_covering_fields(dataset_with_index, tmp_pa
         removed_indices=[],
     )
 
-    with pytest.raises(OSError, match="at least one field must remain indexed"):
+    with pytest.raises(OSError, match="more than once"):
         lance.LanceDataset.commit(
             dataset_with_index.uri,
             create_index_op,

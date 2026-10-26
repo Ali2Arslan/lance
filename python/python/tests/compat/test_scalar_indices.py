@@ -1102,6 +1102,18 @@ class CoveredBTreeIndex(UpgradeDowngradeTest):
     def check_read(self):
         lance.dataset(self.path).count_rows()
 
+    def check_commit_then_drop_transactions(self):
+        dataset = lance.dataset(self.path)
+        committed = dataset.read_transaction(dataset.version - 1).operation
+        dropped = dataset.read_transaction(dataset.version).operation
+        declaration = self.declaration()
+        for index in committed.new_indices + dropped.removed_indices:
+            carried = index.covering_fields
+            assert carried == declaration["covering_fields"]
+            assert index.fields[: len(index.fields) - len(carried)] == [
+                declaration["fields"][0]
+            ]
+
 
 @pytest.mark.compat
 @pytest.mark.parametrize("keys_only", [False, True], ids=["suffix", "keys_only"])
@@ -1120,3 +1132,16 @@ def test_independent_covering_fields_with_older_release(
             older.execute_method(case, "check_read")
     else:
         older.execute_method(case, "check_read")
+
+
+@pytest.mark.compat
+def test_keys_only_index_transactions_with_older_release(venv_factory, tmp_path):
+    case = CoveredBTreeIndex(tmp_path / "data.lance", keys_only=True)
+    case.create()
+    dataset = lance.dataset(case.path)
+    dataset.drop_index(dataset.describe_indices()[0].name)
+    case.check_commit_then_drop_transactions()
+
+    venv_factory.get_venv("13.0.0").execute_method(
+        case, "check_commit_then_drop_transactions"
+    )

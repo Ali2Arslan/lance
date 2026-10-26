@@ -514,17 +514,16 @@ mod tests {
     }
 
     /// The same migration path must reject -- cleanly, not with a panic -- a
-    /// malformed `covering_fields` longer than `fields`.
+    /// malformed `covering_fields` that lists a carried field twice.
     ///
     /// Note this is a genuinely synthetic scenario, not one a real commit can
     /// produce: `crate::index::remap_index`'s own `keyed > 1` guard (a sibling
     /// fix in this same phase) already rejects every organically-committable
     /// composite index *before* this migration path ever runs, since it is
     /// only reached from that function's `RemapResult::Keep` arm. And
-    /// `validate_covering_fields` rejects a fully-consumed `covering_fields`
-    /// (`keyed == 0` with non-empty `fields`) at `Operation::CreateIndex`
-    /// commit time, and `TryFrom<pb::IndexMetadata>` rejects it again when a
-    /// manifest is decoded. The only way left to reach this branch's rejection
+    /// `validate_covering_fields` rejects a repeated carried field at
+    /// `Operation::CreateIndex` commit time, and again when a manifest is
+    /// decoded. The only way left to reach this branch's rejection
     /// is metadata that passed through neither, which is how this test reaches
     /// it: seeding the index cache directly rather than committing through a
     /// `Transaction`.
@@ -550,20 +549,14 @@ mod tests {
         for idx in &mut indices {
             if idx.uuid == index_uuid {
                 // Force the legacy migration path, and malform `covering_fields`
-                // to be longer than `fields` -- more carried fields than fields
-                // at all. No normal commit can produce this.
+                // to carry one field twice. No normal commit can produce this.
                 idx.index_details = None;
                 // A real `index_details: None` entry predates every version bump
                 // too, so `index_version` must go back to 0 along with it --
                 // otherwise `unsupported_index_version` hides it as a too-new
                 // version of an unrecognized type before this path is even reached.
                 idx.index_version = 0;
-                idx.covering_fields = idx
-                    .fields
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(999))
-                    .collect();
+                idx.covering_fields = vec![999, 999];
             }
         }
         let metadata_key = crate::session::index_caches::IndexMetadataKey {
@@ -589,7 +582,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            error.to_string().contains("are not among its fields"),
+            error.to_string().contains("more than once"),
             "malformed covering must fail closed via the validator, not be \
              withdrawn as an ordinary covered index; got: {error}"
         );

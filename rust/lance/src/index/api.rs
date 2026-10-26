@@ -27,9 +27,7 @@ pub struct IndexSegment {
     fragment_bitmap: RoaringBitmap,
     /// Field IDs whose physical values are encoded in this segment.
     fields: Vec<i32>,
-    /// Field IDs whose values this segment carries but is not keyed on.
-    ///
-    /// Always the trailing entries of `fields`.
+    /// Field IDs whose values this segment carries.
     covering_fields: Vec<i32>,
     /// Metadata specific to the index type.
     index_details: Arc<prost_types::Any>,
@@ -85,9 +83,10 @@ impl IndexSegment {
         &self.fields
     }
 
-    /// Return the fields whose values this segment carries but is not keyed on.
+    /// Return the fields whose values this segment carries.
     ///
-    /// Always the trailing entries of [`Self::fields`].
+    /// Read against [`Self::fields`] as [`IndexMetadata::covering_fields`]
+    /// describes.
     pub fn covering_fields(&self) -> &[i32] {
         &self.covering_fields
     }
@@ -95,13 +94,10 @@ impl IndexSegment {
     /// Return the single column this segment is keyed on, or `None` when it is
     /// keyed on several -- a genuinely composite index -- or on none at all.
     ///
-    /// Mirrors [`IndexMetadata::keyed_field`], including its fail-closed
-    /// behavior on a declaration longer than [`Self::fields`]: a segment comes
-    /// from a caller (a distributed build's output, say) that this build never
-    /// validated.
+    /// Reads the keys as [`IndexMetadata::keyed_field`] does, so a segment
+    /// commits under the column its manifest entry is read back keyed on.
     pub fn keyed_field(&self) -> Option<i32> {
-        let keyed = self.fields.len().saturating_sub(self.covering_fields.len());
-        match &self.fields[..keyed] {
+        match IndexMetadata::keyed_fields_of(&self.fields, &self.covering_fields) {
             [only] => Some(*only),
             _ => None,
         }
@@ -448,14 +444,14 @@ mod tests {
         assert_eq!(segment.dataset_version(), 42);
     }
 
-    /// Segments arrive from callers this build never validated, so the keyed
-    /// prefix must fail closed on a declaration longer than `fields` rather than
-    /// underflow, exactly as [`IndexMetadata::keyed_field`] does.
     #[rstest]
     #[case::not_covered(vec![7], vec![], Some(7))]
     #[case::covered(vec![7, 11], vec![11], Some(7))]
     #[case::composite(vec![7, 11], vec![], None)]
-    #[case::malformed_longer_than_fields(vec![7], vec![11, 13], None)]
+    #[case::keys_only(vec![7], vec![11, 13], Some(7))]
+    #[case::carries_its_key(vec![7], vec![7, 11], Some(7))]
+    #[case::carries_its_leading_key(vec![7, 11], vec![7], None)]
+    #[case::no_fields(vec![], vec![11], None)]
     fn test_index_segment_keyed_field(
         #[case] fields: Vec<i32>,
         #[case] covering_fields: Vec<i32>,
@@ -475,6 +471,7 @@ mod tests {
         );
 
         assert_eq!(segment.keyed_field(), expected);
+        assert_eq!(segment.into_metadata("idx").keyed_field(), expected);
     }
 
     /// A covering declaration must survive the metadata -> segment -> metadata

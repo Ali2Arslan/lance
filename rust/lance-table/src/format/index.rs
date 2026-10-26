@@ -68,7 +68,8 @@ pub struct IndexMetadata {
     /// A manifest stores its whole index section in one layout, selected by
     /// [`FLAG_INDEPENDENT_COVERING_FIELDS`](crate::feature_flags::FLAG_INDEPENDENT_COVERING_FIELDS).
     /// [`Self::from_manifest_proto`] and [`Self::to_manifest_proto`] convert
-    /// between that layout and this shape.
+    /// between that layout and this shape. A transaction file always stores
+    /// the suffix layout.
     pub covering_fields: Vec<i32>,
 
     /// Human readable index name
@@ -271,22 +272,29 @@ impl IndexMetadata {
     /// [`Self::dependency_fields`] answers what invalidates it. Empty for a system index
     /// that declares no fields.
     pub fn keyed_fields(&self) -> &[i32] {
-        &self.fields[..self.suffix_layout_key_count().unwrap_or(self.fields.len())]
+        Self::keyed_fields_of(&self.fields, &self.covering_fields)
     }
 
-    /// How many leading entries of [`Self::fields`] are keys under the suffix
-    /// layout, or `None` when [`Self::covering_fields`] is not a shorter
-    /// trailing slice of `fields` and so can only be read as independent.
-    fn suffix_layout_key_count(&self) -> Option<usize> {
-        let key_count = self.fields.len().checked_sub(self.covering_fields.len())?;
-        (key_count > 0 && self.fields.ends_with(&self.covering_fields)).then_some(key_count)
+    /// [`Self::keyed_fields`] for a field list and covering declaration held
+    /// outside an `IndexMetadata`.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7, 11], &[11]), &[7]);
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7], &[7, 11]), &[7]);
+    /// assert_eq!(IndexMetadata::keyed_fields_of(&[7, 11], &[7]), &[7, 11]);
+    /// ```
+    pub fn keyed_fields_of<'a>(fields: &'a [i32], covering_fields: &[i32]) -> &'a [i32] {
+        &fields[..suffix_layout_key_count(fields, covering_fields).unwrap_or(fields.len())]
     }
 
     /// Whether only [`CoveringContract::Independent`] can store this entry,
     /// because its carried fields are not a shorter trailing slice of
     /// [`Self::fields`].
     pub fn requires_independent_contract(&self) -> bool {
-        !self.covering_fields.is_empty() && self.suffix_layout_key_count().is_none()
+        !self.covering_fields.is_empty()
+            && suffix_layout_key_count(&self.fields, &self.covering_fields).is_none()
     }
 
     /// The single column this index is keyed on, or `None` when it is keyed on
@@ -469,7 +477,7 @@ impl IndexMetadata {
     /// a manifest reads the same entries a fresh reader would.
     pub fn into_stored_shape(mut self, contract: CoveringContract) -> Self {
         if contract == CoveringContract::Independent {
-            if let Some(key_count) = self.suffix_layout_key_count() {
+            if let Some(key_count) = suffix_layout_key_count(&self.fields, &self.covering_fields) {
                 self.fields.truncate(key_count);
             }
             self.restore_suffix_layout();
@@ -481,7 +489,7 @@ impl IndexMetadata {
     /// end its key list would read as the suffix layout with fewer keys, so its
     /// carried fields are appended to keep its keys.
     fn restore_suffix_layout(&mut self) {
-        if self.suffix_layout_key_count().is_some() {
+        if suffix_layout_key_count(&self.fields, &self.covering_fields).is_some() {
             self.fields.extend_from_slice(&self.covering_fields);
         }
     }
@@ -501,7 +509,7 @@ impl IndexMetadata {
             }
             CoveringContract::Independent => {
                 self.validate_covering_fields()?;
-                self.suffix_layout_key_count()
+                suffix_layout_key_count(&self.fields, &self.covering_fields)
             }
         };
         let mut proto = pb::IndexMetadata::from(self);
@@ -510,6 +518,27 @@ impl IndexMetadata {
         }
         Ok(proto)
     }
+
+    /// Encode this entry for a transaction file, in the suffix layout: `fields`
+    /// lists the keys, then the carried fields.
+    ///
+    /// A transaction file records no covering contract, so it uses the layout
+    /// every released reader decodes. `TryFrom<pb::IndexMetadata>` reads the
+    /// entry back with the same keys and carried fields.
+    pub(crate) fn to_transaction_proto(&self) -> Result<pb::IndexMetadata> {
+        self.validate_covering_fields()?;
+        let mut proto = pb::IndexMetadata::from(self);
+        proto.fields = [self.keyed_fields(), &self.covering_fields].concat();
+        Ok(proto)
+    }
+}
+
+/// How many leading entries of `fields` are keys under the suffix layout, or
+/// `None` when `covering_fields` is not a shorter trailing slice of `fields`
+/// and so can only be read as independent.
+fn suffix_layout_key_count(fields: &[i32], covering_fields: &[i32]) -> Option<usize> {
+    let key_count = fields.len().checked_sub(covering_fields.len())?;
+    (key_count > 0 && fields.ends_with(covering_fields)).then_some(key_count)
 }
 
 impl DeepSizeOf for IndexMetadata {
@@ -542,8 +571,8 @@ impl DeepSizeOf for IndexMetadata {
 }
 
 /// Decodes an entry outside a manifest, such as one in a transaction or a cache
-/// entry, where it keeps its in-memory shape. Manifest entries go through
-/// [`IndexMetadata::from_manifest_proto`].
+/// entry, and reads its shape as [`IndexMetadata::covering_fields`] describes.
+/// Manifest entries go through [`IndexMetadata::from_manifest_proto`].
 impl TryFrom<pb::IndexMetadata> for IndexMetadata {
     type Error = Error;
 
