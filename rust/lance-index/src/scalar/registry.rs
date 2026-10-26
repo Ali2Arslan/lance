@@ -97,6 +97,16 @@ pub trait BasicTrainer: Send + Sync {
     ) -> Result<CreatedIndex>;
 }
 
+/// Whether a plugin's indices serve [`ScalarIndex::search_ordered`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IndexOrderingCapability {
+    /// The index cannot stream keys in order.
+    None,
+    /// The index streams keys in either direction, with nulls first or last.
+    Bidirectional,
+}
+
 /// A trait for scalar index plugins
 #[async_trait]
 pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
@@ -138,6 +148,30 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
 
     /// Returns true if the index returns an exact answer (e.g. not AtMost)
     fn provides_exact_answer(&self) -> bool;
+
+    /// Whether an index with these details serves
+    /// [`ScalarIndex::search_ordered`], decided without loading the index.
+    ///
+    /// A loaded index can still return `NotSupported`, for example when it
+    /// spans several segments or its files are out of key order, so a planner
+    /// must keep a fallback.
+    ///
+    /// ```
+    /// # use lance_index::pbold;
+    /// # use lance_index::scalar::btree::BTreeIndexPlugin;
+    /// # use lance_index::scalar::registry::{IndexOrderingCapability, ScalarIndexPlugin};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BTreeIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Bidirectional
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::None
+    }
 
     /// The version of the index plugin
     ///

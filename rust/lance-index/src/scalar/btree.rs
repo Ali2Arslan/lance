@@ -32,8 +32,8 @@ use crate::{
         CreatedIndex, RowIdRemapper, UpdateCriteria,
         expression::{SargableQueryParser, ScalarQueryParser},
         registry::{
-            BasicTrainer, ScalarIndexLoad, ScalarIndexPlugin, TrainingOrdering, TrainingRequest,
-            VALUE_COLUMN_NAME, single_flight_open,
+            BasicTrainer, IndexOrderingCapability, ScalarIndexLoad, ScalarIndexPlugin,
+            TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME, single_flight_open,
         },
     },
 };
@@ -89,6 +89,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
 mod flat;
+mod ordered;
 
 pub const BTREE_LOOKUP_NAME: &str = "page_lookup.lance";
 const BTREE_PAGES_NAME: &str = "page_data.lance";
@@ -734,7 +735,7 @@ where
 ///   without a native fast path (struct-backed intervals, booleans) fall back to the
 ///   boxed [`make_comparator`] via `scan_fallback`.
 /// - Range searches (`pages_between`) currently use [`make_comparator`] directly.
-#[derive(Debug, PartialEq, DeepSizeOf)]
+#[derive(Debug, DeepSizeOf)]
 pub struct BTreeLookup {
     /// One row per page (`min | max | null_count | page_idx`), sorted by `min`.
     batch: RecordBatch,
@@ -745,6 +746,13 @@ pub struct BTreeLookup {
     /// Index of the first row whose `max` is non-null. Entirely-null pages sort to
     /// the front (NULLs first) and are skipped when searching value ranges.
     search_start: usize,
+    page_order: ordered::PageOrderVerdict,
+}
+
+impl PartialEq for BTreeLookup {
+    fn eq(&self, other: &Self) -> bool {
+        self.batch == other.batch
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -806,6 +814,7 @@ impl BTreeLookup {
             null_pages,
             all_null_pages,
             search_start,
+            page_order: Default::default(),
         })
     }
 
@@ -2865,6 +2874,15 @@ impl ScalarIndex for BTreeIndex {
         )))
     }
 
+    async fn search_ordered(
+        &self,
+        query: Option<&dyn AnyQuery>,
+        options: SortOptions,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.search_ordered_stream(query, options, metrics)
+    }
+
     fn results_are_row_addresses(&self) -> bool {
         self.results_are_row_addresses
     }
@@ -3825,6 +3843,10 @@ impl ScalarIndexPlugin for BTreeIndexPlugin {
 
     fn provides_exact_answer(&self) -> bool {
         true
+    }
+
+    fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
+        IndexOrderingCapability::Bidirectional
     }
 
     fn version(&self) -> u32 {
