@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance.dataset import ScannerBuilder
+from lance.dataset import ColumnOrdering, ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -7156,3 +7156,37 @@ def test_large_string_scalar_index(tmp_path, index_type):
     result = ds.scanner(filter="category = 'alpha'").to_table()
     assert result.num_rows == 2
     assert set(result.column("id").to_pylist()) == {1, 3}
+
+
+@pytest.mark.parametrize(
+    "options",
+    [{}, {"use_ordered_index": False}, {"use_scalar_index": False}],
+    ids=["ordered_index", "use_ordered_index_false", "use_scalar_index_false"],
+)
+def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
+    ts = [None if i % 10 == 3 else i * 7 % 60 for i in range(60)]
+    table = pa.table(
+        {
+            "ts": pa.array(ts, pa.int32()),
+            "v": pa.array([None if t is None else t * 10 for t in ts], pa.int64()),
+        }
+    )
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=20)
+    dataset.create_scalar_index("ts", "BTREE", name="ts_idx")
+    dataset.delete("ts > 55")
+    order_by = [ColumnOrdering("ts", ascending=False, nulls_first=False)]
+
+    scanner = dataset.scanner(columns=["v"], order_by=order_by, limit=10, **options)
+    plan = scanner.explain_plan()
+    if options:
+        assert "SortExec" in plan and "OrderedIndexScan" not in plan, plan
+    else:
+        node = "OrderedIndexScan: index=ts_idx, order=[ts DESC NULLS LAST], fetch=10"
+        assert node in plan and "SortExec" not in plan, plan
+
+    live = dataset.to_table(columns=["ts", "v"])
+    newest = live.sort_by([("ts", "descending")]).slice(0, 10).select(["v"])
+    assert newest["v"].to_pylist() == [550, 540, 530, 520, 500, 490, 480, 470, 460, 450]
+    assert scanner.to_table() == newest
+    to_table = dataset.to_table(columns=["v"], order_by=order_by, limit=10, **options)
+    assert to_table == newest

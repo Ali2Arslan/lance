@@ -45,6 +45,7 @@ public class ScanOptions {
   private final Optional<MaterializationStyle> lateMaterialization;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
+  private final boolean useOrderedIndex;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -244,6 +245,7 @@ public class ScanOptions {
         Optional.empty(),
         columnOrderings,
         useScalarIndex,
+        true,
         substraitAggregate,
         collectStats,
         fastSearch,
@@ -275,6 +277,7 @@ public class ScanOptions {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      boolean useOrderedIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -323,6 +326,7 @@ public class ScanOptions {
     this.lateMaterialization = lateMaterialization;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
+    this.useOrderedIndex = useOrderedIndex;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -528,6 +532,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether a B-tree index may be read in key order to serve the column orderings.
+   *
+   * @return true if an ordered index read may replace the sort, false otherwise.
+   */
+  public boolean isUseOrderedIndex() {
+    return useOrderedIndex;
+  }
+
+  /**
    * Get whether to only search indexed fragments.
    *
    * @return true if unindexed fragments should be skipped, false otherwise.
@@ -603,6 +616,7 @@ public class ScanOptions {
         .add("lateMaterialization", lateMaterialization.orElse(null))
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
+        .add("useOrderedIndex", useOrderedIndex)
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -638,6 +652,7 @@ public class ScanOptions {
     private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
+    private boolean useOrderedIndex = true;
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -675,6 +690,7 @@ public class ScanOptions {
       this.lateMaterialization = options.getLateMaterialization();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
+      this.useOrderedIndex = options.isUseOrderedIndex();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -956,6 +972,22 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether a B-tree index may be read in key order to serve the column orderings.
+     *
+     * <p>By default, a scan with a limit that orders by one column with a B-tree index reads that
+     * index in key order and stops after {@code offset + limit} live rows, instead of sorting every
+     * row. This applies when the scan has no filter or a filter that the same index answers
+     * exactly. Set this to false to always sort. Other uses of scalar indices are not affected.
+     *
+     * @param useOrderedIndex true to allow an ordered index read, false otherwise. Default is true.
+     * @return Builder instance for method chaining.
+     */
+    public Builder useOrderedIndex(boolean useOrderedIndex) {
+      this.useOrderedIndex = useOrderedIndex;
+      return this;
+    }
+
+    /**
      * Set whether to only search indexed fragments.
      *
      * <p>This is a weak-consistency mode for vector search, full text search, and scalar-indexed
@@ -1057,6 +1089,7 @@ public class ScanOptions {
           lateMaterialization,
           columnOrderings,
           useScalarIndex,
+          useOrderedIndex,
           substraitAggregate,
           collectStats,
           fastSearch,
