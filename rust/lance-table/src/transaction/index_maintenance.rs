@@ -902,7 +902,10 @@ mod tests {
     use crate::format::overlay::staleness::{
         collect_overlay_stale_rows_for_segment, remove_overlay_stale_frags,
     };
-    use crate::transaction::test_support::{overlay_with_field, tagged_entry};
+    use crate::transaction::FragReuseUpdate;
+    use crate::transaction::test_support::{
+        default_build_config, overlay_with_field, sample_manifest, tagged_entry, update_txn,
+    };
     use chrono::{TimeZone, Utc};
     use rstest::rstest;
     use uuid::Uuid;
@@ -1887,6 +1890,7 @@ mod tests {
         CollectOverlayStaleFrags,
         CollectOverlayStaleRows,
         RemoveOverlayStaleFrags,
+        RejectUnknownCoverageRewrite,
     }
 
     impl DependencySite {
@@ -2005,6 +2009,38 @@ mod tests {
                     remove_overlay_stale_frags(&mut coverage, &[overlaid], &indices[0], schema);
                     !coverage.contains(0)
                 }
+                Self::RejectUnknownCoverageRewrite => {
+                    indices[0].fragment_bitmap = None;
+                    let mut manifest = sample_manifest();
+                    manifest.schema = schema.clone();
+                    let mut update = update_txn(vec![]);
+                    let Operation::Update {
+                        updated_fragments,
+                        fields_modified,
+                        ..
+                    } = &mut update.operation
+                    else {
+                        unreachable!()
+                    };
+                    *updated_fragments = vec![Fragment::new(0)];
+                    *fields_modified = vec![changed as u32];
+                    match update.prepare_indices(
+                        Some(&manifest),
+                        indices,
+                        &default_build_config(),
+                        None,
+                        FragReuseUpdate::None,
+                    ) {
+                        Ok(_) => false,
+                        Err(error) => {
+                            assert!(
+                                error.to_string().contains("unknown fragment coverage"),
+                                "{error}"
+                            );
+                            true
+                        }
+                    }
+                }
             }
         }
     }
@@ -2022,6 +2058,7 @@ mod tests {
     #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
     #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
     #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    #[case::reject_unknown_coverage_rewrite(DependencySite::RejectUnknownCoverageRewrite)]
     fn test_covering_dependency(#[case] site: DependencySite) {
         let schema = create_test_schema(&[KEYED, CARRIED, UNRELATED]);
         for shape in [CoveringShape::Suffix, CoveringShape::KeysOnly] {
@@ -2047,6 +2084,7 @@ mod tests {
     #[case::collect_overlay_stale_frags(DependencySite::CollectOverlayStaleFrags)]
     #[case::collect_overlay_stale_rows(DependencySite::CollectOverlayStaleRows)]
     #[case::remove_overlay_stale_frags(DependencySite::RemoveOverlayStaleFrags)]
+    #[case::reject_unknown_coverage_rewrite(DependencySite::RejectUnknownCoverageRewrite)]
     fn test_nested_covering_dependency(#[case] site: DependencySite) {
         let schema = create_nested_test_schema();
         let (s, s_x, s_y, b) = (0, 1, 2, 3);
