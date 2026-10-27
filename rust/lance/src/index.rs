@@ -2047,8 +2047,8 @@ pub(crate) async fn remap_index(
     if !matched.covering_fields.is_empty() {
         log::warn!(
             "Index '{}' declares covering fields {:?}, which no index builder \
-             writes or preserves yet. Index will be dropped during compaction \
-             and must be rebuilt.",
+             writes or preserves yet, so it is not remapped. Rebuild it to \
+             cover the rewritten fragments.",
             matched.name,
             matched.covering_fields,
         );
@@ -2092,8 +2092,7 @@ pub(crate) async fn remap_index(
         Ok(g) => g,
         Err(e) => {
             log::warn!(
-                "Cannot open index '{}' on '{}': {}. \
-                 Index will be dropped during compaction.",
+                "Cannot open index '{}' on '{}': {}, so it is not remapped. Rebuild the index.",
                 index_id,
                 field_path,
                 e
@@ -9401,6 +9400,8 @@ mod tests {
     /// that entry reads back keys-only, so the bit outlives the independent
     /// index that set it. The committing session caches what a fresh reader
     /// decodes, so dropping that index sets the same bits warm or cold.
+    /// Dropping the last covered index is the atomic reverse conversion the
+    /// format asks for, so both bits clear together.
     #[rstest]
     #[case::warm(false)]
     #[case::cold(true)]
@@ -9446,6 +9447,9 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!((suffix.fields, suffix.covering_fields), (vec![a], vec![b]));
+
+        dataset.drop_index(&plain(a).name).await.unwrap();
+        assert_eq!(covering_bits(&dataset), (0, 0));
     }
 
     /// `Manifest::shallow_clone` builds the clone's flags directly, and the
