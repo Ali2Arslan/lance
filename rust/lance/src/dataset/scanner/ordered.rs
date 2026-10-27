@@ -65,6 +65,10 @@ impl Scanner {
             .fragments
             .as_ref()
             .is_some_and(|fragments| fragments != self.dataset.fragments().as_ref());
+        // With stable row ids, an update can add the fragment it writes to the index's
+        // fragment bitmap without indexing its rows (issue 10351), so the bitmap
+        // cannot prove that the index covers every fragment.
+        let has_stable_row_ids = self.dataset.manifest().uses_stable_row_ids();
         if !self.use_ordered_index
             || !self.use_scalar_index
             || self.external_row_mask.is_some()
@@ -72,6 +76,7 @@ impl Scanner {
             || self.include_deleted_rows
             || is_legacy_storage
             || is_fragment_subset
+            || has_stable_row_ids
         {
             return None;
         }
@@ -189,12 +194,13 @@ mod tests {
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
+    use lance_table::format::IndexMetadata;
     use rstest::rstest;
 
     use super::super::{ColumnOrdering, RowAddrMask, RowAddrTreeMap, Scanner};
     use crate::Dataset;
-    use crate::dataset::transaction::Operation;
-    use crate::dataset::{WriteDestination, WriteParams};
+    use crate::dataset::transaction::{Operation, Transaction};
+    use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
 
     const ROWS: i32 = 300;
@@ -409,7 +415,12 @@ mod tests {
                 .unwrap();
         };
         let node = format!("OrderedIndexScan: index={INDEX}, order=[ts DESC NULLS LAST], fetch=23");
-        let rows = assert_ordered_read(&dataset, configure, Expect::OrderedScan(&node)).await;
+        let expect = if enable_stable_row_ids {
+            Expect::Sort
+        } else {
+            Expect::OrderedScan(&node)
+        };
+        let rows = assert_ordered_read(&dataset, configure, expect).await;
         assert_eq!(rows.num_rows(), 20);
     }
 
@@ -529,6 +540,51 @@ mod tests {
         NewerKeyOverlay,
         MissingIndexFiles,
         FullTextSearch,
+        StableRowIdsClaimingAnUpdatedFragment,
+    }
+
+    async fn claim_updated_fragment() -> Dataset {
+        let dataset = dataset(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        })
+        .await;
+        let updated = UpdateBuilder::new(Arc::new(dataset))
+            .update_where("ts < 10")
+            .unwrap()
+            .set("v", "v + 1")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(updated.rows_updated, 6);
+        let mut dataset = Arc::unwrap_or_clone(updated.new_dataset);
+        let index = dataset.load_indices_by_name(INDEX).await.unwrap().remove(0);
+        let claimed = IndexMetadata {
+            fragment_bitmap: Some(
+                dataset
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.id as u32)
+                    .collect(),
+            ),
+            ..index.clone()
+        };
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![claimed],
+                removed_indices: vec![index],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+        dataset
     }
 
     #[rstest]
@@ -542,7 +598,8 @@ mod tests {
             IndexShape::LegacyStorage,
             IndexShape::NewerKeyOverlay,
             IndexShape::MissingIndexFiles,
-            IndexShape::FullTextSearch
+            IndexShape::FullTextSearch,
+            IndexShape::StableRowIdsClaimingAnUpdatedFragment
         )]
         shape: IndexShape,
     ) {
@@ -651,6 +708,7 @@ mod tests {
                 full_text_query = Some(FullTextSearchQuery::new("even".into()));
                 dataset
             }
+            IndexShape::StableRowIdsClaimingAnUpdatedFragment => claim_updated_fragment().await,
         };
         let configure = |scanner: &mut Scanner| {
             scanner
