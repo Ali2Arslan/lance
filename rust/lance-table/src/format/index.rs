@@ -309,6 +309,32 @@ impl IndexMetadata {
         }
     }
 
+    /// Whether `other` is keyed on the same fields and carries the same
+    /// fields, whichever layout each entry uses.
+    ///
+    /// ```
+    /// use lance_table::format::IndexMetadata;
+    ///
+    /// let entry = |fields: Vec<i32>, covering_fields: Vec<i32>| IndexMetadata {
+    ///     uuid: uuid::Uuid::new_v4(),
+    ///     name: "idx".to_string(),
+    ///     fields,
+    ///     covering_fields,
+    ///     dataset_version: 1,
+    ///     fragment_bitmap: None,
+    ///     index_details: None,
+    ///     index_version: 0,
+    ///     created_at: None,
+    ///     base_id: None,
+    ///     files: None,
+    /// };
+    /// assert!(entry(vec![7, 11], vec![11]).declares_same_fields(&entry(vec![7], vec![11])));
+    /// assert!(!entry(vec![7], vec![11]).declares_same_fields(&entry(vec![7], vec![13])));
+    /// ```
+    pub fn declares_same_fields(&self, other: &Self) -> bool {
+        self.keyed_fields() == other.keyed_fields() && self.covering_fields == other.covering_fields
+    }
+
     /// Every field whose change can leave this index stale: [`Self::fields`],
     /// then each of [`Self::covering_fields`] that `fields` does not list,
     /// once.
@@ -1085,6 +1111,24 @@ mod tests {
         assert_eq!(metadata.keyed_fields(), expected_keyed.as_slice());
         assert_eq!(metadata.keyed_field(), expected_single);
         assert_eq!(metadata.requires_independent_contract(), independent);
+    }
+
+    #[rstest]
+    #[case::suffix_and_keys_only((vec![7, 11], vec![11]), (vec![7], vec![11]), true)]
+    #[case::tail_shaped_layouts((vec![7, 11, 11], vec![11]), (vec![7, 11], vec![11]), false)]
+    #[case::different_carried_fields((vec![7], vec![11]), (vec![7], vec![13]), false)]
+    #[case::different_keys((vec![7, 11], vec![11]), (vec![8], vec![11]), false)]
+    #[case::same_fields_one_carried((vec![7, 11], vec![11]), (vec![7, 11], vec![]), false)]
+    fn test_declares_same_fields(
+        #[case] left: (Vec<i32>, Vec<i32>),
+        #[case] right: (Vec<i32>, Vec<i32>),
+        #[case] same: bool,
+    ) {
+        let left = index_metadata_with(left.0, left.1);
+        let right = index_metadata_with(right.0, right.1);
+
+        assert_eq!(left.declares_same_fields(&right), same);
+        assert_eq!(right.declares_same_fields(&left), same);
     }
 
     /// The dependency set is the same whether or not `fields` repeats the

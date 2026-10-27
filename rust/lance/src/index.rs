@@ -1058,8 +1058,7 @@ pub(crate) async fn build_index_metadata_from_segments(
     // the logical index: both carried columns and plugin dependencies can
     // differ. Keep the same invariant as `IndexDescriptionImpl::try_new` and
     // `merge_existing_index_segments`.
-    let expected_fields = segments[0].fields().to_vec();
-    let expected_covering_fields = segments[0].covering_fields().to_vec();
+    let expected = &segments[0];
     for segment in &segments {
         if segment.dataset_version() > dataset.manifest.version {
             return Err(Error::invalid_input(format!(
@@ -1126,9 +1125,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             files: None,
         }
         .validate_covering_fields()?;
-        if segment.fields() != expected_fields.as_slice()
-            || segment.covering_fields() != expected_covering_fields.as_slice()
-        {
+        if !segment.declares_same_fields(expected) {
             return Err(Error::invalid_input(format!(
                 "CreateIndex: segment {} declares fields {:?} (carried {:?}) but index \
                  '{}' declares fields {:?} (carried {:?}); every segment of one index \
@@ -1137,8 +1134,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 segment.fields(),
                 segment.covering_fields(),
                 index_name,
-                expected_fields,
-                expected_covering_fields,
+                expected.fields(),
+                expected.covering_fields(),
             )));
         }
         if !seen_segment_ids.insert(segment.uuid()) {
@@ -2288,13 +2285,24 @@ impl IndexDescriptionImpl {
             ));
         }
 
-        let field_ids = &example_metadata.fields;
-        if !segments.iter().all(|shard| shard.fields == *field_ids) {
-            return Err(Error::index(
-                "Index fields should be identical across all segments".to_string(),
-            ));
+        if let Some(mismatched) = segments
+            .iter()
+            .find(|shard| !shard.declares_same_fields(example_metadata))
+        {
+            return Err(Error::index(format!(
+                "Index '{}' segments should declare identical keyed and carried fields, but \
+                 segment {} declares fields {:?} (carried {:?}) and segment {} declares \
+                 fields {:?} (carried {:?})",
+                name,
+                example_metadata.uuid,
+                example_metadata.fields,
+                example_metadata.covering_fields,
+                mismatched.uuid,
+                mismatched.fields,
+                mismatched.covering_fields,
+            )));
         }
-        // Only the keyed prefix. `fields` also lists the columns the index merely
+        // Only the keyed prefix. `fields` can also list the columns the index merely
         // carries values for, which it cannot be searched on, and this list is what
         // every binding advertises as the index's columns -- Python's
         // `_default_vector_index_for_column` matches on membership of it, so
@@ -3126,10 +3134,9 @@ impl DatasetIndexExt for Dataset {
         let is_index_type_change = existing_different_type_url.is_some();
         let existing_snapshot = existing_named_indices.clone();
         // What a retained sibling has to agree with. Every incoming segment
-        // already carries the same pair: `build_index_metadata_from_segments`
+        // already declares the same fields: `build_index_metadata_from_segments`
         // compares them against each other before this point.
-        let expected_fields = new_indices[0].fields.clone();
-        let expected_covering_fields = new_indices[0].covering_fields.clone();
+        let expected = &new_indices[0];
         let removed_indices = existing_named_indices
             .into_iter()
             .map(|idx| -> Result<Option<IndexMetadata>> {
@@ -3160,21 +3167,19 @@ impl DatasetIndexExt for Dataset {
                 if existing_fragments.is_disjoint(&incoming_fragments) {
                     // Retained, so its declaration outlives this commit and has
                     // to match what is being written: `IndexDescriptionImpl::try_new`
-                    // requires `fields` to be identical across the segments of one
-                    // logical index. Nothing above catches a disagreement, because
+                    // requires the same keyed and carried fields across the segments
+                    // of one logical index. Nothing above catches a disagreement, because
                     // `keyed_fields` is the prefix left after the carried ones -- a
                     // segment carrying columns keys on exactly what a plain one
                     // keys on, and both pass the keyed-field guard.
-                    if idx.fields != expected_fields
-                        || idx.covering_fields != expected_covering_fields
-                    {
+                    if !idx.declares_same_fields(expected) {
                         return Err(Error::invalid_input(format!(
                             "CreateIndex: incoming segments for '{}' declare fields {:?} and covering_fields {:?}, \
                              but retained segment {} declares fields {:?} and covering_fields {:?}; \
                              a logical index cannot mix declarations - rebuild every segment in one commit",
                             index_name,
-                            expected_fields,
-                            expected_covering_fields,
+                            expected.fields,
+                            expected.covering_fields,
                             idx.uuid,
                             idx.fields,
                             idx.covering_fields
@@ -9153,6 +9158,172 @@ mod tests {
         assert_eq!(covering_bits(&dataset), (covering, covering));
     }
 
+    #[rstest]
+    #[case::same_declaration(false, "b", true)]
+    #[case::different_carried_field(false, "c", false)]
+    #[case::same_fields_different_carried_field(true, "c", false)]
+    #[tokio::test]
+    async fn test_index_description_reads_segments_in_either_layout(
+        #[case] first_keys_only: bool,
+        #[case] carried_by_second: &str,
+        #[case] describes: bool,
+    ) {
+        let dataset = write_btree_table("memory://", &["a"]).await;
+        let [a, b, carried] =
+            ["a", "b", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
+        let plain = dataset.load_indices().await.unwrap()[0].clone();
+        let first = IndexMetadata {
+            fields: if first_keys_only { vec![a] } else { vec![a, b] },
+            covering_fields: vec![b],
+            ..plain.clone()
+        };
+        let keys_only = IndexMetadata {
+            uuid: Uuid::new_v4(),
+            fields: vec![a],
+            covering_fields: vec![carried],
+            ..plain
+        };
+
+        let description = IndexDescriptionImpl::try_new(vec![first, keys_only], &dataset).await;
+
+        if !describes {
+            let Err(error) = description else {
+                panic!("segments that carry different fields must not describe one index");
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("should declare identical keyed and carried fields"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        assert_eq!(description.unwrap().field_ids(), [a as u32]);
+    }
+
+    /// A table of two fragments with columns `a`, `b` and `c`, and one
+    /// uncommitted BTree segment on `a` per fragment.
+    async fn two_btree_segments() -> (Dataset, [IndexMetadata; 2]) {
+        let data = gen_batch()
+            .col("a", array::step::<Int32Type>())
+            .col("b", array::step::<Int32Type>())
+            .col("c", array::step::<Int32Type>())
+            .into_reader_rows(RowCount::from(20), BatchCount::from(2));
+        let mut dataset = Dataset::write(
+            data,
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 20,
+                max_rows_per_group: 20,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let params = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut segments = Vec::new();
+        for fragment in dataset.get_fragments() {
+            segments.push(
+                dataset
+                    .create_index_builder(&["a"], IndexType::BTree, &params)
+                    .fragments(vec![fragment.id() as u32])
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        (dataset, segments.try_into().unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_accepts_one_index_in_both_layouts() {
+        let (mut dataset, [first, second]) = two_btree_segments().await;
+        let [a, b] = ["a", "b"].map(|name| dataset.schema().field_id(name).unwrap());
+        let keys_only = IndexMetadata {
+            fields: vec![a],
+            covering_fields: vec![b],
+            ..first
+        };
+        let suffix = IndexMetadata {
+            fields: vec![a, b],
+            covering_fields: vec![b],
+            ..second
+        };
+
+        dataset
+            .commit_existing_index_segments("a_idx", "a", vec![keys_only, suffix])
+            .await
+            .unwrap();
+
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored
+                .iter()
+                .all(|segment| segment.keyed_field() == Some(a) && segment.covering_fields == [b])
+        );
+    }
+
+    #[rstest]
+    #[case::same_declaration("b", true)]
+    #[case::different_carried_field("c", false)]
+    #[tokio::test]
+    async fn test_commit_existing_index_segments_retains_a_sibling_in_the_other_layout(
+        #[case] carried_by_second: &str,
+        #[case] commits: bool,
+    ) {
+        let (mut dataset, [first, second]) = two_btree_segments().await;
+        let [a, b, carried] =
+            ["a", "b", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
+        let first = IndexMetadata {
+            fields: vec![a],
+            covering_fields: vec![b],
+            ..first
+        };
+        let second = IndexMetadata {
+            fields: vec![a, carried],
+            covering_fields: vec![carried],
+            ..second
+        };
+        dataset
+            .commit_existing_index_segments("a_idx", "a", vec![first])
+            .await
+            .unwrap();
+
+        let committed = dataset
+            .commit_existing_index_segments("a_idx", "a", vec![second])
+            .await;
+
+        if !commits {
+            let error = committed.unwrap_err();
+            assert!(
+                error.to_string().contains("cannot mix declarations"),
+                "unexpected error: {error}"
+            );
+            return;
+        }
+        committed.unwrap();
+        let stored = read_manifest_indexes(
+            &dataset.object_store,
+            &dataset.manifest_location,
+            &dataset.manifest,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored
+                .iter()
+                .all(|segment| segment.keyed_field() == Some(a) && segment.covering_fields == [b])
+        );
+    }
+
     /// A commit that loses a race retries against the winner's index list. The
     /// retry here needs the independent layout, so the suffix entry the winner
     /// committed must be stored as its keys in that same manifest: the flag is
@@ -12474,7 +12645,7 @@ mod tests {
     /// The per-segment rules only pin the keyed field and its count, so two
     /// segments can disagree about the carried columns and each still pass. That
     /// pair must be refused at commit, because `IndexDescriptionImpl::try_new`
-    /// requires `fields` to be identical across segments -- committing it would
+    /// requires the same keyed and carried fields across segments -- committing it would
     /// leave `describe_indices` erroring on metadata this call just wrote.
     #[tokio::test]
     async fn test_build_index_metadata_from_segments_rejects_mixed_covering_declarations() {
@@ -12539,7 +12710,7 @@ mod tests {
         );
     }
 
-    /// `fields` lists the carried columns too, but a logical description must
+    /// `fields` can list the carried columns too, but a logical description must
     /// advertise only what the index can be searched on. Every binding reads this
     /// list as "the index's columns" -- Python's `_default_vector_index_for_column`
     /// matches on membership -- so a carried column here hands back the keyed

@@ -247,7 +247,6 @@ def test_index_covering_fields_roundtrip(dataset_with_index, test_table, tmp_pat
     meta_id = _get_field_id_by_name(dataset_without_index.lance_schema, "meta")
     price_id = _get_field_id_by_name(dataset_without_index.lance_schema, "price")
 
-    # `covering_fields` must be a non-empty, non-total suffix of `fields`:
     # [price_id] is the trailing entry of [meta_id, price_id], leaving
     # meta_id as the column the index is keyed on.
     index = Index(

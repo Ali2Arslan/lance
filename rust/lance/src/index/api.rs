@@ -25,7 +25,8 @@ pub struct IndexSegment {
     uuid: Uuid,
     /// The fragments covered by this segment.
     fragment_bitmap: RoaringBitmap,
-    /// Field IDs whose physical values are encoded in this segment.
+    /// Field IDs whose physical values are encoded in this segment, besides any
+    /// that only `covering_fields` lists.
     fields: Vec<i32>,
     /// Field IDs whose values this segment carries.
     covering_fields: Vec<i32>,
@@ -78,7 +79,8 @@ impl IndexSegment {
         &mut self.fragment_bitmap
     }
 
-    /// Return the field IDs whose values are encoded in this segment.
+    /// Return the field IDs whose values are encoded in this segment, besides any
+    /// that only [`Self::covering_fields`] lists.
     pub fn fields(&self) -> &[i32] {
         &self.fields
     }
@@ -101,6 +103,12 @@ impl IndexSegment {
             [only] => Some(*only),
             _ => None,
         }
+    }
+
+    pub(crate) fn declares_same_fields(&self, other: &Self) -> bool {
+        IndexMetadata::keyed_fields_of(&self.fields, &self.covering_fields)
+            == IndexMetadata::keyed_fields_of(&other.fields, &other.covering_fields)
+            && self.covering_fields == other.covering_fields
     }
 
     /// Return the serialized index details for this segment.

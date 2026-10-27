@@ -1033,7 +1033,7 @@ pub(crate) async fn merge_segments(
                 segment.uuid
             ))
         })?;
-        if segment.fields != segments[0].fields {
+        if !segment.declares_same_fields(&segments[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 segments[0].name
@@ -1122,9 +1122,8 @@ pub async fn load_segments(
         return Ok(None);
     }
 
-    let expected_fields = indices[0].fields.clone();
     for meta in &indices {
-        if meta.fields != expected_fields {
+        if !meta.declares_same_fields(&indices[0]) {
             return Err(Error::invalid_input(format!(
                 "FTS index {} has inconsistent fields across segments",
                 index_meta.name
