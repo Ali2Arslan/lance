@@ -22,7 +22,46 @@ package lance.table;
  * force us to load the index until we know we can make use of it)
  */
 
-message BTreeIndexDetails {}
+message BTreeIndexDetails {
+  /* Present on a composite BTree index and absent on a single-column one.
+   * A composite index also sets IndexMetadata.index_version to 2.
+   */
+  BTreeKeyLayout key_layout = 1;
+}
+
+/* The keys of a composite BTree index. IndexMetadata.fields lists the key
+ * columns in key order, and the dataset schema gives their types.
+ *
+ * EXPERIMENTAL: composite keys are an experimental format feature. This
+ * message and the composite index files may change incompatibly without a
+ * separate vote, in which case the index must be rebuilt (the data is never
+ * rewritten), and the feature is removed if its stabilization vote does not
+ * pass. Datasets without a composite index are not affected either way.
+ */
+message BTreeKeyLayout {
+  message KeyEncoding {
+    // The encoding name, such as "arrow_row".
+    string name = 1;
+    uint32 version = 2;
+  }
+  message KeyOrdering {
+    // The ordering name, such as "lexicographic".
+    string name = 1;
+    uint32 version = 2;
+  }
+  message KeyField {
+    bool descending = 1;
+    // True places nulls of this key before every other value. False places them after.
+    bool nulls_first = 2;
+  }
+  // How a tuple of key values becomes the bytes stored in the index pages.
+  KeyEncoding encoding = 1;
+  // How the stored bytes order the key tuples.
+  KeyOrdering ordering = 2;
+  // keys[i] describes the key column IndexMetadata.fields[i].
+  repeated KeyField keys = 3;
+}
+
 message BitmapIndexDetails {}
 message LabelListIndexDetails {}
 message NGramIndexDetails {}
