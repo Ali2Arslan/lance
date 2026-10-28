@@ -381,7 +381,7 @@ impl ValuePages {
                 first_row(maxs, value, Ordering::is_gt)?,
             ),
             Bound::Excluded(value) => (
-                first_row(mins, value, Ordering::is_gt)?,
+                first_row(mins, value, Ordering::is_ge)?,
                 first_row(maxs, value, Ordering::is_ge)?,
             ),
         };
@@ -1002,9 +1002,19 @@ mod tests {
         let legacy = with_lookup_column(&paged, 0, Arc::new(legacy_mins));
         indices.push(("legacy page stats".to_string(), Arc::new(legacy)));
 
+        let mut pages_at_excluded_upper = 0;
         for (name, index) in &indices {
             let lookup = check_page_order(&index.page_lookup, &NoOpMetricsCollector).unwrap();
             let batch = &index.page_lookup.batch;
+            let page_min: HashMap<u32, Option<i32>> = index
+                .page_lookup
+                .page_numbers()
+                .unwrap()
+                .values()
+                .iter()
+                .copied()
+                .zip(batch.column(0).as_primitive::<Int32Type>().iter())
+                .collect();
             let mut keys: Vec<i32> = [batch.column(0), batch.column(1)]
                 .into_iter()
                 .flat_map(|column| column.as_primitive::<Int32Type>().iter().flatten())
@@ -1039,7 +1049,17 @@ mod tests {
                         });
                     match (walked, expected) {
                         (Ok(walked), Ok(expected)) => {
-                            assert_eq!(walked, expected, "{name}, {lower:?} to {upper:?}")
+                            let (at_upper, kept): (Vec<_>, Vec<_>) =
+                                expected.into_iter().partition(|page| {
+                                    matches!(upper, Bound::Excluded(ScalarValue::Int32(bound))
+                                        if page_min[&page.page_id()] == *bound)
+                                });
+                            pages_at_excluded_upper += at_upper.len();
+                            assert_eq!(
+                                walked, kept,
+                                "{name}, {lower:?} to {upper:?}: the walk skips only the pages \
+                                 search keeps whose min is the excluded upper bound"
+                            )
                         }
                         (Err(_), Err(_)) => {}
                         (walked, expected) => panic!(
@@ -1049,6 +1069,62 @@ mod tests {
                 }
             }
         }
+        assert!(
+            pages_at_excluded_upper > 0,
+            "some range has a page whose min is its excluded upper bound"
+        );
+    }
+
+    #[rstest]
+    #[case::ascending(false)]
+    #[case::descending(true)]
+    #[tokio::test]
+    async fn test_ordered_exclusive_upper_skips_pages_at_the_bound(#[case] descending: bool) {
+        const ROWS_PER_KEY: u64 = 41;
+        const BOUND: i32 = 2;
+        let rows: Vec<Row> = (0..4 * ROWS_PER_KEY)
+            .map(|i| (Some((i / ROWS_PER_KEY) as i32), i))
+            .collect();
+        let (index, _tmpdir) = build_index(&rows, 4).await;
+        let mins = index
+            .page_lookup
+            .batch
+            .column(0)
+            .as_primitive::<Int32Type>();
+        let pages_below_bound = mins.iter().filter(|&min| min < Some(BOUND)).count();
+        assert_eq!(
+            mins.iter().filter(|&min| min == Some(BOUND)).count(),
+            10,
+            "min 2 on nine [2 2 2 2] pages and on [2 2 2 3]"
+        );
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Int32(Some(BOUND))),
+        );
+        let options = order(descending, true);
+
+        let first_row = Arc::new(LocalMetricsCollector::default());
+        let mut stream = index
+            .search_ordered(Some(&query), options, first_row.clone())
+            .await
+            .unwrap();
+        stream.try_next().await.unwrap().unwrap();
+        assert_eq!(
+            parts_loaded(&first_row),
+            1,
+            "pages read before the first row"
+        );
+
+        let full_walk = Arc::new(LocalMetricsCollector::default());
+        let actual =
+            ordered_rows_with_metrics(&index, Some(&query), options, full_walk.clone()).await;
+        let expected = sorted_search_rows(&index, &rows, Some(&query), options).await;
+        assert_same_rows(actual, &expected, options, "x < bound");
+        assert_eq!(
+            parts_loaded(&full_walk),
+            pages_below_bound,
+            "a full walk reads only the pages whose min is below the bound"
+        );
     }
 
     #[rstest]
