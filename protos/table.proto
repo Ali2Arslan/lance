@@ -165,7 +165,7 @@ message Manifest {
    *   derived snapshots, including clone and restore, because data files may
    *   retain version 1 seeds. Legacy seeds may coexist and must be decoded
    *   with their original semantics.
-   * * 1 << 18: some index has a predicate (see IndexPredicate). Both feature
+   * * 1 << 19: some index has a predicate (see IndexPredicate). Both feature
    *   words must carry the bit while any index in the manifest has one. A
    *   reader or writer that ignores it would treat a partial index as covering
    *   every row.
@@ -466,7 +466,7 @@ message IndexMetadata {
 
   /* Restricts the index to rows where this predicate is TRUE. Absent means
    * the index covers every live row of the fragments in fragment_bitmap.
-   * Requires feature flag 1 << 18 in both reader_feature_flags and
+   * Requires feature flag 1 << 19 in both reader_feature_flags and
    * writer_feature_flags while any index in the manifest sets this field.
    */
   optional IndexPredicate predicate = 14;

@@ -137,9 +137,9 @@ pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
 ///
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to read or write a table that sets it.
-pub const FLAG_INDEX_PREDICATES: u64 = 1 << 18;
+pub const FLAG_INDEX_PREDICATES: u64 = 1 << 19;
 /// The first bit that is unknown as a feature flag
-pub const FLAG_UNKNOWN: u64 = 1 << 19;
+pub const FLAG_UNKNOWN: u64 = 1 << 20;
 
 const _: () = assert!(FLAG_COVERED_INDEX_METADATA < FLAG_UNKNOWN);
 // The fence needs a bit the current released build already refuses, which means
@@ -397,6 +397,8 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
+    // Bit 18 is left for separate format proposals and has no supported feature here.
+    mark_supported(&mut supported, 1 << 18, false);
     mark_supported(&mut supported, FLAG_INDEX_PREDICATES, false);
     supported
 }
@@ -593,7 +595,7 @@ mod tests {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
         assert!(can_write_dataset(FLAG_OBJECT_METADATA));
-        assert_eq!(FLAG_UNKNOWN, 1 << 19);
+        assert_eq!(FLAG_UNKNOWN, 1 << 20);
         assert!(!can_read_dataset(FLAG_UNKNOWN));
         assert!(!can_write_dataset(FLAG_UNKNOWN));
 
@@ -725,7 +727,9 @@ mod tests {
 
     #[test]
     fn test_index_predicates_flag_is_reserved() {
-        assert_eq!(FLAG_INDEX_PREDICATES, 1 << 18);
+        assert_eq!(FLAG_INDEX_PREDICATES, 1 << 19);
+        assert!(!can_read_dataset(1 << 18));
+        assert!(!can_write_dataset(1 << 18));
         assert!(!can_read_dataset(FLAG_INDEX_PREDICATES));
         assert!(!can_write_dataset(FLAG_INDEX_PREDICATES));
 
