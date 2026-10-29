@@ -496,10 +496,10 @@ mod tests {
         }
     });
 
-    // Neither side gets another `optimize_expr` pass, whose signed-zero rewrite
-    // would turn a planned `x = 0.0` back into `x IN (-0.0, 0.0)`. DataFusion's
-    // coercion and simplifier keep Arrow's semantics, and the simplifier turns a
-    // raw `arrow_cast` into a cast the physical planner accepts.
+    // Neither side gets another `Planner::optimize_expr` pass, whose signed-zero
+    // rewrite would widen a planned `x = 0.0` to both zeros and hide a plan that
+    // lost `-0.0`. DataFusion's simplifier has no such rewrite, and a raw
+    // `arrow_cast` fails at evaluation until the simplifier turns it into a cast.
     fn selected_rows(predicate: Expr) -> Vec<bool> {
         let fixture = &*FIXTURE;
         let context = SimplifyContext::builder()
@@ -571,9 +571,7 @@ mod tests {
         assert_eq!(plan.key_residual, conjuncts_at(expected.key_residual));
         assert_eq!(plan.row_residual, conjuncts_at(expected.row_residual));
 
-        // An AND is TRUE exactly when every conjunct is, so each conjunct is
-        // evaluated once and its rows serve both sides.
-        let rows = conjuncts
+        let selected_by_conjunct = conjuncts
             .iter()
             .cloned()
             .map(selected_rows)
@@ -589,9 +587,11 @@ mod tests {
             .key_residual
             .iter()
             .chain(expected.row_residual)
-            .map(|&position| &rows[position])
+            .map(|&position| &selected_by_conjunct[position])
             .fold(selected_rows(query.to_expr(String::new())), and);
-        let original = rows.iter().fold(vec![true; FIXTURE.rows.num_rows()], and);
+        let original = selected_by_conjunct
+            .iter()
+            .fold(vec![true; FIXTURE.rows.num_rows()], and);
         assert_eq!(planned, original);
     }
 
@@ -932,8 +932,9 @@ mod tests {
         check_plan(&conjuncts(predicate, 0), &FIXTURE.keys, expected);
     }
 
-    // Parsing and optimizing 100,000 literals takes most of a second, so these
-    // lists are built with literals already of the key's type.
+    // Parsing and optimizing 100,000 literals exceeds the test time budget, so
+    // these lists are built with each literal already of the key's type, as
+    // `optimize_expr` would leave it.
     #[rstest]
     #[case::items_of_10_values(
         vec![col("tenant").in_list((0..100_000).map(|item: i32| lit(item % 10)).collect(), false)],
