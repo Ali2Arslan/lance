@@ -151,6 +151,8 @@ pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts}
 #[cfg(feature = "substrait")]
 use lance_datafusion::substrait::parse_substrait;
 
+mod ordered;
+
 /// Rows per output batch when neither the scan options nor
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
 pub const BATCH_SIZE_FALLBACK: usize = 8192;
@@ -1225,6 +1227,8 @@ pub struct Scanner {
     /// to handle this better in the future as well)
     use_scalar_index: bool,
 
+    use_ordered_index: bool,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1717,6 +1721,7 @@ impl Scanner {
             index_segments: None,
             fast_search: false,
             use_scalar_index: true,
+            use_ordered_index: true,
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -3856,6 +3861,7 @@ impl Scanner {
             .await?;
 
         let mut use_limit_node = true;
+        let mut is_index_ordered = false;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
         let mut plan: Arc<dyn ExecutionPlan> = match (
             &self.nearest,
@@ -3897,6 +3903,9 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
+                } else if let Some(ordered_read) = self.try_ordered_read(&mut filter_plan).await {
+                    is_index_ordered = true;
+                    ordered_read
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
@@ -3979,7 +3988,9 @@ impl Scanner {
         }
 
         // Sort
-        if let Some(ordering) = &self.ordering {
+        if let Some(ordering) = &self.ordering
+            && !is_index_ordered
+        {
             let ordering_columns = ordering.iter().map(|col| &col.column_name);
             let projection_with_ordering = self
                 .dataset
