@@ -126,29 +126,30 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// them must refuse the dataset. Ordinary readers can ignore this metadata; all
 /// covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
-/// Some BTree index segment has composite keys, meaning its
-/// `BTreeIndexDetails` sets `key_layout`.
+/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
+/// sets `key_layout`.
 ///
-/// Writer-only. Readers from v10.0.0 on ignore such a segment, because its
-/// index version is 2. Without this bit, on a table with stable row ids,
-/// updates by v12.0.0 and v13.0.0 add the fragment that receives rewritten
-/// rows to the segment's `fragment_bitmap`, although the segment holds no row
-/// address in it. With it, v12.0.0 through v14.0.0 commit nothing to the
-/// table. v10.0.0 and v11.0.0 check writer flags only on insert. Their update,
-/// delete, index creation, column addition, and compaction drop the segment
-/// and clear the bit. Their restore, shallow clone, and branch creation keep
-/// the segment and clear the bit. Their reads stay correct.
+/// The segment's index version 2 keeps older readers from using it, but
+/// nothing keeps v12.0.0 and v13.0.0 writers from updating a table with stable
+/// row ids. Their update adds the fragment that receives the rewritten rows to
+/// the segment's `fragment_bitmap` without indexing those rows. v12.0.0
+/// through v14.0.0 refuse this bit, so they commit nothing to the table.
+///
+/// Writer-only. v10.0.0 and v11.0.0 check writer flags only on insert. Their
+/// update, delete, index creation, column addition, and compaction drop the
+/// segment and clear the bit. Their restore, shallow clone, and branch
+/// creation keep the segment and clear the bit. Their reads stay correct.
 ///
 /// A writer that supports this bit sets it on every published manifest, clones
-/// and restores included, exactly when its index section has a composite
-/// segment, and derives and validates it the way
-/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A composite segment from a
-/// manifest without the bit is unusable, and such a writer never carries it
-/// into a new manifest.
+/// and restores included, exactly when its index section has a segment with a
+/// `key_layout`, and derives and validates it the way
+/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A segment with a `key_layout`
+/// from a manifest without the bit is unusable, and such a writer never
+/// carries it into a new manifest.
 ///
 /// Reserved ahead of its implementation. This build masks the bit out in
 /// `supported_flags_when`, so it refuses to write a table that sets it.
-pub const FLAG_COMPOSITE_BTREE_KEYS: u64 = 1 << 18;
+pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 18;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 19;
 
@@ -170,8 +171,8 @@ const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
 // Same fence for this bit: v14.0.0 refuses bit 18 and up.
-const _: () = assert!(FLAG_COMPOSITE_BTREE_KEYS >= 1 << 18);
-const _: () = assert!(FLAG_COMPOSITE_BTREE_KEYS < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 18);
+const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -410,7 +411,7 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
-    mark_supported(&mut supported, FLAG_COMPOSITE_BTREE_KEYS, false);
+    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -602,16 +603,16 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_composite_btree_keys_flag_fences_writes_without_blocking_reads() {
+    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
         let mut manifest = empty_manifest();
-        manifest.writer_feature_flags = FLAG_COMPOSITE_BTREE_KEYS;
+        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
         ensure_can_read_manifest(&manifest).unwrap();
         let error = ensure_can_write_manifest(&manifest).unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }));
         assert!(error.to_string().contains("cannot be written"));
-        assert!(!can_read_dataset(FLAG_COMPOSITE_BTREE_KEYS));
-        assert!(!can_write_dataset(FLAG_COMPOSITE_BTREE_KEYS));
-        assert_eq!(FLAG_COMPOSITE_BTREE_KEYS, 1 << 18);
+        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
+        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 18);
     }
 
     #[test]

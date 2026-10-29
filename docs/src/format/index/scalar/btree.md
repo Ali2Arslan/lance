@@ -17,7 +17,10 @@ the index can store 256K leaves of size 4K each, requiring only a few MiB of mem
 %%% proto.message.BTreeIndexDetails %%%
 ```
 
-Only a composite index sets `key_layout`. See [Composite Keys](#composite-keys).
+Index version 2 is a superset of version 1. A version 2 segment without
+`key_layout` has exactly the version 1 layout and meaning. A segment sets
+`key_layout` when its pages store encoded keys instead of raw values. See
+[Key Layout](#key-layout).
 
 ## Storage Layout
 
@@ -56,6 +59,7 @@ An ordinary BTree may index the logical `_rowid` column of a table, given the fo
 * `IndexMetadata.fields` **must** be a single field ID `-3`.
 * `_rowid` **must** be represented as a non-nullable `UInt64` field.
 * The index **must** use the address-domain format and be at least version 1.
+* The index **must not** set `key_layout`.
 
 The logical field need not appear in the user schema. Its inline and spilled
 representations are defined in
@@ -72,54 +76,68 @@ The BTree index provides exact results for the following query types:
 | **IsIn**   | `column IN (v1, v2, ...)` | Multiple BTree lookups, union results from all matching sub-indices         |
 | **IsNull** | `column IS NULL`          | Returns rows from all pages where null_count > 0                            |
 
-## Composite Keys
+## Key Layout
 
 !!! warning "Experimental"
 
-    Composite keys are unstable. The `key_layout` message, the `arrow_row`
+    Key layouts are unstable. The `key_layout` message, the `arrow_row`
     encoding, the `lexicographic` ordering, and the page layout in this
     section may change incompatibly without a separate vote. After such a
-    change, a composite index must be rebuilt. The table data is never
-    rewritten. The feature is removed if its stabilization vote does not
+    change, an index with a `key_layout` must be rebuilt. The table data is
+    never rewritten. The feature is removed if its stabilization vote does not
     pass.
 
-A composite BTree index is keyed on two or more columns. It orders rows by the
-tuple of their key values, compared one key at a time. Each page key is one
-byte string that encodes the whole tuple, and byte order equals tuple order, so
-the page lookup above finds pages by comparing encoded keys as bytes. Nulls are
-part of the encoded tuple, so the null handling in
-[Accelerated Queries](#accelerated-queries) does not apply to a composite index.
+A BTree index with a `key_layout` has one or more keys and stores them in the
+[encoded page layout](#encoded-page-layout). With two or more keys it is a
+composite index. With one key it is a single-column index whose direction and
+null placement are set explicitly.
 
-### Composite Index Metadata
+The index orders rows by the tuple of their key values, compared one key at a
+time. Each key keeps its own order inside the tuple order, once its direction
+and null placement are applied. When two tuples have equal values for every
+earlier key, they compare as their values of the next key compare. Each page
+key is one byte string that encodes the whole tuple, and byte order equals
+tuple order, so the page lookup above finds pages by comparing encoded keys as
+bytes. Nulls are part of the encoded tuple, so the null handling in
+[Accelerated Queries](#accelerated-queries) does not apply to an index with a
+`key_layout`.
 
-A composite index sets these `IndexMetadata` fields:
+### Key Layout Metadata
 
-- `fields` lists the key columns in key order. It has at least two entries.
+A segment with `key_layout` sets these `IndexMetadata` fields:
+
+- `index_version` is 2.
+- `fields` lists the key columns in key order. It has at least one entry.
   Each entry names a field of the dataset schema, and no field appears twice.
-- `index_version` is 2. Only a composite index uses version 2. A single-column
-  index keeps version 0 or 1.
 - `index_details` is a `BTreeIndexDetails` whose `key_layout` describes the keys.
 
-A composite index declares no covering fields, so `fields` holds only key
-columns under either [covering-field contract](../index.md#covering-field-contracts).
+This version defines no covering columns for an index with a `key_layout`, so
+`fields` holds exactly its keys under either
+[covering-field contract](../index.md#covering-field-contracts). A later format
+change may add covering columns.
 
 `key_layout.keys[i]` gives the direction and the null placement of the key
 column `fields[i]`. The dataset schema gives the type of each key column, so
-`key_layout` does not repeat it. Every key stores both `descending` and
-`nulls_first`, and the format has no default. The protobuf zero values mean
-ascending with nulls last. `key_layout.encoding` names how a tuple becomes
-bytes, and `key_layout.ordering` names how those bytes order tuples. Each is a
-name and a version. This page defines encoding `arrow_row` version 1 and
-ordering `lexicographic` version 1.
+`key_layout` does not repeat it. Each key sets its direction and its null
+placement explicitly. The null placement does not follow from the direction,
+so an ascending or a descending key may put its nulls first or last. In the
+protobuf, a false `descending` means ascending and a false `nulls_first` means
+nulls last.
+
+`key_layout.encoding` sets how a tuple becomes bytes, and `key_layout.ordering`
+sets how those bytes order tuples. Each holds a `oneof` with one message per
+kind, and the parameters of a kind are fields of its message. This page defines
+the `arrow_row` encoding with `version` 1, and the `lexicographic` ordering,
+which has no parameters.
 
 ```protobuf
 %%% proto.message.BTreeKeyLayout %%%
 ```
 
-### Composite Page Layout
+### Encoded Page Layout
 
-A composite index has the same two files and the same schema metadata as a
-single-column index. Only the type of the value columns changes.
+An index with a `key_layout` has the same two files and the same schema
+metadata as an index without one. Only the type of the value columns changes.
 `page_data.lance` has one row for each indexed row:
 
 ```python
@@ -133,8 +151,9 @@ pa.schema([
 some keys in the tuple are null. `ids` holds the row address, as in version 1.
 Rows sort by `values` compared as unsigned byte strings, and rows with equal
 `values` sort by `ids` in ascending order. Two byte strings compare at their
-first differing byte. A byte string sorts before every longer byte string that
-starts with it.
+first differing byte, so the one-byte string `0xFF` sorts after the two-byte
+string `0x0000`. A byte string sorts before every longer byte string that
+starts with it, so `0x01` sorts before `0x0100`.
 
 `page_lookup.lance` has one row for each page:
 
@@ -148,7 +167,8 @@ pa.schema([
 ```
 
 `min` and `max` are the first and the last `values` of the page. `null_count`
-is always 0, because `values` is never null.
+is always 0, because `values` is never null. The column stays so that
+`page_lookup.lance` has the same columns with or without a `key_layout`.
 
 ### Encoding `arrow_row` Version 1
 
@@ -160,11 +180,18 @@ of each key determine where its encoding ends.
 The encoding admits these key types: Boolean, Int8, Int16, Int32, Int64,
 UInt8, UInt16, UInt32, UInt64, Float32, Float64, Date32, Date64, Timestamp with
 any unit and with or without a time zone, Utf8, LargeUtf8, Binary, and
-LargeBinary.
+LargeBinary. The encoding admits no other type, including nested types such as
+Struct and List and the Decimal types, and a later encoding version may admit
+them.
 
 The encoding of a key depends on its type, on `descending`, and on
 `nulls_first`. The null sentinel of a key is the byte `0x00` when `nulls_first`
-is true and the byte `0xFF` when it is false.
+is true and the byte `0xFF` when it is false. Every non-null encoding below
+starts with a byte strictly between `0x00` and `0xFF`. A fixed-width value
+starts with `0x01` in either direction. A variable-width value starts with
+`0x01` or `0x02`, or with their inverses `0xFE` or `0xFD` when `descending` is
+true. The first byte alone therefore puts a null before or after every non-null
+value of the key, however many bytes the values take.
 
 #### Fixed-Width Types
 
@@ -204,9 +231,9 @@ When `descending` is true, every byte of a non-null encoding is inverted. That
 includes the leading `0x01` or `0x02`, the padding, and the byte after each
 block. A null is never inverted.
 
-### Ordering `lexicographic` Version 1
+### Ordering `lexicographic`
 
-`lexicographic` version 1 compares two tuples one key at a time, in key order.
+`lexicographic` compares two tuples one key at a time, in key order.
 The first key whose values differ decides the order. Two values of one key
 compare as follows:
 
@@ -228,7 +255,7 @@ The order of each type is:
   strings.
 
 Under `arrow_row` version 1, comparing two encoded tuples as unsigned byte
-strings gives the same order as `lexicographic` version 1 gives the tuples. Two
+strings gives the same order as `lexicographic` gives the tuples. Two
 tuples are equal exactly when their encodings are equal. A reader therefore
 orders and searches pages by comparing bytes, and never decodes a key to do so.
 
@@ -300,28 +327,28 @@ last:
 | `(-1, "ab")`   | `01 7fffffff` `fd 9e9dffffffffffff fd` |
 | `(null, null)` | `00 00000000` `ff`                    |
 
-### Composite Reader Rules
+### Key Layout Reader Rules
 
 A reader applies these rules from the manifest alone, before it opens an index
-file. It treats a composite index as unusable when any of these is true:
+file. It picks the page layout of a BTree segment from whether `key_layout` is
+present, never from the number of entries in `fields`. It treats a segment with
+a `key_layout` as unusable when any of these is true:
 
 - `index_version` is below 2.
-- `fields` has fewer than two entries, names a field twice, or names a field
-  that is not in the dataset schema.
+- `fields` is empty, names a field twice, or names a field that is not in the
+  dataset schema.
 - `covering_fields` is not empty.
 - `key_layout.keys` and `fields` have different lengths.
-- The reader does not support the `encoding` name and version, or the
-  `ordering` name and version. A missing `encoding` or `ordering` is not
-  supported.
+- The reader does not support the `encoding` or the `ordering`, including their
+  parameters such as the `arrow_row` `version`. A missing `encoding` or
+  `ordering`, or one whose `oneof` is unset, is not supported.
 - The encoding does not admit the type of a key column.
-- The manifest's writer feature flags lack `FLAG_COMPOSITE_BTREE_KEYS`.
-
-A reader also treats a version 2 BTree index without `key_layout` as unusable.
+- The manifest's writer feature flags lack `FLAG_BTREE_KEY_LAYOUT`.
 
 An engine skips an unusable index and scans the fragments that the index
 covers, as it does for any index segment it cannot use (see
 [Index Compatibility](../index.md#index-compatibility)). If the manifest lacks
-`FLAG_COMPOSITE_BTREE_KEYS`, a writer that supports composite keys drops the
+`FLAG_BTREE_KEY_LAYOUT`, a writer that supports key layouts drops the
 index (see
 [Compatibility With Released Versions](#compatibility-with-released-versions)).
 Otherwise the engine does not add rows or fragments to the index, and its
@@ -342,45 +369,45 @@ byte layout is a new encoding version, `arrow_row` version 2.
 
 ### Compatibility With Released Versions
 
-Two fences keep released versions away from a composite index. Its index
-version fences readers from v10.0.0 on, and the writer feature flag
-`FLAG_COMPOSITE_BTREE_KEYS` fences writers from v12.0.0 on.
-
-A composite index has index version 2. Releases v12.0.0 and v13.0.0 read BTree
-indices up to version 0, and release v14.0.0 reads them up to version 1, so
-these releases ignore a composite index and answer queries from the table data.
-Releases v10.0.0 and v11.0.0 also ignore it when they read. In all five
-releases, equality filters on key columns return the same rows as a full scan.
-
-The index version does not fence writers. On a table with stable row IDs, an
-update by v12.0.0 or v13.0.0 adds the fragment that receives the rewritten rows
-to a composite index's `fragment_bitmap`, although the index holds no row
-address in that fragment. A table with a composite index therefore sets
-`FLAG_COMPOSITE_BTREE_KEYS` (`2^18`) in its writer
+Index version 2 keeps released readers from using an index with a
+`key_layout`, but nothing in the index keeps v12.0.0 and v13.0.0 writers from
+updating a table with stable row IDs. Their update adds the fragment that
+receives the rewritten rows to the index's `fragment_bitmap`, although the
+index holds no row address in that fragment. A table with such an index
+therefore sets `FLAG_BTREE_KEY_LAYOUT` (`2^18`) in its writer
 [feature flags](../../table/versioning.md#current-feature-flags), and not in its
-reader feature flags. Releases v12.0.0 through v14.0.0 commit no change to such
-a table. Their insert, update, delete, index creation, column addition, restore,
-shallow clone, and branch creation fail with an unsupported-feature error.
-Their index optimization and compaction either fail the same way or commit
-nothing.
+reader feature flags. The index version fences readers from v10.0.0 on, and the
+flag fences writers from v12.0.0 on.
+
+Releases v12.0.0 and v13.0.0 read BTree indices up to version 0, and release
+v14.0.0 reads them up to version 1, so these releases ignore an index with a
+`key_layout` and answer queries from the table data. Releases v10.0.0 and
+v11.0.0 also ignore it when they read. In all five releases, equality filters
+on key columns return the same rows as a full scan.
+
+Releases v12.0.0 through v14.0.0 commit no change to a table that sets
+`FLAG_BTREE_KEY_LAYOUT`. Their insert, update, delete, index creation, column
+addition, restore, shallow clone, and branch creation fail with an
+unsupported-feature error. Their index optimization and compaction either fail
+the same way or commit nothing.
 
 Releases v10.0.0 and v11.0.0 check writer feature flags only when they insert.
 Their update, delete, index creation, column addition, and compaction commit
-anyway. Each of these commits removes the composite index from the manifest and
-clears `FLAG_COMPOSITE_BTREE_KEYS`. Their index optimization does the same or
-commits nothing. Their restore, shallow clone, and branch creation clear the
-bit but keep the composite index. On a table with stable row IDs, a later
+anyway. Each of these commits removes the index with a `key_layout` from the
+manifest and clears `FLAG_BTREE_KEY_LAYOUT`. Their index optimization does the
+same or commits nothing. Their restore, shallow clone, and branch creation
+clear the bit but keep the index. On a table with stable row IDs, a later
 update by v12.0.0 or v13.0.0 can then add fragments to the index's
 `fragment_bitmap`. Their reads stay correct throughout.
 
-A reader therefore does not use a composite index from a manifest whose writer
-feature flags lack `FLAG_COMPOSITE_BTREE_KEYS` (see
-[Composite Reader Rules](#composite-reader-rules)).
+A reader therefore does not use an index with a `key_layout` from a manifest
+whose writer feature flags lack `FLAG_BTREE_KEY_LAYOUT` (see
+[Key Layout Reader Rules](#key-layout-reader-rules)).
 
-A writer that supports composite keys never carries a composite index out of a
-manifest whose writer feature flags lack the bit. That rule covers the manifest
-that a commit builds on and the version that a restore, clone, or branch
-copies. The writer drops such an index before it computes the bit. Every
-manifest it publishes, including by clone and restore, sets
-`FLAG_COMPOSITE_BTREE_KEYS` exactly when its index section has a segment with a
-`key_layout`. The bit covers composite index segments only.
+A writer that supports key layouts never carries an index with a `key_layout`
+out of a manifest whose writer feature flags lack the bit. That rule covers the
+manifest that a commit builds on and the version that a restore, clone, or
+branch copies. The writer drops such an index before it computes the bit.
+Every manifest it publishes, including by clone and restore, sets
+`FLAG_BTREE_KEY_LAYOUT` exactly when its index section has a segment with a
+`key_layout`. The bit covers only segments with a `key_layout`.
