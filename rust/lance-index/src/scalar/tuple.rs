@@ -58,14 +58,19 @@ pub enum KeyValues {
 }
 
 /// Lower and upper bounds on one key. A NULL key is never within them.
+///
+/// A range can be empty, with the lower bound above the upper one, or with
+/// equal bounds where either one is excluded. A consumer must read such a range
+/// as selecting no key. `BTreeMap::range`, for example, panics on
+/// `(Excluded(5), Excluded(5))` and on a start above the end.
 pub type KeyRange = (Bound<ScalarValue>, Bound<ScalarValue>);
 
 /// A search over the leading columns of an ordered key.
 ///
 /// The query fixes keys `0..prefix.len()`, each to its [`KeyValues`], so it
 /// covers the cross product of those sets. When `range` is set, the next key is
-/// non-null and within the bounds, so an unbounded range means `IS NOT NULL`.
-/// Later keys are unconstrained.
+/// non-null and within the bounds, so an unbounded range means `IS NOT NULL`
+/// and an empty [`KeyRange`] matches no key tuple. Later keys are unconstrained.
 ///
 /// `Display` prints one SQL term per constrained key, with strings quoted as
 /// `'it''s'` and binary values as `X'0AFF'`. A key whose set is empty prints as
