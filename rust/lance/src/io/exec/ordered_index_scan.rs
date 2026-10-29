@@ -24,8 +24,10 @@ use std::sync::Arc;
 use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::take::take_record_batch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
@@ -482,6 +484,13 @@ impl ExecutionPlan for OrderedIndexScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
+    ) -> DataFusionResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
