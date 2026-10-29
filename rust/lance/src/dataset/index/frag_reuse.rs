@@ -325,12 +325,12 @@ pub(crate) enum TaggedTrimOutcome {
     NothingToTrim,
     /// Replace the current entry with the filtered history.
     Replace {
-        new_entry: IndexMetadata,
-        current_entry: IndexMetadata,
+        new_entry: Box<IndexMetadata>,
+        current_entry: Box<IndexMetadata>,
     },
     /// Everything trimmed away: delete the entry outright. The manifest
     /// feature flags stay set (they are sticky).
-    Delete { current_entry: IndexMetadata },
+    Delete { current_entry: Box<IndexMetadata> },
 }
 
 /// Segments of a logical index whose whole contribution is already served
@@ -513,12 +513,12 @@ async fn cleanup_tagged_frag_reuse_index(dataset: &mut Dataset) -> lance_core::R
             new_entry,
             current_entry,
         } => Operation::CreateIndex {
-            new_indices: vec![new_entry],
-            removed_indices: vec![current_entry],
+            new_indices: vec![*new_entry],
+            removed_indices: vec![*current_entry],
         },
         TaggedTrimOutcome::Delete { current_entry } => Operation::CreateIndex {
             new_indices: vec![],
-            removed_indices: vec![current_entry],
+            removed_indices: vec![*current_entry],
         },
     };
 
@@ -854,7 +854,7 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     }
     if retained.iter().all(|kept| !*kept) {
         return Ok(TaggedTrimOutcome::Delete {
-            current_entry: entry,
+            current_entry: Box::new(entry),
         });
     }
 
@@ -885,8 +885,8 @@ pub(crate) async fn derive_tagged_trim(dataset: &Dataset) -> lance_core::Result<
     decode_frag_reuse_ledger_from_content(entry.index_version, &new_content).await?;
     let new_entry = build_tagged_frag_reuse_entry(dataset, new_content, fragment_bitmap).await?;
     Ok(TaggedTrimOutcome::Replace {
-        new_entry,
-        current_entry: entry,
+        new_entry: Box::new(new_entry),
+        current_entry: Box::new(entry),
     })
 }
 
@@ -938,6 +938,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -2290,6 +2292,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             dataset
                 .apply_commit(
@@ -2810,6 +2814,67 @@ mod tests {
                 "row i={i} still maps into a removed fragment"
             );
             assert_eq!(frag_reuse_index.remap_row_id(before[&i]), Some(after[&i]));
+        }
+    }
+
+    #[test]
+    fn test_compact_open_agrees_with_direct_transposition_on_ascending_old_frags() {
+        // Compaction under `IndexRemapMode::Direct` transposes the same payload into a
+        // per-row map with `transpose_row_ids_from_digest`, so the two must resolve every
+        // real address identically. Ascending old fragments are compaction's scan order,
+        // the only case where the positional and address-ordered pairings have to agree.
+        fn addr(frag: u32, offset: u32) -> u64 {
+            u64::from(RowAddress::new_from_parts(frag, offset))
+        }
+        fn digest(id: u64, physical_rows: usize) -> lance_index::frag_reuse::FragDigest {
+            lance_index::frag_reuse::FragDigest {
+                id,
+                physical_rows,
+                num_deleted_rows: 0,
+            }
+        }
+
+        let old = vec![digest(0, 5), digest(1, 4), digest(3, 3)];
+        let new = vec![digest(10, 4), digest(11, 5)];
+        let rewritten = [
+            (0, 1),
+            (0, 2),
+            (0, 4),
+            (1, 0),
+            (1, 1),
+            (1, 3),
+            (3, 0),
+            (3, 1),
+            (3, 2),
+        ];
+        let changed =
+            roaring::RoaringTreemap::from_iter(rewritten.iter().map(|&(f, o)| addr(f, o)));
+        let mut changed_row_addrs = Vec::with_capacity(changed.serialized_size());
+        changed.serialize_into(&mut changed_row_addrs).unwrap();
+        let details = FragReuseIndexDetails {
+            versions: vec![FragReuseVersion {
+                dataset_version: 1,
+                groups: vec![lance_index::frag_reuse::FragReuseGroup {
+                    changed_row_addrs,
+                    old_frags: old.clone(),
+                    new_frags: new.clone(),
+                }],
+            }],
+        };
+        let index = CompactFragReuseIndex::try_new(uuid::Uuid::new_v4(), details).unwrap();
+
+        let expected = remapping::transpose_row_ids_from_digest(changed, &old, &new);
+        for frag in &old {
+            for offset in 0..frag.physical_rows as u32 {
+                let a = addr(frag.id as u32, offset);
+                assert_eq!(
+                    index.remap_row_id(a),
+                    // `remap_row_id` passes untouched addresses through; the map omits them.
+                    expected.get(&a).copied().unwrap_or(Some(a)),
+                    "mismatch at ({}, {offset})",
+                    frag.id
+                );
+            }
         }
     }
 }

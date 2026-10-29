@@ -70,7 +70,7 @@ pub struct TransactionRebase<'a> {
     /// The fragments and schema at the read version, kept for a CreateIndex
     /// so a concurrent `Merge` can be told which columns it rewrote in place
     /// and which fields it removed or retyped.
-    read_fragments: Option<Vec<Fragment>>,
+    read_fragments: Option<Arc<Vec<Fragment>>>,
     read_schema: Option<lance_core::datatypes::Schema>,
     /// For a `Rewrite` carrying a fragment reuse entry: what it adds relative
     /// to the entry at its read version (`RewriteReuseState`).
@@ -261,7 +261,7 @@ impl<'a> TransactionRebase<'a> {
             | Operation::UpdateBases { .. } => {
                 let is_create_index =
                     matches!(transaction.operation, Operation::CreateIndex { .. });
-                let read_fragments = is_create_index.then(|| dataset.fragments().as_ref().clone());
+                let read_fragments = is_create_index.then(|| dataset.fragments().clone());
                 let read_schema = is_create_index.then(|| dataset.schema().clone());
                 let frag_reuse_base = match &transaction.operation {
                     Operation::CreateIndex { new_indices, .. }
@@ -1551,6 +1551,7 @@ impl<'a> TransactionRebase<'a> {
         if let Operation::Rewrite {
             groups,
             frag_reuse_index,
+            rewritten_indices,
             ..
         } = &self.transaction.operation
         {
@@ -1599,7 +1600,11 @@ impl<'a> TransactionRebase<'a> {
                         Ok(())
                     }
                 }
-                Operation::Rewrite { groups, .. } => {
+                Operation::Rewrite {
+                    groups,
+                    rewritten_indices: other_rewritten_indices,
+                    ..
+                } => {
                     // Double consumption: the committed rewrite replaced
                     // fragments our tagged transitions read from or produce,
                     // so appending our transitions would record row movement
@@ -1653,6 +1658,37 @@ impl<'a> TransactionRebase<'a> {
                     {
                         Err(self.retryable_conflict_err(other_transaction, other_version))
                     } else {
+                        let mut replacement_source_counts = HashMap::new();
+                        for rewritten_index in rewritten_indices {
+                            *replacement_source_counts
+                                .entry(rewritten_index.new_id)
+                                .or_insert(0) += 1;
+                        }
+                        let merged_sources = rewritten_indices
+                            .iter()
+                            .filter(|rewritten_index| {
+                                replacement_source_counts[&rewritten_index.new_id] > 1
+                            })
+                            .map(|rewritten_index| rewritten_index.old_id)
+                            .collect::<HashSet<_>>();
+                        let replaced_source =
+                            other_rewritten_indices.iter().find_map(|rewritten_index| {
+                                (rewritten_index.old_id != rewritten_index.new_id
+                                    && merged_sources.contains(&rewritten_index.old_id))
+                                .then_some(rewritten_index.old_id)
+                            });
+                        if let Some(source_id) = replaced_source {
+                            return Err(Error::incompatible_transaction_source(
+                                format!(
+                                    "A concurrent rewrite at version {} replaced source index \
+                                     segment {}, which this rewrite planned to merge. The stale \
+                                     compaction plan can never succeed as committed; replan \
+                                     compaction from the latest dataset.",
+                                    other_version, source_id
+                                )
+                                .into(),
+                            ));
+                        }
                         Ok(())
                     }
                 }
@@ -2073,12 +2109,13 @@ impl<'a> TransactionRebase<'a> {
     /// and the version gate keeps indexes correct. A concurrent operation
     /// conflicts when it takes precedence over the overlay for cells the overlay
     /// covers, dropping the overlay's values: retryably when it rewrites the
-    /// physical layout of one of our fragments (Rewrite, Merge) or re-creates the
-    /// covered rows from the pre-overlay base (a row-moving Update — checked
-    /// row-by-row in `finish_data_overlay`), or removes an overlaid fragment
-    /// outright (a Delete / Update that drops the fragment); and incompatibly for
-    /// whole-dataset replacements (Overwrite / Restore) and MemWAL state updates
-    /// (UpdateMemWalState), which do not rebase against data operations.
+    /// physical layout of one of our fragments (Rewrite, Merge), drops a field
+    /// we overlay (Project), or re-creates the covered rows from the pre-overlay
+    /// base (a row-moving Update — checked row-by-row in `finish_data_overlay`),
+    /// or removes an overlaid fragment outright (a Delete / Update that drops the
+    /// fragment); and incompatibly for whole-dataset replacements (Overwrite /
+    /// Restore) and MemWAL state updates (UpdateMemWalState), which do not rebase
+    /// against data operations.
     fn check_data_overlay_txn(
         &mut self,
         other_transaction: &Transaction,
@@ -2088,12 +2125,33 @@ impl<'a> TransactionRebase<'a> {
             Operation::Append { .. }
             | Operation::CreateIndex { .. }
             | Operation::ReserveFragments { .. }
-            | Operation::Project { .. }
             | Operation::UpdateConfig { .. }
             | Operation::UpdateBases { .. }
             | Operation::Clone { .. }
             | Operation::DataReplacement { .. }
             | Operation::DataOverlay { .. } => Ok(()),
+            // A concurrent Project that dropped a field we overlay discards our
+            // values for it. Project only prunes the overlays already committed,
+            // so ours would otherwise land covering a field that no longer exists.
+            Operation::Project { schema, .. } => {
+                let Operation::DataOverlay { groups } = &self.transaction.operation else {
+                    return Err(wrong_operation_err(&self.transaction.operation));
+                };
+                let remaining_field_ids = schema
+                    .fields_pre_order()
+                    .map(|f| f.id)
+                    .collect::<HashSet<_>>();
+                let drops_our_field = groups
+                    .iter()
+                    .flat_map(|g| g.overlays.iter())
+                    .flat_map(|o| o.data_file.fields.iter())
+                    .any(|id| !remaining_field_ids.contains(id));
+                if drops_our_field {
+                    Err(self.retryable_conflict_err(other_transaction, other_version))
+                } else {
+                    Ok(())
+                }
+            }
             // A concurrent Delete only tombstones rows via a deletion vector,
             // which preserves physical offsets; the overlay value for a deleted
             // offset is simply inert. Conflict only if the whole overlaid
@@ -2861,12 +2919,12 @@ impl<'a> TransactionRebase<'a> {
                         new_entry,
                         current_entry,
                     } => {
-                        *new_indices = vec![new_entry];
-                        *removed_indices = vec![current_entry];
+                        *new_indices = vec![*new_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                     TaggedTrimOutcome::Delete { current_entry } => {
                         new_indices.clear();
-                        *removed_indices = vec![current_entry];
+                        *removed_indices = vec![*current_entry];
                     }
                 }
                 return Ok(self.transaction);
@@ -3293,6 +3351,57 @@ fn overlay_group_coverage(group: &DataOverlayGroup) -> RoaringBitmap {
     union
 }
 
+/// Refuse a concurrent transaction that could hand one of an allocating
+/// clustering submission's key field ids to another column.
+///
+/// A definition keys on field ids the writer resolved in `read_schema`, a
+/// snapshot that still used reusable ids. Until the allocation itself
+/// activates the non-reusable contract, a schema replacement in the window
+/// (an overwrite, a drop, a restore, or a merge that does not keep every read
+/// field under its id with the same name, parent and type) may reassign an id,
+/// and a drop followed by a re-add with the same name and type hides that in
+/// the final shape. So the transaction, not the landing schema, is judged.
+/// Appends, deletes, updates, index builds and additive merges rebase as usual.
+pub(crate) fn refuse_field_identity_change(
+    read_schema: &lance_core::datatypes::Schema,
+    other_transaction: &Transaction,
+    other_version: u64,
+) -> Result<()> {
+    let may_change_identity = match &other_transaction.operation {
+        Operation::Overwrite { .. } | Operation::Project { .. } | Operation::Restore { .. } => true,
+        Operation::Merge { schema, .. } => !keeps_every_field_identity(read_schema, schema),
+        _ => false,
+    };
+    if may_change_identity {
+        return Err(Error::incompatible_transaction_source(
+            format!(
+                "This UpdateConfig allocates clustering definitions keyed on field ids read \
+                 before concurrent transaction {} at version {other_version}, which may have \
+                 given one of those ids to another column; reload the table and rebuild the list.",
+                other_transaction.operation
+            )
+            .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every field of `read` is still the same field (name, parent, type) under
+/// the same id in `landing`. Added fields are fine; a missing, renamed or
+/// retyped one is not.
+fn keeps_every_field_identity(
+    read: &lance_core::datatypes::Schema,
+    landing: &lance_core::datatypes::Schema,
+) -> bool {
+    read.fields_pre_order().all(|field| {
+        landing.field_by_id(field.id).is_some_and(|landed| {
+            landed.name == field.name
+                && landed.parent_id == field.parent_id
+                && landed.data_type() == field.data_type()
+        })
+    })
+}
+
 fn wrong_operation_err(op: &Operation) -> Error {
     Error::internal(format!("function called against a wrong operation: {}", op))
 }
@@ -3450,6 +3559,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let operation = Operation::Rewrite {
             groups: vec![],
@@ -4146,6 +4257,8 @@ mod tests {
             created_at: None, // Test index, not setting timestamp
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
@@ -4732,6 +4845,13 @@ mod tests {
 
         let fragment0 = Fragment::new(0);
         let fragment1 = Fragment::new(1);
+        // Fields 0 and 1; our overlay covers field 0.
+        let two_field_schema =
+            lance_core::datatypes::Schema::try_from(&arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("a", arrow_schema::DataType::Int32, true),
+                arrow_schema::Field::new("b", arrow_schema::DataType::Int32, true),
+            ]))
+            .unwrap();
 
         // Each case is checked against our overlay on fragment 1.
         let cases: Vec<(Operation, ConflictResult)> = vec![
@@ -4796,6 +4916,22 @@ mod tests {
                 Retryable,
             ),
             (Operation::Restore { version: 1 }, NotCompatible),
+            // A projection that keeps our overlaid field 0 is compatible; one that
+            // drops it would leave our overlay covering a missing field.
+            (
+                Operation::Project {
+                    schema: two_field_schema.clone(),
+                    preserves_nullability: true,
+                },
+                Compatible,
+            ),
+            (
+                Operation::Project {
+                    schema: two_field_schema.project_by_ids(&[1], true),
+                    preserves_nullability: true,
+                },
+                Retryable,
+            ),
             // Overwrite/Restore replace the dataset, and UpdateMemWalState does
             // not rebase against data operations — all hard conflicts.
             (
@@ -5383,6 +5519,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let mut rebase = TransactionRebase {
             transaction: Transaction::new(
@@ -5494,6 +5632,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let column_index = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5587,6 +5727,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let index1 = IndexMetadata {
             uuid: uuid::Uuid::new_v4(),
@@ -5662,6 +5804,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -5710,6 +5854,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5775,6 +5921,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let drop_operation = Operation::CreateIndex {
             new_indices: vec![],
@@ -5819,6 +5967,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let replaced = index(Uuid::new_v4());
         let concurrently_removed = index(Uuid::new_v4());
@@ -5872,6 +6022,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5885,6 +6037,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let rewrite = Transaction::new(
             1,
@@ -5955,6 +6109,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let frag_reuse_index = IndexMetadata {
             uuid: Uuid::new_v4(),
@@ -5968,6 +6124,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         // The rewrite's own `old_fragments` are what the SRID inference reads:
@@ -6676,6 +6834,8 @@ mod tests {
                         created_at: None,
                         base_id: None,
                         files: None,
+                        clustering_id: None,
+                        metadata: Default::default(),
                     }],
                     removed_indices: vec![],
                 },
@@ -9232,6 +9392,8 @@ mod tests {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             let ours = Transaction::new(
                 1,

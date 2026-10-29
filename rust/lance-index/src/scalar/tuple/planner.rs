@@ -10,30 +10,39 @@
 //! - `key = v`, `key IN (...)`, `key IS NULL`, and an OR whose terms are all
 //!   `key = v` or `key IN (...)` on one key fix a key to a set of values. A
 //!   bare Boolean key means `key = true`, and `NOT key` means `key = false`,
-//!   alone or as an OR term. [`Planner::optimize_expr`] writes a short
+//!   alone or as an OR term. `Planner::optimize_expr` writes a short
 //!   `key IN (...)` list as such an OR, `key = true` as `key`, `key = false`
 //!   as `NOT key`, and `x = 0.0` on a float key as `x IN (-0.0, 0.0)`. These
 //!   conjuncts bind a leading prefix of keys: key 0, then key 1, and so on, up
 //!   to the first key that no conjunct fixes or whose smallest set would grow
-//!   the prefix past [`MAX_PREFIX_TUPLES`]. When several conjuncts fix one
-//!   key, the one with the smallest set binds it. A set of more than
-//!   [`MAX_PREFIX_TUPLES`] distinct values never binds, even when an earlier
-//!   key's set is empty.
-//! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
-//!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
-//!   binds only when every finite bound it carries is still open, because a
-//!   conjunct is consumed whole or not at all. So in an unoptimized
-//!   `a < 20 AND a BETWEEN 5 AND 10`, the `BETWEEN` stays in the key residual.
-//!   [`Planner::optimize_expr`] splits `BETWEEN` into two bounds, so in
-//!   `a > 0 AND a BETWEEN 1 AND 10`, `a > 0` binds the lower bound, `a <= 10`
-//!   binds the upper bound, and `a >= 1` stays in the key residual.
+//!   the prefix past the seek budget. When several conjuncts fix one key, the
+//!   one with the smallest set binds it. A set of more distinct values than
+//!   the budget never binds, even when an earlier key's set is empty.
+//! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`,
+//!   `key IS NOT NULL`, and an AND or OR of these on one key select a union of
+//!   ranges on that key. Conjuncts on the key after the prefix bind, and the
+//!   query keeps the intersection of their unions, with overlapping and
+//!   touching ranges merged. So `a < 1 OR a > 5` binds two ranges, and
+//!   `(a < 1 OR a > 5) AND a < 9` binds `(a < 1 OR (a > 5 AND a < 9))`. A
+//!   range OR of more terms than the seek budget never binds, even when they
+//!   would merge into fewer ranges, and neither does a conjunct that would
+//!   raise the query's seeks past the budget. `Planner::optimize_expr` writes
+//!   `x >= 0.0` on a float key as `x >= -0.0 OR x < -inf`, which also selects
+//!   the NaNs with the sign bit set, so it binds two ranges.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes any other OR or
-//!   NOT, `!=`, `NOT IN`, expressions over keys, conjuncts on keys after the
-//!   range, and a bound on a side that an earlier conjunct already bounds.
+//!   NOT, `!=`, `NOT IN`, expressions over keys, and conjuncts on keys after the
+//!   range.
 //! - A conjunct that reads any other column goes back to the caller untouched,
 //!   in the row residual. A column qualified by a relation, such as `l.tenant`,
 //!   counts as outside the key, because the keys carry no relation to match it.
+//!
+//! The seek budget bounds the seeks a plan costs an index, which runs one seek
+//! per prefix tuple and range, or one per prefix tuple when no range binds. It
+//! is [`DEFAULT_MAX_TUPLE_SEEKS`] unless the `LANCE_TUPLE_MAX_SEEKS`
+//! environment variable sets another. With the default, `tenant IN (5,000
+//! values) AND (ts < 1 OR ts > 5)` binds the prefix and leaves the OR, which
+//! would cost 10,000 seeks, in the key residual.
 //!
 //! Literals, casts of literals, and `arrow_cast` of literals are coerced to the
 //! key type when the coercion is lossless. In a returned plan, any other literal
@@ -47,27 +56,58 @@
 //! which selects no rows. In a returned plan, a conjunct with a NULL range
 //! bound stays in the key residual. Only `key IS NULL` matches NULL keys.
 //!
-//! [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
+//! `Planner::optimize_expr` is in `lance-datafusion`.
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::num::NonZeroUsize;
 use std::ops::Bound;
+use std::sync::LazyLock;
 
 use arrow_schema::{DataType, FieldRef, Fields};
 use datafusion_common::ScalarValue;
 use datafusion_expr::expr::{Between, BinaryExpr, Cast, InList, ScalarFunction};
 use datafusion_expr::utils::split_binary;
 use datafusion_expr::{Expr, Operator};
-use lance_datafusion::expr::safe_coerce_scalar;
+use lance_datafusion_exec::expr::safe_coerce_scalar;
 
-use super::{KeyRange, KeyValues, TupleQuery};
+use super::{Cut, KeyRange, KeyValues, TupleQuery};
 
-/// The most prefix tuples one planned [`TupleQuery`] may cover.
+/// The default seek budget, the most seeks one planned [`TupleQuery`] may cost.
 ///
 /// The prefix covers the cross product of its keys' sets, and an index runs one
-/// seek per prefix tuple, so this caps the seeks one query costs. A key whose
-/// set would grow the product past the cap ends the prefix. In a returned plan,
-/// its conjunct stays in the key residual.
-pub const MAX_PREFIX_TUPLES: usize = 8192;
+/// seek per prefix tuple and range, or one per prefix tuple when the query has
+/// no ranges. The [module documentation](self) lists the conjuncts the budget
+/// keeps out of the query.
+///
+/// The `LANCE_TUPLE_MAX_SEEKS` environment variable, read once per process,
+/// sets another budget. When it is set to anything but a positive integer that
+/// fits in a `usize`, the planner logs a warning and keeps this default.
+pub const DEFAULT_MAX_TUPLE_SEEKS: usize = 8192;
+
+static MAX_TUPLE_SEEKS: LazyLock<usize> = LazyLock::new(|| {
+    parse_max_tuple_seeks(std::env::var_os("LANCE_TUPLE_MAX_SEEKS").as_deref()).unwrap_or_else(
+        |warning| {
+            log::warn!("{warning}");
+            DEFAULT_MAX_TUPLE_SEEKS
+        },
+    )
+});
+
+fn parse_max_tuple_seeks(value: Option<&OsStr>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MAX_TUPLE_SEEKS);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse::<NonZeroUsize>().ok())
+        .map(NonZeroUsize::get)
+        .ok_or_else(|| {
+            format!(
+                "Failed to parse LANCE_TUPLE_MAX_SEEKS {value:?} as a positive integer, using default {DEFAULT_MAX_TUPLE_SEEKS}"
+            )
+        })
+}
 
 /// A conjunctive filter, split by what a [`TupleQuery`] answers.
 ///
@@ -89,25 +129,25 @@ pub struct TuplePlan<'a> {
 
 enum Constraint {
     Values { key: usize, values: KeyValues },
-    Range { key: usize, range: KeyRange },
+    Ranges { key: usize, ranges: Vec<KeyRange> },
 }
 
 /// Plan `conjuncts`, the terms of an AND, as one query over `keys`, the index's
 /// key columns in key order.
 ///
-/// Pass conjuncts that went through [`Planner::optimize_expr`], as
-/// [`create_filter_plan`] does before it plans per-column indices. That pass
-/// coerces literal types, so `at >= '2024-01-01'` on a timestamp key arrives
-/// here with a timestamp literal. This function never parses a string into a
-/// timestamp, so without that pass the raw string leaves its conjunct unplanned.
+/// Pass conjuncts that went through `Planner::optimize_expr` in
+/// `lance-datafusion`. [`create_filter_plan`] expects the same pass before it
+/// plans per-column indices. That pass coerces literal types, so
+/// `at >= '2024-01-01'` on a timestamp key arrives here with a timestamp
+/// literal. This function never parses a string into a timestamp, so without
+/// that pass the raw string leaves its conjunct unplanned.
 ///
 /// Returns `None` when no conjunct binds the first key, and the caller keeps
-/// every conjunct. When the smallest set on the first key holds more than
-/// [`MAX_PREFIX_TUPLES`] values, no set binds it, so the result is `None`
-/// unless a range binds that key.
+/// every conjunct. When the smallest set on the first key holds more values
+/// than the seek budget (see [`DEFAULT_MAX_TUPLE_SEEKS`]), no set binds it, so
+/// the result is `None` unless a range binds that key.
 ///
-/// [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
-/// [`create_filter_plan`]: crate::scalar::expression::PlannerIndexExt::create_filter_plan
+/// [`create_filter_plan`]: crate::scalar::expression::create_filter_plan
 ///
 /// ```
 /// use arrow_schema::{DataType, Field, Fields};
@@ -132,6 +172,10 @@ enum Constraint {
 /// assert_eq!(plan.row_residual, vec![&conjuncts[3]]);
 /// ```
 pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<TuplePlan<'a>> {
+    plan(conjuncts, keys, *MAX_TUPLE_SEEKS)
+}
+
+fn plan<'a>(conjuncts: &'a [Expr], keys: &Fields, max_seeks: usize) -> Option<TuplePlan<'a>> {
     let mut row_residual = Vec::new();
     let mut key_conjuncts = Vec::new();
     for conjunct in conjuncts {
@@ -140,7 +184,7 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
             .iter()
             .all(|column| column.relation.is_none() && keys.find(&column.name).is_some());
         if reads_only_keys {
-            key_conjuncts.push((conjunct, constraint(conjunct, keys)));
+            key_conjuncts.push((conjunct, constraint(conjunct, keys, max_seeks)));
         } else {
             row_residual.push(conjunct);
         }
@@ -165,7 +209,7 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         };
         let Some(product) = tuples
             .checked_mul(size)
-            .filter(|product| *product <= MAX_PREFIX_TUPLES)
+            .filter(|product| *product <= max_seeks)
         else {
             break;
         };
@@ -177,11 +221,11 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         prefix.push(values);
     }
 
-    let mut range: Option<KeyRange> = None;
+    let mut ranges: Option<Vec<KeyRange>> = None;
     for (position, (_, constraint)) in key_conjuncts.iter().enumerate() {
-        let Some(Constraint::Range {
+        let Some(Constraint::Ranges {
             key,
-            range: (lower, upper),
+            ranges: conjunct_ranges,
         }) = constraint
         else {
             continue;
@@ -189,21 +233,22 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         if *key != prefix.len() {
             continue;
         }
-        let bound = range.get_or_insert((Bound::Unbounded, Bound::Unbounded));
-        let lower_fits = matches!(lower, Bound::Unbounded) || matches!(bound.0, Bound::Unbounded);
-        let upper_fits = matches!(upper, Bound::Unbounded) || matches!(bound.1, Bound::Unbounded);
-        if lower_fits && upper_fits {
-            if matches!(bound.0, Bound::Unbounded) {
-                bound.0 = lower.clone();
-            }
-            if matches!(bound.1, Bound::Unbounded) {
-                bound.1 = upper.clone();
-            }
-            is_consumed[position] = true;
-        }
+        let bound = match &ranges {
+            None => Some(conjunct_ranges.clone()),
+            Some(bound) => intersect(bound, conjunct_ranges),
+        };
+        let Some(bound) = bound.filter(|bound| {
+            tuples
+                .checked_mul(bound.len())
+                .is_some_and(|seeks| seeks <= max_seeks)
+        }) else {
+            continue;
+        };
+        ranges = Some(bound);
+        is_consumed[position] = true;
     }
 
-    if prefix.is_empty() && range.is_none() {
+    if prefix.is_empty() && ranges.is_none() {
         return None;
     }
     let mut consumed = Vec::new();
@@ -219,7 +264,7 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         query: TupleQuery {
             keys: keys.clone(),
             prefix,
-            range,
+            ranges,
         },
         consumed,
         key_residual,
@@ -234,8 +279,31 @@ fn set_size(values: &KeyValues) -> usize {
     }
 }
 
-fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
+fn constraint(conjunct: &Expr, keys: &Fields, max_seeks: usize) -> Option<Constraint> {
+    let ranges = || {
+        key_ranges(conjunct, keys, max_seeks)
+            .map(|(key, ranges)| Constraint::Ranges { key, ranges })
+    };
     match conjunct {
+        Expr::IsNull(expr) => Some(Constraint::Values {
+            key: key_column(expr, keys)?.0,
+            values: KeyValues::Null,
+        }),
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Eq, ..
+        })
+        | Expr::InList(_)
+        | Expr::Column(_)
+        | Expr::Not(_) => key_set(conjunct, keys, max_seeks),
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or, ..
+        }) => key_set(conjunct, keys, max_seeks).or_else(ranges),
+        _ => ranges(),
+    }
+}
+
+fn key_ranges(expr: &Expr, keys: &Fields, max_seeks: usize) -> Option<(usize, Vec<KeyRange>)> {
+    let (key, range) = match expr {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: op @ (Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq),
@@ -253,7 +321,7 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
                 Operator::GtEq => (Bound::Included(value), Bound::Unbounded),
                 _ => return None,
             };
-            Some(Constraint::Range { key, range })
+            (key, range)
         }
         Expr::Between(Between {
             expr,
@@ -264,26 +332,109 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
             let (key, field) = key_column(expr, keys)?;
             let low = bound(low, field.data_type())?;
             let high = bound(high, field.data_type())?;
-            let range = (Bound::Included(low), Bound::Included(high));
-            Some(Constraint::Range { key, range })
+            (key, (Bound::Included(low), Bound::Included(high)))
         }
-        Expr::IsNull(expr) => Some(Constraint::Values {
-            key: key_column(expr, keys)?.0,
-            values: KeyValues::Null,
-        }),
-        Expr::IsNotNull(expr) => Some(Constraint::Range {
-            key: key_column(expr, keys)?.0,
-            range: (Bound::Unbounded, Bound::Unbounded),
-        }),
+        Expr::IsNotNull(expr) => (
+            key_column(expr, keys)?.0,
+            (Bound::Unbounded, Bound::Unbounded),
+        ),
         Expr::BinaryExpr(BinaryExpr {
-            op: Operator::Eq | Operator::Or,
+            op: op @ (Operator::And | Operator::Or),
             ..
-        })
-        | Expr::InList(_)
-        | Expr::Column(_)
-        | Expr::Not(_) => key_set(conjunct, keys),
-        _ => None,
+        }) => {
+            let is_or = *op == Operator::Or;
+            let terms = split_binary(expr, *op);
+            if is_or && terms.len() > max_seeks {
+                return None;
+            }
+            let mut key = None;
+            let mut merged = Vec::with_capacity(terms.len());
+            for term in terms {
+                let (term_key, term_ranges) = key_ranges(term, keys, max_seeks)?;
+                if *key.get_or_insert(term_key) != term_key {
+                    return None;
+                }
+                merged.push(term_ranges);
+            }
+            while merged.len() > 1 {
+                let mut pairs = std::mem::take(&mut merged).into_iter();
+                while let Some(a) = pairs.next() {
+                    merged.push(match pairs.next() {
+                        Some(b) if is_or => union(&a, &b)?,
+                        Some(b) => intersect(&a, &b)?,
+                        None => a,
+                    });
+                }
+            }
+            return Some((key?, merged.pop()?));
+        }
+        _ => return None,
+    };
+    Some((key, union_of(range)?))
+}
+
+fn union_of(range: KeyRange) -> Option<Vec<KeyRange>> {
+    let is_empty = Cut::lower(&range.0)
+        .partial_cmp(&Cut::upper(&range.1))?
+        .is_ge();
+    Some(if is_empty { Vec::new() } else { vec![range] })
+}
+
+fn intersect(a: &[KeyRange], b: &[KeyRange]) -> Option<Vec<KeyRange>> {
+    let mut ranges = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let a_starts_last = Cut::lower(&a[i].0)
+            .partial_cmp(&Cut::lower(&b[j].0))?
+            .is_ge();
+        let a_ends_first = Cut::upper(&a[i].1)
+            .partial_cmp(&Cut::upper(&b[j].1))?
+            .is_le();
+        let lower = if a_starts_last { &a[i].0 } else { &b[j].0 };
+        let upper = if a_ends_first { &a[i].1 } else { &b[j].1 };
+        ranges.extend(union_of((lower.clone(), upper.clone()))?);
+        if a_ends_first {
+            i += 1;
+        } else {
+            j += 1;
+        }
     }
+    Some(ranges)
+}
+
+fn union(a: &[KeyRange], b: &[KeyRange]) -> Option<Vec<KeyRange>> {
+    let mut ranges: Vec<KeyRange> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let next = if j == b.len()
+            || (i < a.len()
+                && Cut::lower(&a[i].0)
+                    .partial_cmp(&Cut::lower(&b[j].0))?
+                    .is_le())
+        {
+            i += 1;
+            &a[i - 1]
+        } else {
+            j += 1;
+            &b[j - 1]
+        };
+        match ranges.last_mut() {
+            Some(last)
+                if Cut::lower(&next.0)
+                    .partial_cmp(&Cut::upper(&last.1))?
+                    .is_le() =>
+            {
+                if Cut::upper(&next.1)
+                    .partial_cmp(&Cut::upper(&last.1))?
+                    .is_gt()
+                {
+                    last.1 = next.1.clone();
+                }
+            }
+            _ => ranges.push(next.clone()),
+        }
+    }
+    Some(ranges)
 }
 
 fn key_column<'k>(expr: &Expr, keys: &'k Fields) -> Option<(usize, &'k FieldRef)> {
@@ -293,7 +444,7 @@ fn key_column<'k>(expr: &Expr, keys: &'k Fields) -> Option<(usize, &'k FieldRef)
     }
 }
 
-fn key_set(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
+fn key_set(conjunct: &Expr, keys: &Fields, max_seeks: usize) -> Option<Constraint> {
     let boolean_key = |expr: &Expr| {
         key_column(expr, keys)
             .filter(|(_, field)| field.data_type() == &DataType::Boolean)
@@ -341,13 +492,14 @@ fn key_set(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
         }
     }
     let key = key?;
-    let values = key_values(values, keys[key].data_type())?;
+    let values = key_values(values, keys[key].data_type(), max_seeks)?;
     Some(Constraint::Values { key, values })
 }
 
 fn key_values(
     items: impl IntoIterator<Item = ScalarValue>,
     data_type: &DataType,
+    max_seeks: usize,
 ) -> Option<KeyValues> {
     let mut values = Vec::new();
     let mut seen = HashSet::new();
@@ -357,7 +509,7 @@ fn key_values(
         }
         let value = coerce_lossless(value, data_type)?;
         if seen.insert(value.clone()) {
-            if values.len() == MAX_PREFIX_TUPLES {
+            if values.len() == max_seeks {
                 return None;
             }
             values.push(value);
@@ -460,6 +612,7 @@ mod tests {
         let flag = [None, Some(false), Some(true)];
         let x = [
             None,
+            Some(-f64::NAN),
             Some(f64::NEG_INFINITY),
             Some(-1.5),
             Some(-0.0),
@@ -470,9 +623,15 @@ mod tests {
         ];
         let (tenants, ts, at, status, flag, x): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
             iproduct!(tenants, ts, at, status, flag, x).multiunzip();
+        // Rust leaves the sign of a NaN cast to f32 unspecified.
         let y = x
             .iter()
-            .map(|value| value.map(|value| value as f32))
+            .map(|value| {
+                value.map(|value| {
+                    let sign = if value.is_sign_negative() { -1.0 } else { 1.0 };
+                    (value as f32).copysign(sign)
+                })
+            })
             .collect::<Vec<_>>();
         let rows = RecordBatch::try_new(
             schema.clone(),
@@ -544,8 +703,8 @@ mod tests {
         })
     }
 
-    fn check_plan(conjuncts: &[Expr], keys: &Fields, expected: Option<Expected>) {
-        let plan = plan_tuple_predicate(conjuncts, keys);
+    fn check_plan(conjuncts: &[Expr], keys: &Fields, max_seeks: usize, expected: Option<Expected>) {
+        let plan = plan(conjuncts, keys, max_seeks);
         let Some(expected) = expected else {
             assert_eq!(plan, None);
             return;
@@ -556,7 +715,7 @@ mod tests {
         let revalidated = TupleQuery::try_new(
             query.keys().clone(),
             query.prefix().to_vec(),
-            query.range().cloned(),
+            query.ranges().map(<[_]>::to_vec),
         )
         .unwrap();
         assert_eq!(&revalidated, query);
@@ -597,6 +756,22 @@ mod tests {
 
     fn in_list(key: &str, len: usize) -> String {
         format!("{key} IN ({})", (0..len).join(", "))
+    }
+
+    fn ranges(key: &str, len: usize, start: usize) -> String {
+        let ranges = (0..len).map(|range| {
+            let lower = start + 2 * range;
+            format!("({key} > {lower} AND {key} < {})", lower + 2)
+        });
+        format!("({})", ranges.format(" OR "))
+    }
+
+    fn split_ranges(key: &str, len: usize) -> String {
+        let terms = (0..len).map(|term| {
+            let (a, b, c, d) = (4 * term, 4 * term + 1, 4 * term + 2, 4 * term + 3);
+            format!("({key} BETWEEN {a} AND {d} AND ({key} < {b} OR {key} > {c}))")
+        });
+        format!("({})", terms.format(" OR "))
     }
 
     // A SQL filter reaches the planner after two optimizer passes, one when the
@@ -664,23 +839,76 @@ mod tests {
     )]
     #[case::empty_range_lower_above_upper(
         "tenant = 1 AND ts > 20 AND ts < 10",
-        planned("TupleQuery[tenant = 1, ts > 20 AND ts < 10]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::empty_range_equal_bounds_both_excluded(
         "tenant = 1 AND ts > 5 AND ts < 5",
-        planned("TupleQuery[tenant = 1, ts > 5 AND ts < 5]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::empty_range_equal_bounds_one_excluded(
         "tenant = 1 AND ts >= 5 AND ts < 5",
-        planned("TupleQuery[tenant = 1, ts >= 5 AND ts < 5]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::second_lower_bound(
         "tenant = 1 AND ts > 5 AND ts >= 10",
-        planned("TupleQuery[tenant = 1, ts > 5]", &[2], &[])
+        planned("TupleQuery[tenant = 1, ts >= 10]", &[], &[])
     )]
     #[case::between_after_lower_bound(
         "tenant > 10 AND tenant BETWEEN 0 AND 100",
-        planned("TupleQuery[tenant > 10 AND tenant <= 100]", &[1], &[])
+        planned("TupleQuery[tenant > 10 AND tenant <= 100]", &[], &[])
+    )]
+    #[case::or_of_ranges(
+        "tenant < 1 OR tenant > 5",
+        planned("TupleQuery[(tenant < 1 OR tenant > 5)]", &[], &[])
+    )]
+    #[case::or_of_ranges_after_equality(
+        "tenant = 1 AND (ts < 1 OR ts > 5)",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR ts > 5)]", &[], &[])
+    )]
+    #[case::or_of_ranges_apart_at_excluded_value(
+        "tenant = 1 AND (ts < 10 OR ts > 10)",
+        planned("TupleQuery[tenant = 1, (ts < 10 OR ts > 10)]", &[], &[])
+    )]
+    #[case::or_of_overlapping_ranges(
+        "tenant = 1 AND (ts < 10 OR ts BETWEEN 5 AND 20)",
+        planned("TupleQuery[tenant = 1, ts <= 20]", &[], &[])
+    )]
+    #[case::or_of_ranges_touching_at_excluded_value(
+        "tenant = 1 AND (ts < 10 OR ts >= 10)",
+        planned("TupleQuery[tenant = 1, ts IS NOT NULL]", &[], &[])
+    )]
+    #[case::or_of_ranges_touching_at_included_value(
+        "tenant = 1 AND (ts <= 10 OR ts > 10 AND ts < 20)",
+        planned("TupleQuery[tenant = 1, ts < 20]", &[], &[])
+    )]
+    #[case::or_intersected_with_range(
+        "tenant = 1 AND (ts < 1 OR ts > 5) AND ts < 20",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR (ts > 5 AND ts < 20))]", &[], &[])
+    )]
+    #[case::or_intersected_with_or(
+        "tenant = 1 AND (ts < 5 OR ts > 10) AND (ts < 1 OR ts > 19)",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR ts > 19)]", &[], &[])
+    )]
+    #[case::or_intersected_to_empty(
+        "tenant = 1 AND (ts < 1 OR ts > 20) AND ts BETWEEN 5 AND 10",
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
+    )]
+    #[case::or_of_empty_ranges(
+        "tenant = 1 AND (ts > 20 AND ts < 10 OR ts > 5 AND ts < 5)",
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
+    )]
+    #[case::or_of_ranges_across_keys("tenant < 1 OR ts > 5", None)]
+    #[case::or_of_range_and_is_null(
+        "tenant = 1 AND (ts < 10 OR ts IS NULL)",
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::or_of_range_and_expression(
+        "tenant = 1 AND (ts < 10 OR ts % 7 = 0)",
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::or_of_ranges_on_bound_prefix(
+        "tenant = 1 AND (tenant < 0 OR tenant > 5) AND ts > 3",
+        planned("TupleQuery[tenant = 1, ts > 3]", &[1], &[])
     )]
     #[case::is_null_in_prefix(
         "tenant IS NULL AND ts = 10",
@@ -773,17 +1001,38 @@ mod tests {
     #[case::not_equality("NOT tenant = 1", None)]
     #[case::not_equal("tenant != 1", None)]
     #[case::not_in("tenant NOT IN (1, 2)", None)]
-    #[case::not_between("tenant NOT BETWEEN 1 AND 2", None)]
+    #[case::not_between(
+        "tenant NOT BETWEEN 1 AND 2",
+        planned("TupleQuery[(tenant < 1 OR tenant > 2)]", &[], &[])
+    )]
     #[case::equality_on_second_key_only("ts = 10", None)]
     #[case::equality_on_later_keys_only("ts = 10 AND at = TIMESTAMP '2024-01-01 00:00:00'", None)]
     #[case::arrow_cast_of_key("tenant = arrow_cast(ts, 'Int32')", None)]
     #[case::key_compared_to_key("tenant = ts", None)]
     #[case::non_key_only("status = 'a'", None)]
-    #[case::cap_8191_tuples(
+    fn plans_conjunctive_predicate(
+        #[case] predicate: String,
+        #[case] expected: Option<Expected>,
+        #[values(1, 2)] passes: usize,
+    ) {
+        check_plan(
+            &conjuncts(&predicate, passes),
+            &FIXTURE.keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
+            expected,
+        );
+    }
+
+    #[rstest]
+    #[case::tuples_below_budget(
+        "ts",
+        DEFAULT_MAX_TUPLE_SEEKS,
         in_list("tenant", 8191),
         planned(format!("TupleQuery[{}]", in_list("tenant", 8191)), &[], &[])
     )]
-    #[case::cap_8192_tuples(
+    #[case::tuples_at_budget(
+        "ts",
+        DEFAULT_MAX_TUPLE_SEEKS,
         format!("{} AND {}", in_list("tenant", 64), in_list("ts", 128)),
         planned(
             format!("TupleQuery[{}, {}]", in_list("tenant", 64), in_list("ts", 128)),
@@ -791,21 +1040,121 @@ mod tests {
             &[]
         )
     )]
-    #[case::cap_8193_tuples(
+    #[case::tuples_past_budget(
+        "ts",
+        DEFAULT_MAX_TUPLE_SEEKS,
         format!("{} AND {}", in_list("tenant", 3), in_list("ts", 2731)),
         planned(format!("TupleQuery[{}]", in_list("tenant", 3)), &[1], &[])
     )]
-    #[case::cap_8193_values_on_one_key(in_list("tenant", 8193), None)]
-    #[case::cap_8193_values_beside_range(
+    #[case::values_past_budget_on_one_key(
+        "ts",
+        DEFAULT_MAX_TUPLE_SEEKS,
+        in_list("tenant", 8193),
+        None
+    )]
+    #[case::values_past_budget_beside_range(
+        "ts",
+        DEFAULT_MAX_TUPLE_SEEKS,
         format!("{} AND tenant > 5", in_list("tenant", 8193)),
         planned("TupleQuery[tenant > 5]", &[0], &[])
     )]
-    fn plans_conjunctive_predicate(
+    #[case::tuples_times_float_ranges_at_budget(
+        "x",
+        DEFAULT_MAX_TUPLE_SEEKS,
+        format!("{} AND (x >= -0.0 OR x < CAST('-inf' AS DOUBLE))", in_list("tenant", 4096)),
+        planned(
+            format!("TupleQuery[{}, (x < -inf OR x >= -0)]", in_list("tenant", 4096)),
+            &[],
+            &[]
+        )
+    )]
+    #[case::tuples_times_float_ranges_past_budget(
+        "x",
+        DEFAULT_MAX_TUPLE_SEEKS,
+        format!("{} AND (x >= -0.0 OR x < CAST('-inf' AS DOUBLE))", in_list("tenant", 4097)),
+        planned(format!("TupleQuery[{}]", in_list("tenant", 4097)), &[1], &[])
+    )]
+    #[case::tuples_times_ranges_at_budget(
+        "ts",
+        4,
+        "tenant IN (1, 2) AND (ts < 1 OR ts > 5)".to_string(),
+        planned("TupleQuery[tenant IN (1, 2), (ts < 1 OR ts > 5)]", &[], &[])
+    )]
+    #[case::tuples_times_ranges_past_budget(
+        "ts",
+        3,
+        "tenant IN (1, 2) AND (ts < 1 OR ts > 5)".to_string(),
+        planned("TupleQuery[tenant IN (1, 2)]", &[1], &[])
+    )]
+    #[case::ranges_at_budget(
+        "ts",
+        64,
+        ranges("tenant", 64, 0),
+        planned(format!("TupleQuery[{}]", ranges("tenant", 64, 0)), &[], &[])
+    )]
+    #[case::ranges_from_fewer_terms_at_budget(
+        "ts",
+        66,
+        split_ranges("tenant", 33),
+        planned(
+            format!(
+                "TupleQuery[({})]",
+                (0..33)
+                    .map(|v| (4 * v, 4 * v + 1, 4 * v + 2, 4 * v + 3))
+                    .map(|(a, b, c, d)| format!(
+                        "(tenant >= {a} AND tenant < {b}) OR (tenant > {c} AND tenant <= {d})"
+                    ))
+                    .join(" OR ")
+            ),
+            &[],
+            &[]
+        )
+    )]
+    #[case::ranges_from_fewer_terms_past_budget("ts", 65, split_ranges("tenant", 33), None)]
+    #[case::ranges_past_budget_after_intersection(
+        "ts",
+        64,
+        format!("tenant = 1 AND {} AND {}", ranges("ts", 64, 0), ranges("ts", 64, 1)),
+        planned(format!("TupleQuery[tenant = 1, {}]", ranges("ts", 64, 0)), &[2], &[])
+    )]
+    #[case::or_terms_at_budget_merged_into_one_range(
+        "ts",
+        64,
+        format!("tenant = 1 AND ({})", (1..=64).map(|v| format!("ts < {v}")).join(" OR ")),
+        planned("TupleQuery[tenant = 1, ts < 64]", &[], &[])
+    )]
+    #[case::or_terms_past_budget_merged_into_one_range(
+        "ts",
+        64,
+        format!("tenant = 1 AND ({})", (1..=65).map(|v| format!("ts < {v}")).join(" OR ")),
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::budget_of_one_binds_one_range(
+        "ts",
+        1,
+        "tenant = 1 AND ts > 5".to_string(),
+        planned("TupleQuery[tenant = 1, ts > 5]", &[], &[])
+    )]
+    #[case::budget_of_one_leaves_two_ranges(
+        "ts",
+        1,
+        "tenant = 1 AND (ts < 1 OR ts > 5)".to_string(),
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::budget_of_one_leaves_two_values("ts", 1, "tenant IN (1, 2)".to_string(), None)]
+    fn plans_within_seek_budget(
+        #[case] second_key: &str,
+        #[case] max_seeks: usize,
         #[case] predicate: String,
         #[case] expected: Option<Expected>,
         #[values(1, 2)] passes: usize,
     ) {
-        check_plan(&conjuncts(&predicate, passes), &FIXTURE.keys, expected);
+        let schema = FIXTURE.rows.schema();
+        let keys = Fields::from(vec![
+            schema.field_with_name("tenant").unwrap().clone(),
+            schema.field_with_name(second_key).unwrap().clone(),
+        ]);
+        check_plan(&conjuncts(&predicate, passes), &keys, max_seeks, expected);
     }
 
     #[rstest]
@@ -830,6 +1179,7 @@ mod tests {
         check_plan(
             &conjuncts(predicate, passes),
             &FIXTURE.boolean_keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
             expected,
         );
     }
@@ -837,12 +1187,20 @@ mod tests {
     #[rstest]
     #[case::equals_zero("x", "x = 0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
     #[case::equals_negative_zero("x", "x = -0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
-    #[case::at_least_zero("x", "x >= 0.0", planned("TupleQuery[x >= -0]", &[], &[]))]
-    #[case::below_zero("x", "x < 0.0", planned("TupleQuery[x < -0]", &[], &[]))]
+    #[case::at_least_zero(
+        "x",
+        "x >= 0.0",
+        planned("TupleQuery[(x < -inf OR x >= -0)]", &[], &[])
+    )]
+    #[case::below_zero(
+        "x",
+        "x < 0.0",
+        planned("TupleQuery[x >= -inf AND x < -0]", &[], &[])
+    )]
     #[case::above_negative_infinity(
         "x",
         "x > CAST('-inf' AS DOUBLE)",
-        planned("TupleQuery[x > -inf]", &[], &[])
+        planned("TupleQuery[(x < -inf OR x > -inf)]", &[], &[])
     )]
     #[case::in_zero_and_one(
         "x",
@@ -854,11 +1212,26 @@ mod tests {
         "x = 0.0 AND tenant = 1",
         planned("TupleQuery[x IN (-0, 0), tenant = 1]", &[], &[])
     )]
+    #[case::at_least_zero_or_negative_nan(
+        "x",
+        "x >= -0.0 OR x < CAST('-inf' AS DOUBLE)",
+        planned("TupleQuery[(x < -inf OR x >= -0)]", &[], &[])
+    )]
+    #[case::above_negative_infinity_or_negative_nan(
+        "x",
+        "x > CAST('-inf' AS DOUBLE) OR x < CAST('-inf' AS DOUBLE)",
+        planned("TupleQuery[(x < -inf OR x > -inf)]", &[], &[])
+    )]
     // DataFusion's SQL parser types a bare `0.0` as DOUBLE and casts `y` to match.
     #[case::float32_equals_zero(
         "y",
         "y = CAST(0.0 AS REAL)",
         planned("TupleQuery[y IN (-0, 0)]", &[], &[])
+    )]
+    #[case::float32_at_least_zero_or_negative_nan(
+        "y",
+        "y >= CAST(-0.0 AS REAL) OR y < CAST('-inf' AS REAL)",
+        planned("TupleQuery[(y < -inf OR y >= -0)]", &[], &[])
     )]
     fn plans_predicate_on_float_key(
         #[case] float_key: &str,
@@ -871,7 +1244,12 @@ mod tests {
             schema.field_with_name(float_key).unwrap().clone(),
             schema.field_with_name("tenant").unwrap().clone(),
         ]);
-        check_plan(&conjuncts(predicate, passes), &keys, expected);
+        check_plan(
+            &conjuncts(predicate, passes),
+            &keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
+            expected,
+        );
     }
 
     #[rstest]
@@ -890,7 +1268,11 @@ mod tests {
     )]
     #[case::between_after_upper_bound(
         "tenant = 1 AND ts < 20 AND ts BETWEEN 5 AND 10",
-        planned("TupleQuery[tenant = 1, ts < 20]", &[2], &[])
+        planned("TupleQuery[tenant = 1, ts >= 5 AND ts <= 10]", &[], &[])
+    )]
+    #[case::or_of_between_and_range(
+        "tenant = 1 AND (ts BETWEEN 1 AND 3 OR ts > 10)",
+        planned("TupleQuery[tenant = 1, ((ts >= 1 AND ts <= 3) OR ts > 10)]", &[], &[])
     )]
     #[case::equals_null("tenant = NULL", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::null_range_bound(
@@ -928,16 +1310,21 @@ mod tests {
         planned("TupleQuery[tenant IN (1, 2, 3, 4, 5)]", &[], &[])
     )]
     #[case::or_with_not_in_term("tenant NOT IN (1, 2, 3, 4) OR tenant = 5", None)]
-    #[case::cap_8192_values_after_empty_set(
+    #[case::values_at_budget_after_empty_set(
         format!("tenant IN (NULL) AND {}", in_list("ts", 8192)),
         planned(format!("TupleQuery[FALSE, {}]", in_list("ts", 8192)), &[], &[])
     )]
-    #[case::cap_8193_values_after_empty_set(
+    #[case::values_past_budget_after_empty_set(
         format!("tenant IN (NULL) AND {}", in_list("ts", 8193)),
         planned("TupleQuery[FALSE]", &[1], &[])
     )]
     fn plans_unoptimized_predicate(#[case] predicate: String, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts(&predicate, 0), &FIXTURE.keys, expected);
+        check_plan(
+            &conjuncts(&predicate, 0),
+            &FIXTURE.keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
+            expected,
+        );
     }
 
     // Parsing and optimizing 100,000 literals exceeds the test time budget, so
@@ -963,18 +1350,61 @@ mod tests {
         planned("TupleQuery[FALSE]", &[1], &[])
     )]
     fn plans_100000_item_in_list(#[case] conjuncts: Vec<Expr>, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts, &FIXTURE.keys, expected);
+        check_plan(&conjuncts, &FIXTURE.keys, DEFAULT_MAX_TUPLE_SEEKS, expected);
+    }
+
+    #[rstest]
+    #[case::unset(None, DEFAULT_MAX_TUPLE_SEEKS)]
+    #[case::one(Some("1"), 1)]
+    #[case::valid(Some("100"), 100)]
+    fn reads_max_tuple_seeks(#[case] value: Option<&str>, #[case] expected: usize) {
+        assert_eq!(parse_max_tuple_seeks(value.map(OsStr::new)), Ok(expected));
+    }
+
+    #[rstest]
+    #[case::zero("0")]
+    #[case::negative("-5")]
+    #[case::non_numeric("many")]
+    #[case::empty("")]
+    fn warns_on_max_tuple_seeks_that_is_not_positive(#[case] value: &str) {
+        let warning = parse_max_tuple_seeks(Some(OsStr::new(value))).unwrap_err();
+        for part in [
+            "LANCE_TUPLE_MAX_SEEKS".to_string(),
+            format!("{value:?}"),
+            DEFAULT_MAX_TUPLE_SEEKS.to_string(),
+        ] {
+            assert!(warning.contains(&part), "{warning}");
+        }
     }
 
     #[test]
     fn qualified_column_never_binds_a_key() {
         let other_tenant = || Expr::Column(Column::new(Some("l"), "tenant"));
-        check_plan(&[other_tenant().eq(lit(1))], &FIXTURE.keys, None);
+        check_plan(
+            &[other_tenant().eq(lit(1))],
+            &FIXTURE.keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
+            None,
+        );
 
         let conjuncts = [col("tenant").eq(lit(1)), other_tenant().eq(lit(2))];
         let plan = plan_tuple_predicate(&conjuncts, &FIXTURE.keys).expect("tenant binds key 0");
         assert_eq!(plan.consumed, vec![&conjuncts[0]]);
         assert_eq!(plan.row_residual, vec![&conjuncts[1]]);
+    }
+
+    #[test]
+    fn or_over_two_keys_of_one_type_never_binds() {
+        let keys = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        check_plan(
+            &[col("a").lt(lit(1)).or(col("b").gt(lit(5)))],
+            &keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
+            None,
+        );
     }
 
     #[test]
@@ -989,6 +1419,7 @@ mod tests {
         check_plan(
             &conjuncts,
             &FIXTURE.keys,
+            DEFAULT_MAX_TUPLE_SEEKS,
             planned("TupleQuery[tenant = 1, ts = 10]", &[2], &[]),
         );
     }

@@ -42,6 +42,29 @@ These options apply to all object stores.
 | `client_max_retries`         | Number of times for the object store client to retry the request. Default, `3`.                                                                                                                                                                                                                         |
 | `client_retry_timeout`       | Timeout for the object store client to retry the request in seconds. Default, `180`.                                                                                                                                                                                                                    |
 
+### Local filesystem durability
+
+Set `local_fsync` to `"true"` for local datasets when writes must be durable
+before they return:
+
+```python
+import lance
+import pyarrow as pa
+
+lance.write_dataset(
+    pa.table({"id": [1]}),
+    "/path/to/data.lance",
+    storage_options={"local_fsync": "true"},
+)
+```
+
+The default is `"false"`. When enabled, Lance syncs local data, transaction,
+and manifest files before reporting successful writes, including copied files
+during deep clones. Local copies use the destination's setting. On Unix it also
+syncs their directory entries, including newly created directories. This increases
+write latency. Pass the option again when reopening a dataset for later writes;
+it is a store setting, not a dataset property. Only `"true"` and `"false"` are accepted.
+
 ### Bulk copy strategy
 
 Lance streams bulk index-file movement and dataset deep-clone files through
@@ -184,6 +207,36 @@ ds = lance.dataset(
 ```
 
 This can also be done with the `AWS_ENDPOINT` and `AWS_DEFAULT_REGION` environment variables.
+
+!!! warning
+
+    Safe concurrent writes through `s3://` require the store to atomically enforce
+    create-only `PutObject` requests with `If-None-Match: *`. Some S3-compatible
+    stores, including Garage, accept this header but ignore the condition and
+    overwrite existing objects. Concurrent writers can then both report success
+    while silently losing acknowledged data.
+
+    Lance does not check whether the store enforces this condition. Before using
+    concurrent writers, verify that your provider supports atomic conditional
+    writes, or configure a [custom distributed commit lock](#custom-commit-locks)
+    shared by every writer. Reads do not require a commit lock.
+
+#### Custom commit locks
+
+In Python, pass `commit_lock` to `lance.write_dataset` when creating or appending
+to a dataset, and to `lance.dataset` when opening a dataset for subsequent writes.
+The callback accepts the manifest version to commit and returns a context manager
+that acquires a distributed lock on entry and releases it on exit. Hold the lock
+for the entire context and release it even if the commit raises an exception.
+
+Every writer to the same dataset must use the same lock service and lock key for
+that dataset (optionally including the manifest version). The lock must coordinate
+writers across all processes and machines; a process-local lock is insufficient.
+
+Rust applications can provide a
+[`CommitLock`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitLock.html)
+implementation or a custom
+[`CommitHandler`](https://docs.rs/lance-table/latest/lance_table/io/commit/trait.CommitHandler.html).
 
 ### S3 Express (Directory Bucket)
 

@@ -20,20 +20,24 @@
 //!     Field::new("ts", DataType::Int64, true),
 //! ]);
 //! let tenants = vec![ScalarValue::Int32(Some(1)), ScalarValue::Int32(Some(2))];
-//! let ts = (
-//!     Bound::Included(ScalarValue::Int64(Some(10))),
-//!     Bound::Excluded(ScalarValue::Int64(Some(20))),
-//! );
+//! let ts = vec![
+//!     (
+//!         Bound::Included(ScalarValue::Int64(Some(10))),
+//!         Bound::Excluded(ScalarValue::Int64(Some(20))),
+//!     ),
+//!     (Bound::Excluded(ScalarValue::Int64(Some(90))), Bound::Unbounded),
+//! ];
 //! let query = TupleQuery::try_new(keys, vec![KeyValues::In(tenants)], Some(ts))?;
 //! assert_eq!(
 //!     query.to_string(),
-//!     "TupleQuery[tenant IN (1, 2), ts >= 10 AND ts < 20]"
+//!     "TupleQuery[tenant IN (1, 2), ((ts >= 10 AND ts < 20) OR ts > 90)]"
 //! );
 //! # Ok(())
 //! # }
 //! ```
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Bound;
@@ -59,27 +63,35 @@ pub enum KeyValues {
 
 /// Lower and upper bounds on one key. A NULL key is never within them.
 ///
-/// A range can be empty, with the lower bound above the upper one, or with
-/// equal bounds where either one is excluded. A consumer must read such a range
-/// as selecting no key. `BTreeMap::range`, for example, panics on
-/// `(Excluded(5), Excluded(5))` and on a start above the end.
+/// Bounds compare in [`ScalarValue`]'s order, which orders floats by IEEE 754
+/// total order, as [`f64::total_cmp`] and the B-tree index do. A NaN with its
+/// sign bit set sorts below `-inf`, `-0.0` sorts below `0.0`, and a NaN without
+/// its sign bit sorts above `inf`, so `x < -inf` selects only the negative NaNs.
 pub type KeyRange = (Bound<ScalarValue>, Bound<ScalarValue>);
 
 /// A search over the leading columns of an ordered key.
 ///
 /// The query fixes keys `0..prefix.len()`, each to its [`KeyValues`], so it
-/// covers the cross product of those sets. When `range` is set, the next key is
-/// non-null and within the bounds, so an unbounded range means `IS NOT NULL`
-/// and an empty [`KeyRange`] matches no key tuple. Later keys are unconstrained.
+/// covers the cross product of those sets. When `ranges` is set, the next key
+/// is non-null and within one of the ranges, so a single unbounded range means
+/// `IS NOT NULL` and an empty list matches no key tuple. Later keys are
+/// unconstrained.
+///
+/// The ranges are in ascending order. In each, the lower bound sorts below the
+/// upper bound, or both include the same value. Each range ends before the next
+/// begins: its upper bound sorts below the next lower bound, or both exclude
+/// the same value, as in `x < 5 OR x > 5`. Ranges that overlap or touch, such
+/// as `x < 5` and `x >= 5`, are one range.
 ///
 /// `Display` prints one SQL term per constrained key, with strings quoted as
 /// `'it''s'` and binary values as `X'0AFF'`. A key whose set is empty prints as
-/// `FALSE`, because no key tuple can match it.
+/// `FALSE`, because no key tuple can match it, and so does an empty list of
+/// ranges. Two or more ranges print as `(x < 1 OR (x > 5 AND x < 9))`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TupleQuery {
     keys: Fields,
     prefix: Vec<KeyValues>,
-    range: Option<KeyRange>,
+    ranges: Option<Vec<KeyRange>>,
 }
 
 impl TupleQuery {
@@ -87,16 +99,22 @@ impl TupleQuery {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when `prefix` and `range` constrain more
-    /// keys than `keys` holds, when a value or bound is NULL or does not have
-    /// its key's type, or when a [`KeyValues::In`] repeats a value.
-    pub fn try_new(keys: Fields, prefix: Vec<KeyValues>, range: Option<KeyRange>) -> Result<Self> {
-        let constrained = prefix.len() + usize::from(range.is_some());
+    /// Returns [`Error::InvalidInput`] when `prefix` and `ranges` constrain
+    /// more keys than `keys` holds, when a value or bound is NULL or does not
+    /// have its key's type, when a [`KeyValues::In`] repeats a value, or when a
+    /// range is empty or the ranges are out of order, overlap, or touch, as
+    /// [`TupleQuery`] describes.
+    pub fn try_new(
+        keys: Fields,
+        prefix: Vec<KeyValues>,
+        ranges: Option<Vec<KeyRange>>,
+    ) -> Result<Self> {
+        let constrained = prefix.len() + usize::from(ranges.is_some());
         if constrained > keys.len() {
             return Err(Error::invalid_input(format!(
-                "TupleQuery constrains {constrained} keys ({} in the prefix, range: {}) but the index has {} keys",
+                "TupleQuery constrains {constrained} keys ({} in the prefix, ranges: {}) but the index has {} keys",
                 prefix.len(),
-                range.is_some(),
+                ranges.is_some(),
                 keys.len()
             )));
         }
@@ -114,17 +132,33 @@ impl TupleQuery {
                 }
             }
         }
-        if let Some((lower, upper)) = &range {
-            for bound in [lower, upper] {
-                if let Bound::Included(value) | Bound::Excluded(value) = bound {
-                    check_value(value, &keys[prefix.len()])?;
+        if let Some(ranges) = &ranges {
+            let key = &keys[prefix.len()];
+            for (lower, upper) in ranges {
+                for bound in [lower, upper] {
+                    if let Bound::Included(value) | Bound::Excluded(value) = bound {
+                        check_value(value, key)?;
+                    }
                 }
+            }
+            let cuts = ranges
+                .iter()
+                .flat_map(|(lower, upper)| [Cut::lower(lower), Cut::upper(upper)])
+                .collect::<Vec<_>>();
+            if cuts
+                .windows(2)
+                .any(|pair| pair[0].partial_cmp(&pair[1]) != Some(Ordering::Less))
+            {
+                return Err(Error::invalid_input(format!(
+                    "TupleQuery ranges for key '{}' must be non-empty, ascending, and apart, but are {ranges:?}",
+                    key.name()
+                )));
             }
         }
         Ok(Self {
             keys,
             prefix,
-            range,
+            ranges,
         })
     }
 
@@ -138,9 +172,49 @@ impl TupleQuery {
         &self.prefix
     }
 
-    /// The bounds on the key after the prefix, if it is constrained.
-    pub fn range(&self) -> Option<&KeyRange> {
-        self.range.as_ref()
+    /// The ranges the key after the prefix lies in, if it is constrained.
+    pub fn ranges(&self) -> Option<&[KeyRange]> {
+        self.ranges.as_deref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cut<'a> {
+    Start,
+    JustBelow(&'a ScalarValue),
+    JustAbove(&'a ScalarValue),
+    End,
+}
+
+impl<'a> Cut<'a> {
+    fn lower(bound: &'a Bound<ScalarValue>) -> Self {
+        match bound {
+            Bound::Included(value) => Self::JustBelow(value),
+            Bound::Excluded(value) => Self::JustAbove(value),
+            Bound::Unbounded => Self::Start,
+        }
+    }
+
+    fn upper(bound: &'a Bound<ScalarValue>) -> Self {
+        match bound {
+            Bound::Included(value) => Self::JustAbove(value),
+            Bound::Excluded(value) => Self::JustBelow(value),
+            Bound::Unbounded => Self::End,
+        }
+    }
+}
+
+impl PartialOrd for Cut<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::Start, Self::Start) | (Self::End, Self::End) => Some(Ordering::Equal),
+            (Self::Start, _) | (_, Self::End) => Some(Ordering::Less),
+            (_, Self::Start) | (Self::End, _) => Some(Ordering::Greater),
+            (Self::JustBelow(a) | Self::JustAbove(a), Self::JustBelow(b) | Self::JustAbove(b)) => {
+                let is_above = |cut: &Self| matches!(cut, Self::JustAbove(_));
+                Some(a.partial_cmp(b)?.then(is_above(self).cmp(&is_above(other))))
+            }
+        }
     }
 }
 
@@ -172,25 +246,42 @@ impl fmt::Display for TupleQuery {
                 }
             });
         }
-        if let Some((lower, upper)) = &self.range {
+        if let Some(ranges) = &self.ranges {
             let name = self.keys[self.prefix.len()].name();
-            let lower = match lower {
-                Bound::Included(value) => Some(format!("{name} >= {}", sql_literal(value))),
-                Bound::Excluded(value) => Some(format!("{name} > {}", sql_literal(value))),
-                Bound::Unbounded => None,
-            };
-            let upper = match upper {
-                Bound::Included(value) => Some(format!("{name} <= {}", sql_literal(value))),
-                Bound::Excluded(value) => Some(format!("{name} < {}", sql_literal(value))),
-                Bound::Unbounded => None,
-            };
-            terms.push(match (lower, upper) {
-                (Some(lower), Some(upper)) => format!("{lower} AND {upper}"),
-                (Some(bound), None) | (None, Some(bound)) => bound,
-                (None, None) => format!("{name} IS NOT NULL"),
+            terms.push(match ranges.as_slice() {
+                [] => "FALSE".to_string(),
+                [range] => range_sql(name, range),
+                ranges => {
+                    let ranges = ranges
+                        .iter()
+                        .map(|range| match range {
+                            (Bound::Unbounded, _) | (_, Bound::Unbounded) => range_sql(name, range),
+                            _ => format!("({})", range_sql(name, range)),
+                        })
+                        .collect::<Vec<_>>();
+                    format!("({})", ranges.join(" OR "))
+                }
             });
         }
         write!(f, "TupleQuery[{}]", terms.join(", "))
+    }
+}
+
+fn range_sql(name: &str, (lower, upper): &KeyRange) -> String {
+    let lower = match lower {
+        Bound::Included(value) => Some(format!("{name} >= {}", sql_literal(value))),
+        Bound::Excluded(value) => Some(format!("{name} > {}", sql_literal(value))),
+        Bound::Unbounded => None,
+    };
+    let upper = match upper {
+        Bound::Included(value) => Some(format!("{name} <= {}", sql_literal(value))),
+        Bound::Excluded(value) => Some(format!("{name} < {}", sql_literal(value))),
+        Bound::Unbounded => None,
+    };
+    match (lower, upper) {
+        (Some(lower), Some(upper)) => format!("{lower} AND {upper}"),
+        (Some(bound), None) | (None, Some(bound)) => bound,
+        (None, None) => format!("{name} IS NOT NULL"),
     }
 }
 
@@ -234,20 +325,34 @@ impl AnyQuery for TupleQuery {
                 }
             });
         }
-        if let Some((lower, upper)) = &self.range {
+        if let Some(ranges) = &self.ranges {
             let key = column(&self.keys[self.prefix.len()]);
-            match lower {
-                Bound::Included(value) => terms.push(key.clone().gt_eq(lit(value.clone()))),
-                Bound::Excluded(value) => terms.push(key.clone().gt(lit(value.clone()))),
-                Bound::Unbounded => {}
-            }
-            match upper {
-                Bound::Included(value) => terms.push(key.clone().lt_eq(lit(value.clone()))),
-                Bound::Excluded(value) => terms.push(key.clone().lt(lit(value.clone()))),
-                Bound::Unbounded => {}
-            }
-            if matches!((lower, upper), (Bound::Unbounded, Bound::Unbounded)) {
-                terms.push(key.is_not_null());
+            let range_terms = |(lower, upper): &KeyRange| {
+                let mut terms = Vec::with_capacity(2);
+                match lower {
+                    Bound::Included(value) => terms.push(key.clone().gt_eq(lit(value.clone()))),
+                    Bound::Excluded(value) => terms.push(key.clone().gt(lit(value.clone()))),
+                    Bound::Unbounded => {}
+                }
+                match upper {
+                    Bound::Included(value) => terms.push(key.clone().lt_eq(lit(value.clone()))),
+                    Bound::Excluded(value) => terms.push(key.clone().lt(lit(value.clone()))),
+                    Bound::Unbounded => {}
+                }
+                if matches!((lower, upper), (Bound::Unbounded, Bound::Unbounded)) {
+                    terms.push(key.clone().is_not_null());
+                }
+                terms
+            };
+            match ranges.as_slice() {
+                [range] => terms.extend(range_terms(range)),
+                ranges => terms.push(
+                    ranges
+                        .iter()
+                        .filter_map(|range| range_terms(range).into_iter().reduce(Expr::and))
+                        .reduce(Expr::or)
+                        .unwrap_or(lit(false)),
+                ),
             }
         }
         terms.into_iter().reduce(Expr::and).unwrap_or(lit(true))
@@ -273,27 +378,59 @@ mod tests {
         ])
     }
 
+    fn ts(value: i64) -> ScalarValue {
+        ScalarValue::Int64(Some(value))
+    }
+
     #[rstest]
     #[case::prefix_longer_than_keys(vec![KeyValues::Null; 3], None)]
     #[case::range_after_last_key(
         vec![KeyValues::Null; 2],
-        Some((Bound::Unbounded, Bound::Unbounded))
+        Some(vec![(Bound::Unbounded, Bound::Unbounded)])
     )]
     #[case::value_of_other_type(vec![KeyValues::In(vec![ScalarValue::Int64(Some(1))])], None)]
     #[case::null_value(vec![KeyValues::In(vec![ScalarValue::Int32(None)])], None)]
     #[case::null_bound(
         vec![KeyValues::Null],
-        Some((Bound::Included(ScalarValue::Int64(None)), Bound::Unbounded))
+        Some(vec![(Bound::Included(ScalarValue::Int64(None)), Bound::Unbounded)])
     )]
     #[case::bound_of_other_type(
         vec![KeyValues::Null],
-        Some((Bound::Unbounded, Bound::Excluded(ScalarValue::Int32(Some(1)))))
+        Some(vec![(Bound::Unbounded, Bound::Excluded(ScalarValue::Int32(Some(1))))])
+    )]
+    #[case::empty_range_lower_above_upper(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Excluded(ts(20)), Bound::Excluded(ts(10)))])
+    )]
+    #[case::empty_range_equal_bounds_one_excluded(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Included(ts(5)), Bound::Excluded(ts(5)))])
+    )]
+    #[case::ranges_out_of_order(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Excluded(ts(9)), Bound::Unbounded), (Bound::Unbounded, Bound::Excluded(ts(1)))])
+    )]
+    #[case::overlapping_ranges(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Unbounded, Bound::Excluded(ts(5))), (Bound::Excluded(ts(3)), Bound::Unbounded)])
+    )]
+    #[case::touching_ranges(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Unbounded, Bound::Excluded(ts(5))), (Bound::Included(ts(5)), Bound::Unbounded)])
+    )]
+    #[case::ranges_sharing_an_included_value(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Unbounded, Bound::Included(ts(5))), (Bound::Excluded(ts(5)), Bound::Unbounded)])
+    )]
+    #[case::range_after_unbounded_range(
+        vec![KeyValues::Null],
+        Some(vec![(Bound::Unbounded, Bound::Unbounded), (Bound::Excluded(ts(5)), Bound::Unbounded)])
     )]
     fn try_new_rejects_invalid_query(
         #[case] prefix: Vec<KeyValues>,
-        #[case] range: Option<KeyRange>,
+        #[case] ranges: Option<Vec<KeyRange>>,
     ) {
-        let error = TupleQuery::try_new(keys(), prefix, range).unwrap_err();
+        let error = TupleQuery::try_new(keys(), prefix, ranges).unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
@@ -322,9 +459,21 @@ mod tests {
     )]
     #[case::binary_bound(
         vec![KeyValues::Null],
-        Some((Bound::Included(ScalarValue::Binary(Some(vec![0x0a, 0xff]))), Bound::Unbounded)),
+        Some(vec![(Bound::Included(ScalarValue::Binary(Some(vec![0x0a, 0xff]))), Bound::Unbounded)]),
         "TupleQuery[tag IS NULL, blob >= X'0AFF']"
     )]
+    #[case::union_of_ranges(
+        vec![KeyValues::Null],
+        Some(vec![
+            (Bound::Unbounded, Bound::Excluded(ScalarValue::Binary(Some(vec![0x0a])))),
+            (
+                Bound::Excluded(ScalarValue::Binary(Some(vec![0x0a]))),
+                Bound::Included(ScalarValue::Binary(Some(vec![0xff]))),
+            ),
+        ]),
+        "TupleQuery[tag IS NULL, (blob < X'0A' OR (blob > X'0A' AND blob <= X'FF'))]"
+    )]
+    #[case::empty_ranges(vec![KeyValues::Null], Some(vec![]), "TupleQuery[tag IS NULL, FALSE]")]
     #[case::dictionary_string(
         vec![
             KeyValues::Null,
@@ -345,7 +494,7 @@ mod tests {
     )]
     fn display_quotes_values_and_marks_empty_sets(
         #[case] prefix: Vec<KeyValues>,
-        #[case] range: Option<KeyRange>,
+        #[case] ranges: Option<Vec<KeyRange>>,
         #[case] expected: &str,
     ) {
         let label_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
@@ -354,7 +503,7 @@ mod tests {
             Field::new("blob", DataType::Binary, true),
             Field::new("label", label_type, true),
         ]);
-        let query = TupleQuery::try_new(keys, prefix, range).unwrap();
+        let query = TupleQuery::try_new(keys, prefix, ranges).unwrap();
         assert_eq!(query.to_string(), expected);
     }
 
@@ -363,16 +512,13 @@ mod tests {
         let query = TupleQuery::try_new(
             keys(),
             vec![KeyValues::Null],
-            Some((
-                Bound::Excluded(ScalarValue::Int64(Some(5))),
-                Bound::Unbounded,
-            )),
+            Some(vec![(Bound::Excluded(ts(5)), Bound::Unbounded)]),
         )
         .unwrap();
         let unbounded = TupleQuery::try_new(
             keys(),
             vec![KeyValues::Null],
-            Some((Bound::Unbounded, Bound::Unbounded)),
+            Some(vec![(Bound::Unbounded, Bound::Unbounded)]),
         )
         .unwrap();
         assert!(query.dyn_eq(&query.clone()));
