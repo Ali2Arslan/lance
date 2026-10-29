@@ -928,8 +928,16 @@ mod tests {
         planned("TupleQuery[tenant IN (1, 2, 3, 4, 5)]", &[], &[])
     )]
     #[case::or_with_not_in_term("tenant NOT IN (1, 2, 3, 4) OR tenant = 5", None)]
-    fn plans_unoptimized_predicate(#[case] predicate: &str, #[case] expected: Option<Expected>) {
-        check_plan(&conjuncts(predicate, 0), &FIXTURE.keys, expected);
+    #[case::cap_8192_values_after_empty_set(
+        format!("tenant IN (NULL) AND {}", in_list("ts", 8192)),
+        planned(format!("TupleQuery[FALSE, {}]", in_list("ts", 8192)), &[], &[])
+    )]
+    #[case::cap_8193_values_after_empty_set(
+        format!("tenant IN (NULL) AND {}", in_list("ts", 8193)),
+        planned("TupleQuery[FALSE]", &[1], &[])
+    )]
+    fn plans_unoptimized_predicate(#[case] predicate: String, #[case] expected: Option<Expected>) {
+        check_plan(&conjuncts(&predicate, 0), &FIXTURE.keys, expected);
     }
 
     // Parsing and optimizing 100,000 literals exceeds the test time budget, so
