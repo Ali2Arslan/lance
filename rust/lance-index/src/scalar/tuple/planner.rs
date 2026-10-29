@@ -153,23 +153,26 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
             .enumerate()
             .filter_map(|(position, (_, constraint))| match constraint {
                 Some(Constraint::Values { key, values }) if *key == index => {
-                    Some((position, values))
+                    Some((position, set_size(values)))
                 }
                 _ => None,
             })
-            .min_by_key(|(_, values)| set_size(values));
-        let Some((position, values)) = smallest else {
+            .min_by_key(|(_, size)| *size);
+        let Some((position, size)) = smallest else {
             break;
         };
         let Some(product) = tuples
-            .checked_mul(set_size(values))
+            .checked_mul(size)
             .filter(|product| *product <= MAX_PREFIX_TUPLES)
         else {
             break;
         };
         tuples = product;
         is_consumed[position] = true;
-        prefix.push(values.clone());
+        let Some(Constraint::Values { values, .. }) = key_conjuncts[position].1.take() else {
+            unreachable!("position {position} holds the smallest set on key {index}");
+        };
+        prefix.push(values);
     }
 
     let mut range: Option<KeyRange> = None;
