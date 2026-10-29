@@ -397,9 +397,11 @@ mod tests {
 
     use arrow_array::cast::AsArray;
     use arrow_array::{
-        BooleanArray, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+        BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMillisecondArray,
     };
     use arrow_schema::{Field, Schema, TimeUnit};
+    use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
     use datafusion::prelude::SessionContext;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::utils::split_conjunction;
@@ -428,6 +430,8 @@ mod tests {
             Field::new("at", DataType::Timestamp(TimeUnit::Millisecond, None), true),
             Field::new("status", DataType::Utf8, true),
             Field::new("flag", DataType::Boolean, true),
+            Field::new("x", DataType::Float64, true),
+            Field::new("y", DataType::Float32, true),
         ]));
         let tenants = [None, Some(0), Some(1), Some(2), Some(3), Some(7)]
             .into_iter()
@@ -443,8 +447,22 @@ mod tests {
         ];
         let status = [None, Some("a"), Some("b")];
         let flag = [None, Some(false), Some(true)];
-        let (tenants, ts, at, status, flag): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
-            iproduct!(tenants, ts, at, status, flag).multiunzip();
+        let x = [
+            None,
+            Some(f64::NEG_INFINITY),
+            Some(-1.5),
+            Some(-0.0),
+            Some(0.0),
+            Some(1.0),
+            Some(f64::INFINITY),
+            Some(f64::NAN),
+        ];
+        let (tenants, ts, at, status, flag, x): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
+            iproduct!(tenants, ts, at, status, flag, x).multiunzip();
+        let y = x
+            .iter()
+            .map(|value| value.map(|value| value as f32))
+            .collect::<Vec<_>>();
         let rows = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -453,6 +471,8 @@ mod tests {
                 Arc::new(TimestampMillisecondArray::from(at)),
                 Arc::new(StringArray::from(status)),
                 Arc::new(BooleanArray::from(flag)),
+                Arc::new(Float64Array::from(x)),
+                Arc::new(Float32Array::from(y)),
             ],
         )
         .unwrap();
@@ -465,10 +485,19 @@ mod tests {
         }
     });
 
+    // Neither side gets another `optimize_expr` pass, whose signed-zero rewrite
+    // would turn a planned `x = 0.0` back into `x IN (-0.0, 0.0)`. DataFusion's
+    // coercion and simplifier keep Arrow's semantics, and the simplifier turns a
+    // raw `arrow_cast` into a cast the physical planner accepts.
     fn selected_rows(predicate: Expr) -> Vec<bool> {
         let fixture = &*FIXTURE;
-        let predicate = Planner::new(fixture.rows.schema())
-            .optimize_expr(predicate)
+        let context = SimplifyContext::builder()
+            .with_schema(Arc::new(fixture.schema.clone()))
+            .build();
+        let simplifier = ExprSimplifier::new(context);
+        let predicate = simplifier
+            .coerce(predicate, &fixture.schema)
+            .and_then(|predicate| simplifier.simplify(predicate))
             .unwrap();
         let predicate = fixture
             .session
@@ -531,13 +560,28 @@ mod tests {
         assert_eq!(plan.key_residual, conjuncts_at(expected.key_residual));
         assert_eq!(plan.row_residual, conjuncts_at(expected.row_residual));
 
-        let planned = std::iter::once(query.to_expr(String::new()))
-            .chain(plan.key_residual.into_iter().cloned())
-            .chain(plan.row_residual.into_iter().cloned())
-            .reduce(Expr::and)
-            .unwrap();
-        let predicate = conjuncts.iter().cloned().reduce(Expr::and).unwrap();
-        assert_eq!(selected_rows(planned), selected_rows(predicate));
+        // An AND is TRUE exactly when every conjunct is, so each conjunct is
+        // evaluated once and its rows serve both sides.
+        let rows = conjuncts
+            .iter()
+            .cloned()
+            .map(selected_rows)
+            .collect::<Vec<_>>();
+        let and = |selected: Vec<bool>, conjunct: &Vec<bool>| {
+            selected
+                .iter()
+                .zip(conjunct)
+                .map(|(a, b)| *a && *b)
+                .collect()
+        };
+        let planned = expected
+            .key_residual
+            .iter()
+            .chain(expected.row_residual)
+            .map(|&position| &rows[position])
+            .fold(selected_rows(query.to_expr(String::new())), and);
+        let original = rows.iter().fold(vec![true; FIXTURE.rows.num_rows()], and);
+        assert_eq!(planned, original);
     }
 
     fn in_list(key: &str, len: usize) -> String {
@@ -768,6 +812,46 @@ mod tests {
     }
 
     #[rstest]
+    #[case::equals_zero("x", "x = 0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
+    #[case::equals_negative_zero("x", "x = -0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
+    #[case::at_least_zero("x", "x >= 0.0", planned("TupleQuery[x >= -0]", &[], &[]))]
+    #[case::below_zero("x", "x < 0.0", planned("TupleQuery[x < -0]", &[], &[]))]
+    #[case::above_negative_infinity(
+        "x",
+        "x > CAST('-inf' AS DOUBLE)",
+        planned("TupleQuery[x > -inf]", &[], &[])
+    )]
+    #[case::in_zero_and_one(
+        "x",
+        "x IN (0.0, 1.0)",
+        planned("TupleQuery[x IN (-0, 0, 1)]", &[], &[])
+    )]
+    #[case::zero_before_tenant(
+        "x",
+        "x = 0.0 AND tenant = 1",
+        planned("TupleQuery[x IN (-0, 0), tenant = 1]", &[], &[])
+    )]
+    // DataFusion's SQL parser types a bare `0.0` as DOUBLE and casts `y` to match.
+    #[case::float32_equals_zero(
+        "y",
+        "y = CAST(0.0 AS REAL)",
+        planned("TupleQuery[y IN (-0, 0)]", &[], &[])
+    )]
+    fn plans_predicate_on_float_key(
+        #[case] float_key: &str,
+        #[case] predicate: &str,
+        #[case] expected: Option<Expected>,
+        #[values(1, 2)] passes: usize,
+    ) {
+        let schema = FIXTURE.rows.schema();
+        let keys = Fields::from(vec![
+            schema.field_with_name(float_key).unwrap().clone(),
+            schema.field_with_name("tenant").unwrap().clone(),
+        ]);
+        check_plan(&conjuncts(predicate, passes), &keys, expected);
+    }
+
+    #[rstest]
     #[case::literal_on_left("1 = tenant", planned("TupleQuery[tenant = 1]", &[], &[]))]
     #[case::arrow_cast_on_first_key(
         "tenant = arrow_cast(1, 'Int32')",
@@ -823,18 +907,6 @@ mod tests {
     #[case::or_with_not_in_term("tenant NOT IN (1, 2, 3, 4) OR tenant = 5", None)]
     fn plans_unoptimized_predicate(#[case] predicate: &str, #[case] expected: Option<Expected>) {
         check_plan(&conjuncts(predicate, 0), &FIXTURE.keys, expected);
-    }
-
-    #[rstest]
-    fn signed_zero_in_list_binds_float_key(#[values(1, 2)] passes: usize) {
-        let keys = Fields::from(vec![Field::new("x", DataType::Float64, true)]);
-        let planner = Planner::new(Arc::new(Schema::new(keys.clone())));
-        let mut filter = planner.parse_filter("x IN (0.0, 1.0)").unwrap();
-        for _ in 0..passes {
-            filter = planner.optimize_expr(filter).unwrap();
-        }
-        let plan = plan_tuple_predicate(std::slice::from_ref(&filter), &keys).expect("x binds");
-        assert_eq!(plan.query.to_string(), "TupleQuery[x IN (-0, 0, 1)]");
     }
 
     #[test]
