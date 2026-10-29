@@ -1049,14 +1049,14 @@ mod tests {
                         });
                     match (walked, expected) {
                         (Ok(walked), Ok(expected)) => {
-                            let (at_upper, kept): (Vec<_>, Vec<_>) =
+                            let (at_excluded_upper, expected_walk): (Vec<_>, Vec<_>) =
                                 expected.into_iter().partition(|page| {
                                     matches!(upper, Bound::Excluded(ScalarValue::Int32(bound))
                                         if page_min[&page.page_id()] == *bound)
                                 });
-                            pages_at_excluded_upper += at_upper.len();
+                            pages_at_excluded_upper += at_excluded_upper.len();
                             assert_eq!(
-                                walked, kept,
+                                walked, expected_walk,
                                 "{name}, {lower:?} to {upper:?}: the walk skips only the pages \
                                  search keeps whose min is the excluded upper bound"
                             )
