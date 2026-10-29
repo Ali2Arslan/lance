@@ -385,6 +385,9 @@ fn literal(expr: &Expr) -> Option<ScalarValue> {
 }
 
 fn coerce_lossless(value: ScalarValue, data_type: &DataType) -> Option<ScalarValue> {
+    if value.data_type() == *data_type {
+        return Some(value);
+    }
     let coerced = safe_coerce_scalar(&value, data_type)?;
     let is_lossless =
         coerced.data_type() == *data_type && coerced.cast_to(&value.data_type()).ok()? == value;
