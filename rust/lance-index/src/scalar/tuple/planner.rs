@@ -10,7 +10,7 @@
 //! - `key = v`, `key IN (...)`, `key IS NULL`, and an OR whose terms are all
 //!   `key = v` or `key IN (...)` on one key fix a key to a set of values. A
 //!   bare Boolean key means `key = true`, and `NOT key` means `key = false`,
-//!   alone or as an OR term. [`Planner::optimize_expr`] writes a short
+//!   alone or as an OR term. `Planner::optimize_expr` writes a short
 //!   `key IN (...)` list as such an OR, `key = true` as `key`, `key = false`
 //!   as `NOT key`, and `x = 0.0` on a float key as `x IN (-0.0, 0.0)`. These
 //!   conjuncts bind a leading prefix of keys: key 0, then key 1, and so on, up
@@ -27,7 +27,9 @@
 //!   `(a < 1 OR a > 5) AND a < 9` binds `(a < 1 OR (a > 5 AND a < 9))`. A
 //!   range OR of more than [`MAX_KEY_RANGES`] terms never binds, and neither
 //!   does a conjunct that would leave the query more than [`MAX_KEY_RANGES`]
-//!   ranges.
+//!   ranges. `Planner::optimize_expr` writes `x >= 0.0` on a float key as
+//!   `x >= -0.0 OR x < -inf`, which also selects the NaNs with the sign bit
+//!   set, so it binds two ranges.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes any other OR or
 //!   NOT, `!=`, `NOT IN`, expressions over keys, and conjuncts on keys after the
@@ -48,7 +50,7 @@
 //! which selects no rows. In a returned plan, a conjunct with a NULL range
 //! bound stays in the key residual. Only `key IS NULL` matches NULL keys.
 //!
-//! [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
+//! `Planner::optimize_expr` is in `lance-datafusion`.
 
 use std::collections::HashSet;
 use std::ops::Bound;
@@ -58,7 +60,7 @@ use datafusion_common::ScalarValue;
 use datafusion_expr::expr::{Between, BinaryExpr, Cast, InList, ScalarFunction};
 use datafusion_expr::utils::split_binary;
 use datafusion_expr::{Expr, Operator};
-use lance_datafusion::expr::safe_coerce_scalar;
+use lance_datafusion_exec::expr::safe_coerce_scalar;
 
 use super::{Cut, KeyRange, KeyValues, TupleQuery};
 
@@ -105,19 +107,19 @@ enum Constraint {
 /// Plan `conjuncts`, the terms of an AND, as one query over `keys`, the index's
 /// key columns in key order.
 ///
-/// Pass conjuncts that went through [`Planner::optimize_expr`], as
-/// [`create_filter_plan`] does before it plans per-column indices. That pass
-/// coerces literal types, so `at >= '2024-01-01'` on a timestamp key arrives
-/// here with a timestamp literal. This function never parses a string into a
-/// timestamp, so without that pass the raw string leaves its conjunct unplanned.
+/// Pass conjuncts that went through `Planner::optimize_expr` in
+/// `lance-datafusion`. [`create_filter_plan`] expects the same pass before it
+/// plans per-column indices. That pass coerces literal types, so
+/// `at >= '2024-01-01'` on a timestamp key arrives here with a timestamp
+/// literal. This function never parses a string into a timestamp, so without
+/// that pass the raw string leaves its conjunct unplanned.
 ///
 /// Returns `None` when no conjunct binds the first key, and the caller keeps
 /// every conjunct. When the smallest set on the first key holds more than
 /// [`MAX_PREFIX_TUPLES`] values, no set binds it, so the result is `None`
 /// unless a range binds that key.
 ///
-/// [`Planner::optimize_expr`]: lance_datafusion::planner::Planner::optimize_expr
-/// [`create_filter_plan`]: crate::scalar::expression::PlannerIndexExt::create_filter_plan
+/// [`create_filter_plan`]: crate::scalar::expression::create_filter_plan
 ///
 /// ```
 /// use arrow_schema::{DataType, Field, Fields};
@@ -1047,12 +1049,20 @@ mod tests {
     #[rstest]
     #[case::equals_zero("x", "x = 0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
     #[case::equals_negative_zero("x", "x = -0.0", planned("TupleQuery[x IN (-0, 0)]", &[], &[]))]
-    #[case::at_least_zero("x", "x >= 0.0", planned("TupleQuery[x >= -0]", &[], &[]))]
-    #[case::below_zero("x", "x < 0.0", planned("TupleQuery[x < -0]", &[], &[]))]
+    #[case::at_least_zero(
+        "x",
+        "x >= 0.0",
+        planned("TupleQuery[(x < -inf OR x >= -0)]", &[], &[])
+    )]
+    #[case::below_zero(
+        "x",
+        "x < 0.0",
+        planned("TupleQuery[x >= -inf AND x < -0]", &[], &[])
+    )]
     #[case::above_negative_infinity(
         "x",
         "x > CAST('-inf' AS DOUBLE)",
-        planned("TupleQuery[x > -inf]", &[], &[])
+        planned("TupleQuery[(x < -inf OR x > -inf)]", &[], &[])
     )]
     #[case::in_zero_and_one(
         "x",
