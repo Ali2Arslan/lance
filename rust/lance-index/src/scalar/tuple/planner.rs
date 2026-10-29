@@ -308,22 +308,25 @@ fn key_ranges(expr: &Expr, keys: &Fields) -> Option<(usize, Vec<KeyRange>)> {
                 return None;
             }
             let mut key = None;
-            let mut ranges = if is_or {
-                Vec::new()
-            } else {
-                vec![(Bound::Unbounded, Bound::Unbounded)]
-            };
+            let mut merged = Vec::with_capacity(terms.len());
             for term in terms {
                 let (term_key, term_ranges) = key_ranges(term, keys)?;
                 if *key.get_or_insert(term_key) != term_key {
                     return None;
                 }
-                ranges = if is_or {
-                    union(&ranges, &term_ranges)?
-                } else {
-                    intersect(&ranges, &term_ranges)?
-                };
+                merged.push(term_ranges);
             }
+            while merged.len() > 1 {
+                let mut pairs = std::mem::take(&mut merged).into_iter();
+                while let Some(a) = pairs.next() {
+                    merged.push(match pairs.next() {
+                        Some(b) if is_or => union(&a, &b)?,
+                        Some(b) => intersect(&a, &b)?,
+                        None => a,
+                    });
+                }
+            }
+            let ranges = merged.pop()?;
             return (ranges.len() <= MAX_KEY_RANGES).then_some((key?, ranges));
         }
         _ => return None,
