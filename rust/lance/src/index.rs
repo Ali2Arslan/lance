@@ -92,6 +92,7 @@ pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub(crate) mod segment_coverage;
 pub mod vector;
 
 use self::frag_reuse_with_stable_row_ids::{
@@ -3954,8 +3955,9 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
-        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
-        let fri_key = FragReuseIndexKey { uuid: &identity };
+        let fri_key = FragReuseIndexKey {
+            uuid: &frag_reuse_index_meta.uuid,
+        };
         let frag_reuse_index = dataset
             .index_cache
             .get_or_insert_with_key(fri_key, || async move {
@@ -4103,7 +4105,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-/// The FRI identity that belongs in the vector cache keys before any remapping
+/// The FRI UUID that belongs in the vector cache keys before any remapping
 /// is resolved: only a v0 history, whose remapper is applied while the index
 /// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
 async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
@@ -4112,22 +4114,7 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .ok()?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
-        .map(|idx| frag_reuse::v0_cache_identity(dataset, idx))
-}
-
-/// The FRI part of a cache key for content read alongside the dataset's
-/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
-/// entry UUID for tagged history, which every change to that history replaces.
-pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
-    load_all_indices(dataset)
-        .await
-        .ok()?
-        .iter()
-        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
-        .map(|idx| match idx.index_version {
-            0 => frag_reuse::v0_cache_identity(dataset, idx),
-            _ => idx.uuid,
-        })
+        .map(|idx| idx.uuid)
 }
 
 impl Dataset {
@@ -4837,8 +4824,9 @@ impl DatasetIndexInternalExt for Dataset {
                 };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
-            let identity = frag_reuse::v0_cache_identity(self, &frag_reuse_index_meta);
-            let frag_reuse_key = FragReuseIndexKey { uuid: &identity };
+            let frag_reuse_key = FragReuseIndexKey {
+                uuid: &frag_reuse_uuid,
+            };
 
             let index = self
                 .index_cache
@@ -4870,7 +4858,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = frag_reuse_cache_scope(self).await;
+        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -15489,6 +15477,8 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15605,6 +15595,8 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -15878,18 +15870,17 @@ mod tests {
         }
     }
 
-    /// Compactions rewrite fragments 2 and 3 into 4 and 5, then 0 and 1 into
-    /// 6 and 7 (relabeling 4 and 5 to 8 and 9), then 7 and 8 into 10 and 11
-    /// (relabeling 9 to 12). The index is caught up past the first compaction,
-    /// so a cleanup trims its record: 10, 11 and 12 no longer trace to the
-    /// build through 4 and 5, though the shared group's other source, 7, does,
-    /// as 6 still does.
+    /// Compactions rewrite fragments 0 and 1 into 4 and 5, 2 and 3 into 6 and
+    /// 7, then 5 and 6 into 8 and 9. The index is caught up past the first
+    /// one, so a cleanup trims its record: 4 and 5 no longer trace to the
+    /// build, and neither do 8 and 9, though their other source, 6, does, as 7
+    /// still does.
     #[tokio::test]
     async fn test_sources_at_build_fails_on_a_missing_link_beside_a_traced_one() {
         let dir = TempStrDir::default();
         let (mut dataset, built) = recording_btree_table(dir.as_str(), 4).await;
         let version = dataset.manifest.version;
-        let first = compact_into_two(&mut dataset, &[2, 3]).await;
+        let first = compact_into_two(&mut dataset, &[0, 1]).await;
         crate::dataset::optimize::remapping::remap_column_index(
             &mut dataset,
             &["i"],
@@ -15897,20 +15888,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let second = compact_into_two(&mut dataset, &[0, 1]).await;
-        let third = compact_into_two(&mut dataset, &[second[1], 8]).await;
-        assert_eq!(first, [4, 5]);
-        assert_eq!(second, [6, 7]);
-        assert_eq!(third, [10, 11]);
-        assert_eq!(
-            dataset
-                .manifest
-                .fragments
-                .iter()
-                .map(|fragment| fragment.id)
-                .collect::<Vec<_>>(),
-            [6, 10, 11, 12]
-        );
+        let second = compact_into_two(&mut dataset, &[2, 3]).await;
+        let third = compact_into_two(&mut dataset, &[first[1], second[0]]).await;
         let trace = |versions: &[FragReuseVersion], fragment: u64| {
             sources_at_build(versions, version, fragment as u32, |id| built.contains(id)).map(
                 |mut sources| {
@@ -15930,13 +15909,13 @@ mod tests {
             .unwrap();
         let kept = dataset.frag_reuse_index().await.unwrap().unwrap();
         assert_eq!(kept.details.versions.len(), 2);
-        for fragment in [12, third[0], third[1]] {
+        for fragment in [first[0], third[0], third[1]] {
             assert_eq!(
                 trace(&kept.details.versions, fragment),
                 None,
                 "fragment {fragment}"
             );
         }
-        assert_eq!(trace(&kept.details.versions, second[0]), Some(vec![0, 1]));
+        assert_eq!(trace(&kept.details.versions, second[1]), Some(vec![2, 3]));
     }
 }

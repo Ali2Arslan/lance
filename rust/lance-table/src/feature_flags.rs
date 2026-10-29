@@ -3,7 +3,7 @@
 
 //! Feature flags
 
-use crate::format::Manifest;
+use crate::format::{IndexMetadata, Manifest};
 use lance_core::{Error, Result, datatypes::Schema};
 
 /// Fragments may contain deletion files, which record the tombstones of
@@ -126,30 +126,12 @@ pub const FLAG_ZONE_WRITE_SEEDS: u64 = 1 << 16;
 /// them must refuse the dataset. Ordinary readers can ignore this metadata; all
 /// covered features share this one bit.
 pub const FLAG_OBJECT_METADATA: u64 = 1 << 17;
-/// Keeps released writers away from BTree segments whose `BTreeIndexDetails`
-/// sets `key_layout`.
-///
-/// The segment's index version 2 keeps older readers from using it, but
-/// nothing keeps v12.0.0 and v13.0.0 writers from updating a table with stable
-/// row ids. Their update adds the fragment that receives the rewritten rows to
-/// the segment's `fragment_bitmap` without indexing those rows. v12.0.0
-/// through v14.0.0 refuse this bit, so they commit nothing to the table.
-///
-/// Writer-only. v10.0.0 and v11.0.0 check writer flags only on insert. Their
-/// update, delete, index creation, column addition, and compaction drop the
-/// segment and clear the bit. Their restore, shallow clone, and branch
-/// creation keep the segment and clear the bit. Their reads stay correct.
-///
-/// A writer that supports this bit sets it on every published manifest, clones
-/// and restores included, exactly when its index section has a segment with a
-/// `key_layout`, and derives and validates it the way
-/// [`FLAG_FRAG_REUSE_WITH_STABLE_ROW_IDS`] is. A segment with a `key_layout`
-/// from a manifest without the bit is unusable, and such a writer never
-/// carries it into a new manifest.
-///
-/// Reserved ahead of its implementation. This build masks the bit out in
-/// `supported_flags_when`, so it refuses to write a table that sets it.
-pub const FLAG_BTREE_KEY_LAYOUT: u64 = 1 << 18;
+/// A stable-row-ID table contains an index that stores physical row addresses.
+/// Older writers may treat its entries as stable row IDs and extend coverage to
+/// rewritten fragments without indexing them, silently losing query results.
+/// Readers can still skip an unsupported index version and scan the data.
+/// This writer-only flag is cleared when the last row-address index is removed.
+pub const FLAG_ROW_ADDR_INDICES: u64 = 1 << 18;
 /// The first bit that is unknown as a feature flag
 pub const FLAG_UNKNOWN: u64 = 1 << 19;
 
@@ -170,9 +152,7 @@ const _: () = assert!(FLAG_INDEPENDENT_COVERING_FIELDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_MANAGED_BLOBS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_ZONE_WRITE_SEEDS < FLAG_UNKNOWN);
 const _: () = assert!(FLAG_OBJECT_METADATA < FLAG_UNKNOWN);
-// Same fence for this bit: v14.0.0 refuses bit 18 and up.
-const _: () = assert!(FLAG_BTREE_KEY_LAYOUT >= 1 << 18);
-const _: () = assert!(FLAG_BTREE_KEY_LAYOUT < FLAG_UNKNOWN);
+const _: () = assert!(FLAG_ROW_ADDR_INDICES < FLAG_UNKNOWN);
 
 pub(crate) const STICKY_PAIRED_FLAGS: u64 = FLAG_MIXED_DATA_FILE_VERSIONS
     | FLAG_FRAGMENT_REUSE_INDEX
@@ -191,14 +171,12 @@ pub fn apply_feature_flags(
     enable_stable_row_id: bool,
     disable_transaction_file: bool,
 ) -> Result<()> {
-    // Carried across the reset: a `Manifest` only points at its index section,
-    // so whether any index declares covering columns is not visible here.
-    // `build_manifest` decides it from the index list it is committing and sets
-    // the bit after calling this; without the carry the second call, from
-    // `write_manifest_file`, would clear that decision immediately before the
-    // write.
+    // A Manifest only points at its index section, so index-dependent flags
+    // cannot be derived here. Carry them across the reset so a second call from
+    // write_manifest_file preserves the flags already derived from the index list.
     let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
         & FLAG_COVERED_INDEX_METADATA;
+    let row_addr_indices = manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES;
     // Same carry for the index section's clustering references and generic
     // metadata, which `build_manifest` derives from the index list.
     let object_metadata = manifest.writer_feature_flags & FLAG_OBJECT_METADATA;
@@ -295,10 +273,29 @@ pub fn apply_feature_flags(
 
     manifest.reader_feature_flags |= covered_index_metadata;
     manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.writer_feature_flags |= row_addr_indices;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 
     Ok(())
+}
+
+/// Derive the writer fence from the final index list, including unsupported
+/// index versions. Call after [`apply_feature_flags`] when committing indices;
+/// restore and clone must also derive it for snapshots written before the fence.
+///
+/// ```
+/// # use lance_table::format::{IndexMetadata, Manifest};
+/// # use lance_table::feature_flags::apply_row_addr_index_feature_flag;
+/// # fn prepare(manifest: &mut Manifest, indices: &[IndexMetadata]) {
+/// apply_row_addr_index_feature_flag(manifest, indices);
+/// # }
+/// ```
+pub fn apply_row_addr_index_feature_flag(manifest: &mut Manifest, indices: &[IndexMetadata]) {
+    manifest.writer_feature_flags &= !FLAG_ROW_ADDR_INDICES;
+    if manifest.uses_stable_row_ids() && indices.iter().any(IndexMetadata::results_are_row_addrs) {
+        manifest.writer_feature_flags |= FLAG_ROW_ADDR_INDICES;
+    }
 }
 
 /// Set the writer-only object-metadata bit for an index section that carries a
@@ -411,7 +408,6 @@ fn supported_flags_when(
     mark_supported(&mut supported, FLAG_INDEPENDENT_COVERING_FIELDS, false);
     mark_supported(&mut supported, FLAG_ZONE_WRITE_SEEDS, true);
     mark_supported(&mut supported, FLAG_OBJECT_METADATA, true);
-    mark_supported(&mut supported, FLAG_BTREE_KEY_LAYOUT, false);
     supported
 }
 
@@ -603,19 +599,6 @@ mod tests {
     use crate::format::BasePath;
 
     #[test]
-    fn test_btree_key_layout_flag_fences_writes_without_blocking_reads() {
-        let mut manifest = empty_manifest();
-        manifest.writer_feature_flags = FLAG_BTREE_KEY_LAYOUT;
-        ensure_can_read_manifest(&manifest).unwrap();
-        let error = ensure_can_write_manifest(&manifest).unwrap_err();
-        assert!(matches!(error, Error::NotSupported { .. }));
-        assert!(error.to_string().contains("cannot be written"));
-        assert!(!can_read_dataset(FLAG_BTREE_KEY_LAYOUT));
-        assert!(!can_write_dataset(FLAG_BTREE_KEY_LAYOUT));
-        assert_eq!(FLAG_BTREE_KEY_LAYOUT, 1 << 18);
-    }
-
-    #[test]
     fn test_object_metadata_flag_is_supported_and_derived() {
         assert_eq!(FLAG_OBJECT_METADATA, 1 << 17);
         assert!(can_read_dataset(FLAG_OBJECT_METADATA));
@@ -667,6 +650,19 @@ mod tests {
         apply_feature_flags(&mut manifest, false, false).unwrap();
         assert_ne!(manifest.writer_feature_flags & FLAG_OBJECT_METADATA, 0);
         assert_eq!(manifest.reader_feature_flags & FLAG_OBJECT_METADATA, 0);
+    }
+
+    #[test]
+    fn test_row_addr_index_writer_fence_is_supported() {
+        assert_eq!(FLAG_ROW_ADDR_INDICES, 1 << 18);
+        assert!(can_write_dataset(FLAG_ROW_ADDR_INDICES));
+        let mut manifest = empty_manifest();
+        manifest.writer_feature_flags = FLAG_ROW_ADDR_INDICES;
+        ensure_can_read_manifest(&manifest).unwrap();
+        ensure_can_write_manifest(&manifest).unwrap();
+        apply_feature_flags(&mut manifest, false, false).unwrap();
+        assert_eq!(manifest.reader_feature_flags & FLAG_ROW_ADDR_INDICES, 0);
+        assert_ne!(manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES, 0);
     }
 
     #[test]
