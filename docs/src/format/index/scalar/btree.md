@@ -343,13 +343,14 @@ a `key_layout` as unusable when any of these is true:
   parameters such as the `arrow_row` `version`. A missing `encoding` or
   `ordering`, or one whose `oneof` is unset, is not supported.
 - The encoding does not admit the type of a key column.
-- The manifest's writer feature flags lack `FLAG_BTREE_KEY_LAYOUT`.
+- The manifest sets `FLAG_STABLE_ROW_IDS` and its writer feature flags lack
+  `FLAG_ROW_ADDR_INDICES`.
 
 An engine skips an unusable index and scans the fragments that the index
 covers, as it does for any index segment it cannot use (see
-[Index Compatibility](../index.md#index-compatibility)). If the manifest lacks
-`FLAG_BTREE_KEY_LAYOUT`, a writer that supports key layouts drops the
-index (see
+[Index Compatibility](../index.md#index-compatibility)). If the manifest sets
+`FLAG_STABLE_ROW_IDS` and lacks `FLAG_ROW_ADDR_INDICES`, a writer that supports
+key layouts drops the index (see
 [Compatibility With Released Versions](#compatibility-with-released-versions)).
 Otherwise the engine does not add rows or fragments to the index, and its
 compaction does not rewrite the fragments that the index covers. It still
@@ -373,11 +374,13 @@ Index version 2 keeps released readers from using an index with a
 `key_layout`, but nothing in the index keeps v12.0.0 and v13.0.0 writers from
 updating a table with stable row IDs. Their update adds the fragment that
 receives the rewritten rows to the index's `fragment_bitmap`, although the
-index holds no row address in that fragment. A table with such an index
-therefore sets `FLAG_BTREE_KEY_LAYOUT` (`2^18`) in its writer
+index holds no row address in that fragment. A table with `FLAG_STABLE_ROW_IDS`
+and a row-address index, including any BTree at version 1 or above, therefore
+sets `FLAG_ROW_ADDR_INDICES` (`2^18`) in its writer
 [feature flags](../../table/versioning.md#current-feature-flags), and not in its
-reader feature flags. The index version fences readers from v10.0.0 on, and the
-flag fences writers from v12.0.0 on.
+reader feature flags. A table without `FLAG_STABLE_ROW_IDS` sets no writer flag,
+because updates on such a table never add rewritten fragments to an index's
+`fragment_bitmap`.
 
 Releases v12.0.0 and v13.0.0 read BTree indices up to version 0, and release
 v14.0.0 reads them up to version 1, so these releases ignore an index with a
@@ -385,29 +388,38 @@ v14.0.0 reads them up to version 1, so these releases ignore an index with a
 v11.0.0 also ignore it when they read. In all five releases, equality filters
 on key columns return the same rows as a full scan.
 
-Releases v12.0.0 through v14.0.0 commit no change to a table that sets
-`FLAG_BTREE_KEY_LAYOUT`. Their insert, update, delete, index creation, column
-addition, restore, shallow clone, and branch creation fail with an
-unsupported-feature error. Their index optimization and compaction either fail
-the same way or commit nothing.
+On a table with `FLAG_STABLE_ROW_IDS`, `FLAG_ROW_ADDR_INDICES` fences writers
+from v12.0.0 on:
 
-Releases v10.0.0 and v11.0.0 check writer feature flags only when they insert.
-Their update, delete, index creation, column addition, and compaction commit
-anyway. Each of these commits removes the index with a `key_layout` from the
-manifest and clears `FLAG_BTREE_KEY_LAYOUT`. Their index optimization does the
-same or commits nothing. Their restore, shallow clone, and branch creation
-clear the bit but keep the index. On a table with stable row IDs, a later
-update by v12.0.0 or v13.0.0 can then add fragments to the index's
-`fragment_bitmap`. Their reads stay correct throughout.
+- Releases v12.0.0 through v14.0.0 commit no change to the table. Their insert,
+  update, delete, index creation, column addition, restore, shallow clone,
+  branch creation, and compaction fail with an unsupported-feature error, and
+  their index optimization fails the same way or commits nothing.
+- Releases v10.0.0 and v11.0.0 check writer feature flags only when they
+  insert. Their update, delete, index creation, column addition, and compaction
+  commit anyway, remove the index with a `key_layout` from the manifest, and
+  clear `FLAG_ROW_ADDR_INDICES`. Their index optimization does the same or
+  commits nothing. Their restore, shallow clone, and branch creation clear the
+  bit and keep the index. A later update by v12.0.0 or v13.0.0 can then add
+  fragments to the index's `fragment_bitmap`.
 
-A reader therefore does not use an index with a `key_layout` from a manifest
-whose writer feature flags lack `FLAG_BTREE_KEY_LAYOUT` (see
-[Key Layout Reader Rules](#key-layout-reader-rules)).
+On a table without `FLAG_STABLE_ROW_IDS`, `FLAG_ROW_ADDR_INDICES` is not set:
 
-A writer that supports key layouts never carries an index with a `key_layout`
-out of a manifest whose writer feature flags lack the bit. That rule covers the
-manifest that a commit builds on and the version that a restore, clone, or
-branch copies. The writer drops such an index before it computes the bit.
-Every manifest it publishes, including by clone and restore, sets
-`FLAG_BTREE_KEY_LAYOUT` exactly when its index section has a segment with a
-`key_layout`. The bit covers only segments with a `key_layout`.
+- Releases v12.0.0 through v14.0.0 commit their writes and keep the index with
+  a `key_layout`, without adding new or rewritten fragments to its
+  `fragment_bitmap`. Their in-place column updates remove modified fragments
+  from `fragment_bitmap`, their index optimization skips the index, and their
+  compaction leaves the fragments that the index covers uncompacted.
+- Releases v10.0.0 and v11.0.0 remove the index with a `key_layout` when they
+  insert, update, delete, create an index, add a column, or compact files.
+  Their index optimization does the same or commits nothing, and their restore,
+  shallow clone, and branch creation keep the index.
+
+On a table with `FLAG_STABLE_ROW_IDS`, a reader therefore does not use an index
+with a `key_layout` from a manifest whose writer feature flags lack
+`FLAG_ROW_ADDR_INDICES` (see
+[Key Layout Reader Rules](#key-layout-reader-rules)), and a writer that
+supports key layouts never carries such an index out of a manifest that lacks
+the bit. That rule covers the manifest that a commit builds on and the version
+that a restore, clone, or branch copies. The writer drops such an index before
+it computes `FLAG_ROW_ADDR_INDICES`.
