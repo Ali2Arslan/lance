@@ -16,7 +16,9 @@
 //!   conjuncts bind a leading prefix of keys: key 0, then key 1, and so on, up
 //!   to the first key that no conjunct fixes or whose smallest set would grow
 //!   the prefix past [`MAX_PREFIX_TUPLES`]. When several conjuncts fix one
-//!   key, the one with the smallest set binds it.
+//!   key, the one with the smallest set binds it. A set of more than
+//!   [`MAX_PREFIX_TUPLES`] distinct values never binds, even when an earlier
+//!   key's set is empty.
 //! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
 //!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
 //!   binds only when every finite bound it carries is still open, because a
@@ -355,6 +357,9 @@ fn key_values(
         }
         let value = coerce_lossless(value, data_type)?;
         if seen.insert(value.clone()) {
+            if values.len() == MAX_PREFIX_TUPLES {
+                return None;
+            }
             values.push(value);
         }
     }
@@ -925,6 +930,31 @@ mod tests {
     #[case::or_with_not_in_term("tenant NOT IN (1, 2, 3, 4) OR tenant = 5", None)]
     fn plans_unoptimized_predicate(#[case] predicate: &str, #[case] expected: Option<Expected>) {
         check_plan(&conjuncts(predicate, 0), &FIXTURE.keys, expected);
+    }
+
+    // Parsing and optimizing 100,000 literals takes most of a second, so these
+    // lists are built with literals already of the key's type.
+    #[rstest]
+    #[case::items_of_10_values(
+        vec![col("tenant").in_list((0..100_000).map(|item: i32| lit(item % 10)).collect(), false)],
+        planned(format!("TupleQuery[{}]", in_list("tenant", 10)), &[], &[])
+    )]
+    #[case::distinct_values(
+        vec![
+            col("tenant").eq(lit(1)),
+            col("ts").in_list((0..100_000_i64).map(lit).collect(), false),
+        ],
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::distinct_values_after_empty_set(
+        vec![
+            col("tenant").in_list(vec![lit(ScalarValue::Null)], false),
+            col("ts").in_list((0..100_000_i64).map(lit).collect(), false),
+        ],
+        planned("TupleQuery[FALSE]", &[1], &[])
+    )]
+    fn plans_100000_item_in_list(#[case] conjuncts: Vec<Expr>, #[case] expected: Option<Expected>) {
+        check_plan(&conjuncts, &FIXTURE.keys, expected);
     }
 
     #[test]
