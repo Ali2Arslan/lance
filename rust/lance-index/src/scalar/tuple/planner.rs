@@ -19,10 +19,15 @@
 //!   key, the one with the smallest set binds it. A set of more than
 //!   [`MAX_PREFIX_TUPLES`] distinct values never binds, even when an earlier
 //!   key's set is empty.
-//! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
-//!   `key IS NOT NULL` bound the key after the prefix. Each such conjunct on
-//!   that key binds, and the query keeps the intersection of their ranges. So
-//!   `a > 0 AND a BETWEEN 1 AND 10` binds `a >= 1 AND a <= 10`.
+//! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`,
+//!   `key IS NOT NULL`, and an AND or OR of these on one key select a union of
+//!   ranges on that key. Conjuncts on the key after the prefix bind, and the
+//!   query keeps the intersection of their unions, with overlapping and
+//!   touching ranges merged. So `a < 1 OR a > 5` binds two ranges, and
+//!   `(a < 1 OR a > 5) AND a < 9` binds `(a < 1 OR (a > 5 AND a < 9))`. A
+//!   range OR of more than [`MAX_KEY_RANGES`] terms never binds, and neither
+//!   does a conjunct that would leave the query more than [`MAX_KEY_RANGES`]
+//!   ranges.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes any other OR or
 //!   NOT, `!=`, `NOT IN`, expressions over keys, and conjuncts on keys after the
@@ -60,10 +65,19 @@ use super::{Cut, KeyRange, KeyValues, TupleQuery};
 /// The most prefix tuples one planned [`TupleQuery`] may cover.
 ///
 /// The prefix covers the cross product of its keys' sets, and an index runs one
-/// seek per prefix tuple, so this caps the seeks one query costs. A key whose
-/// set would grow the product past the cap ends the prefix. In a returned plan,
-/// its conjunct stays in the key residual.
+/// seek per prefix tuple and range, so with [`MAX_KEY_RANGES`] this caps the
+/// seeks one query costs. A key whose set would grow the product past the cap
+/// ends the prefix. In a returned plan, its conjunct stays in the key residual.
 pub const MAX_PREFIX_TUPLES: usize = 8192;
+
+/// The most ranges one planned [`TupleQuery`] may hold on the key after its
+/// prefix.
+///
+/// An OR of more range terms than this never binds, even when they would merge
+/// into fewer ranges, and neither does a conjunct that would leave the query
+/// more ranges than this. In a returned plan, such a conjunct stays in the key
+/// residual.
+pub const MAX_KEY_RANGES: usize = 64;
 
 /// A conjunctive filter, split by what a [`TupleQuery`] answers.
 ///
@@ -188,8 +202,8 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         let bound = match &ranges {
             None => conjunct_ranges.clone(),
             Some(bound) => match intersect(bound, conjunct_ranges) {
-                Some(bound) => bound,
-                None => continue,
+                Some(bound) if bound.len() <= MAX_KEY_RANGES => bound,
+                _ => continue,
             },
         };
         ranges = Some(bound);
@@ -228,19 +242,23 @@ fn set_size(values: &KeyValues) -> usize {
 }
 
 fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
+    let ranges =
+        || key_ranges(conjunct, keys).map(|(key, ranges)| Constraint::Ranges { key, ranges });
     match conjunct {
         Expr::IsNull(expr) => Some(Constraint::Values {
             key: key_column(expr, keys)?.0,
             values: KeyValues::Null,
         }),
         Expr::BinaryExpr(BinaryExpr {
-            op: Operator::Eq | Operator::Or,
-            ..
+            op: Operator::Eq, ..
         })
         | Expr::InList(_)
         | Expr::Column(_)
         | Expr::Not(_) => key_set(conjunct, keys),
-        _ => key_ranges(conjunct, keys).map(|(key, ranges)| Constraint::Ranges { key, ranges }),
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Or, ..
+        }) => key_set(conjunct, keys).or_else(ranges),
+        _ => ranges(),
     }
 }
 
@@ -280,6 +298,34 @@ fn key_ranges(expr: &Expr, keys: &Fields) -> Option<(usize, Vec<KeyRange>)> {
             key_column(expr, keys)?.0,
             (Bound::Unbounded, Bound::Unbounded),
         ),
+        Expr::BinaryExpr(BinaryExpr {
+            op: op @ (Operator::And | Operator::Or),
+            ..
+        }) => {
+            let is_or = *op == Operator::Or;
+            let terms = split_binary(expr, *op);
+            if is_or && terms.len() > MAX_KEY_RANGES {
+                return None;
+            }
+            let mut key = None;
+            let mut ranges = if is_or {
+                Vec::new()
+            } else {
+                vec![(Bound::Unbounded, Bound::Unbounded)]
+            };
+            for term in terms {
+                let (term_key, term_ranges) = key_ranges(term, keys)?;
+                if *key.get_or_insert(term_key) != term_key {
+                    return None;
+                }
+                ranges = if is_or {
+                    union(&ranges, &term_ranges)?
+                } else {
+                    intersect(&ranges, &term_ranges)?
+                };
+            }
+            return (ranges.len() <= MAX_KEY_RANGES).then_some((key?, ranges));
+        }
         _ => return None,
     };
     Some((key, union_of(range)?))
@@ -309,6 +355,41 @@ fn intersect(a: &[KeyRange], b: &[KeyRange]) -> Option<Vec<KeyRange>> {
             i += 1;
         } else {
             j += 1;
+        }
+    }
+    Some(ranges)
+}
+
+fn union(a: &[KeyRange], b: &[KeyRange]) -> Option<Vec<KeyRange>> {
+    let mut ranges: Vec<KeyRange> = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        let next = if j == b.len()
+            || (i < a.len()
+                && Cut::lower(&a[i].0)
+                    .partial_cmp(&Cut::lower(&b[j].0))?
+                    .is_le())
+        {
+            i += 1;
+            &a[i - 1]
+        } else {
+            j += 1;
+            &b[j - 1]
+        };
+        match ranges.last_mut() {
+            Some(last)
+                if Cut::lower(&next.0)
+                    .partial_cmp(&Cut::upper(&last.1))?
+                    .is_le() =>
+            {
+                if Cut::upper(&next.1)
+                    .partial_cmp(&Cut::upper(&last.1))?
+                    .is_gt()
+                {
+                    last.1 = next.1.clone();
+                }
+            }
+            _ => ranges.push(next.clone()),
         }
     }
     Some(ranges)
@@ -627,6 +708,14 @@ mod tests {
         format!("{key} IN ({})", (0..len).join(", "))
     }
 
+    fn ranges(key: &str, len: usize, start: usize) -> String {
+        let ranges = (0..len).map(|range| {
+            let lower = start + 2 * range;
+            format!("({key} > {lower} AND {key} < {})", lower + 2)
+        });
+        format!("({})", ranges.format(" OR "))
+    }
+
     // A SQL filter reaches the planner after two optimizer passes, one when the
     // scanner parses it and one in `create_filter_plan`.
     fn conjuncts(predicate: &str, passes: usize) -> Vec<Expr> {
@@ -709,6 +798,59 @@ mod tests {
     #[case::between_after_lower_bound(
         "tenant > 10 AND tenant BETWEEN 0 AND 100",
         planned("TupleQuery[tenant > 10 AND tenant <= 100]", &[], &[])
+    )]
+    #[case::or_of_ranges(
+        "tenant < 1 OR tenant > 5",
+        planned("TupleQuery[(tenant < 1 OR tenant > 5)]", &[], &[])
+    )]
+    #[case::or_of_ranges_after_equality(
+        "tenant = 1 AND (ts < 1 OR ts > 5)",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR ts > 5)]", &[], &[])
+    )]
+    #[case::or_of_ranges_apart_at_excluded_value(
+        "tenant = 1 AND (ts < 10 OR ts > 10)",
+        planned("TupleQuery[tenant = 1, (ts < 10 OR ts > 10)]", &[], &[])
+    )]
+    #[case::or_of_overlapping_ranges(
+        "tenant = 1 AND (ts < 10 OR ts BETWEEN 5 AND 20)",
+        planned("TupleQuery[tenant = 1, ts <= 20]", &[], &[])
+    )]
+    #[case::or_of_ranges_touching_at_excluded_value(
+        "tenant = 1 AND (ts < 10 OR ts >= 10)",
+        planned("TupleQuery[tenant = 1, ts IS NOT NULL]", &[], &[])
+    )]
+    #[case::or_of_ranges_touching_at_included_value(
+        "tenant = 1 AND (ts <= 10 OR ts > 10 AND ts < 20)",
+        planned("TupleQuery[tenant = 1, ts < 20]", &[], &[])
+    )]
+    #[case::or_intersected_with_range(
+        "tenant = 1 AND (ts < 1 OR ts > 5) AND ts < 20",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR (ts > 5 AND ts < 20))]", &[], &[])
+    )]
+    #[case::or_intersected_with_or(
+        "tenant = 1 AND (ts < 5 OR ts > 10) AND (ts < 1 OR ts > 19)",
+        planned("TupleQuery[tenant = 1, (ts < 1 OR ts > 19)]", &[], &[])
+    )]
+    #[case::or_intersected_to_empty(
+        "tenant = 1 AND (ts < 1 OR ts > 20) AND ts BETWEEN 5 AND 10",
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
+    )]
+    #[case::or_of_empty_ranges(
+        "tenant = 1 AND (ts > 20 AND ts < 10 OR ts > 5 AND ts < 5)",
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
+    )]
+    #[case::or_of_ranges_across_keys("tenant < 1 OR ts > 5", None)]
+    #[case::or_of_range_and_is_null(
+        "tenant = 1 AND (ts < 10 OR ts IS NULL)",
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::or_of_range_and_expression(
+        "tenant = 1 AND (ts < 10 OR ts % 7 = 0)",
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::or_of_ranges_on_bound_prefix(
+        "tenant = 1 AND (tenant < 0 OR tenant > 5) AND ts > 3",
+        planned("TupleQuery[tenant = 1, ts > 3]", &[1], &[])
     )]
     #[case::is_null_in_prefix(
         "tenant IS NULL AND ts = 10",
@@ -801,7 +943,10 @@ mod tests {
     #[case::not_equality("NOT tenant = 1", None)]
     #[case::not_equal("tenant != 1", None)]
     #[case::not_in("tenant NOT IN (1, 2)", None)]
-    #[case::not_between("tenant NOT BETWEEN 1 AND 2", None)]
+    #[case::not_between(
+        "tenant NOT BETWEEN 1 AND 2",
+        planned("TupleQuery[(tenant < 1 OR tenant > 2)]", &[], &[])
+    )]
     #[case::equality_on_second_key_only("ts = 10", None)]
     #[case::equality_on_later_keys_only("ts = 10 AND at = TIMESTAMP '2024-01-01 00:00:00'", None)]
     #[case::arrow_cast_of_key("tenant = arrow_cast(ts, 'Int32')", None)]
@@ -827,6 +972,36 @@ mod tests {
     #[case::cap_8193_values_beside_range(
         format!("{} AND tenant > 5", in_list("tenant", 8193)),
         planned("TupleQuery[tenant > 5]", &[0], &[])
+    )]
+    #[case::cap_64_ranges(
+        format!("tenant = 1 AND {}", ranges("ts", 64, 0)),
+        planned(format!("TupleQuery[tenant = 1, {}]", ranges("ts", 64, 0)), &[], &[])
+    )]
+    #[case::cap_65_ranges(
+        format!("tenant = 1 AND {}", ranges("ts", 65, 0)),
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::cap_127_ranges_after_intersection(
+        format!("tenant = 1 AND {} AND {}", ranges("ts", 64, 0), ranges("ts", 64, 1)),
+        planned(format!("TupleQuery[tenant = 1, {}]", ranges("ts", 64, 0)), &[2], &[])
+    )]
+    #[case::cap_64_terms_merged_into_one_range(
+        format!("tenant = 1 AND ({})", (1..=64).map(|v| format!("ts < {v}")).join(" OR ")),
+        planned("TupleQuery[tenant = 1, ts < 64]", &[], &[])
+    )]
+    #[case::cap_65_terms_merged_into_one_range(
+        format!("tenant = 1 AND ({})", (1..=65).map(|v| format!("ts < {v}")).join(" OR ")),
+        planned("TupleQuery[tenant = 1]", &[1], &[])
+    )]
+    #[case::cap_66_ranges_from_33_terms(
+        format!(
+            "tenant = 1 AND ({})",
+            (0..33)
+                .map(|v| (4 * v, 4 * v + 1, 4 * v + 2, 4 * v + 3))
+                .map(|(a, b, c, d)| format!("(ts BETWEEN {a} AND {d} AND (ts < {b} OR ts > {c}))"))
+                .join(" OR ")
+        ),
+        planned("TupleQuery[tenant = 1]", &[1], &[])
     )]
     fn plans_conjunctive_predicate(
         #[case] predicate: String,
@@ -920,6 +1095,10 @@ mod tests {
         "tenant = 1 AND ts < 20 AND ts BETWEEN 5 AND 10",
         planned("TupleQuery[tenant = 1, ts >= 5 AND ts <= 10]", &[], &[])
     )]
+    #[case::or_of_between_and_range(
+        "tenant = 1 AND (ts BETWEEN 1 AND 3 OR ts > 10)",
+        planned("TupleQuery[tenant = 1, ((ts >= 1 AND ts <= 3) OR ts > 10)]", &[], &[])
+    )]
     #[case::equals_null("tenant = NULL", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::null_range_bound(
         "tenant = 1 AND ts > NULL",
@@ -1003,6 +1182,15 @@ mod tests {
         let plan = plan_tuple_predicate(&conjuncts, &FIXTURE.keys).expect("tenant binds key 0");
         assert_eq!(plan.consumed, vec![&conjuncts[0]]);
         assert_eq!(plan.row_residual, vec![&conjuncts[1]]);
+    }
+
+    #[test]
+    fn or_over_two_keys_of_one_type_never_binds() {
+        let keys = Fields::from(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        check_plan(&[col("a").lt(lit(1)).or(col("b").gt(lit(5)))], &keys, None);
     }
 
     #[test]
