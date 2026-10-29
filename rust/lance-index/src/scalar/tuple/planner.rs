@@ -651,6 +651,18 @@ mod tests {
         "tenant > 1 AND tenant < 7",
         planned("TupleQuery[tenant > 1 AND tenant < 7]", &[], &[])
     )]
+    #[case::empty_range_lower_above_upper(
+        "tenant = 1 AND ts > 20 AND ts < 10",
+        planned("TupleQuery[tenant = 1, ts > 20 AND ts < 10]", &[], &[])
+    )]
+    #[case::empty_range_equal_bounds_both_excluded(
+        "tenant = 1 AND ts > 5 AND ts < 5",
+        planned("TupleQuery[tenant = 1, ts > 5 AND ts < 5]", &[], &[])
+    )]
+    #[case::empty_range_equal_bounds_one_excluded(
+        "tenant = 1 AND ts >= 5 AND ts < 5",
+        planned("TupleQuery[tenant = 1, ts >= 5 AND ts < 5]", &[], &[])
+    )]
     #[case::second_lower_bound(
         "tenant = 1 AND ts > 5 AND ts >= 10",
         planned("TupleQuery[tenant = 1, ts > 5]", &[2], &[])
