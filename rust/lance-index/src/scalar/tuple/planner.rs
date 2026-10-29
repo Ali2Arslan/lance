@@ -20,17 +20,13 @@
 //!   [`MAX_PREFIX_TUPLES`] distinct values never binds, even when an earlier
 //!   key's set is empty.
 //! - `key < v`, `key <= v`, `key > v`, `key >= v`, `key BETWEEN v AND w`, and
-//!   `key IS NOT NULL` bound the key after the prefix. In input order, each one
-//!   binds only when every finite bound it carries is still open, because a
-//!   conjunct is consumed whole or not at all. So in an unoptimized
-//!   `a < 20 AND a BETWEEN 5 AND 10`, the `BETWEEN` stays in the key residual.
-//!   [`Planner::optimize_expr`] splits `BETWEEN` into two bounds, so in
-//!   `a > 0 AND a BETWEEN 1 AND 10`, `a > 0` binds the lower bound, `a <= 10`
-//!   binds the upper bound, and `a >= 1` stays in the key residual.
+//!   `key IS NOT NULL` bound the key after the prefix. Each such conjunct on
+//!   that key binds, and the query keeps the intersection of their ranges. So
+//!   `a > 0 AND a BETWEEN 1 AND 10` binds `a >= 1 AND a <= 10`.
 //! - Every other conjunct that reads only key columns joins the key residual,
 //!   which the index evaluates on decoded keys. This includes any other OR or
-//!   NOT, `!=`, `NOT IN`, expressions over keys, conjuncts on keys after the
-//!   range, and a bound on a side that an earlier conjunct already bounds.
+//!   NOT, `!=`, `NOT IN`, expressions over keys, and conjuncts on keys after the
+//!   range.
 //! - A conjunct that reads any other column goes back to the caller untouched,
 //!   in the row residual. A column qualified by a relation, such as `l.tenant`,
 //!   counts as outside the key, because the keys carry no relation to match it.
@@ -59,7 +55,7 @@ use datafusion_expr::utils::split_binary;
 use datafusion_expr::{Expr, Operator};
 use lance_datafusion::expr::safe_coerce_scalar;
 
-use super::{KeyRange, KeyValues, TupleQuery};
+use super::{Cut, KeyRange, KeyValues, TupleQuery};
 
 /// The most prefix tuples one planned [`TupleQuery`] may cover.
 ///
@@ -89,7 +85,7 @@ pub struct TuplePlan<'a> {
 
 enum Constraint {
     Values { key: usize, values: KeyValues },
-    Range { key: usize, range: KeyRange },
+    Ranges { key: usize, ranges: Vec<KeyRange> },
 }
 
 /// Plan `conjuncts`, the terms of an AND, as one query over `keys`, the index's
@@ -177,11 +173,11 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         prefix.push(values);
     }
 
-    let mut range: Option<KeyRange> = None;
+    let mut ranges: Option<Vec<KeyRange>> = None;
     for (position, (_, constraint)) in key_conjuncts.iter().enumerate() {
-        let Some(Constraint::Range {
+        let Some(Constraint::Ranges {
             key,
-            range: (lower, upper),
+            ranges: conjunct_ranges,
         }) = constraint
         else {
             continue;
@@ -189,21 +185,18 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         if *key != prefix.len() {
             continue;
         }
-        let bound = range.get_or_insert((Bound::Unbounded, Bound::Unbounded));
-        let lower_fits = matches!(lower, Bound::Unbounded) || matches!(bound.0, Bound::Unbounded);
-        let upper_fits = matches!(upper, Bound::Unbounded) || matches!(bound.1, Bound::Unbounded);
-        if lower_fits && upper_fits {
-            if matches!(bound.0, Bound::Unbounded) {
-                bound.0 = lower.clone();
-            }
-            if matches!(bound.1, Bound::Unbounded) {
-                bound.1 = upper.clone();
-            }
-            is_consumed[position] = true;
-        }
+        let bound = match &ranges {
+            None => conjunct_ranges.clone(),
+            Some(bound) => match intersect(bound, conjunct_ranges) {
+                Some(bound) => bound,
+                None => continue,
+            },
+        };
+        ranges = Some(bound);
+        is_consumed[position] = true;
     }
 
-    if prefix.is_empty() && range.is_none() {
+    if prefix.is_empty() && ranges.is_none() {
         return None;
     }
     let mut consumed = Vec::new();
@@ -219,7 +212,7 @@ pub fn plan_tuple_predicate<'a>(conjuncts: &'a [Expr], keys: &Fields) -> Option<
         query: TupleQuery {
             keys: keys.clone(),
             prefix,
-            range,
+            ranges,
         },
         consumed,
         key_residual,
@@ -236,6 +229,23 @@ fn set_size(values: &KeyValues) -> usize {
 
 fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
     match conjunct {
+        Expr::IsNull(expr) => Some(Constraint::Values {
+            key: key_column(expr, keys)?.0,
+            values: KeyValues::Null,
+        }),
+        Expr::BinaryExpr(BinaryExpr {
+            op: Operator::Eq | Operator::Or,
+            ..
+        })
+        | Expr::InList(_)
+        | Expr::Column(_)
+        | Expr::Not(_) => key_set(conjunct, keys),
+        _ => key_ranges(conjunct, keys).map(|(key, ranges)| Constraint::Ranges { key, ranges }),
+    }
+}
+
+fn key_ranges(expr: &Expr, keys: &Fields) -> Option<(usize, Vec<KeyRange>)> {
+    let (key, range) = match expr {
         Expr::BinaryExpr(BinaryExpr {
             left,
             op: op @ (Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq),
@@ -253,7 +263,7 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
                 Operator::GtEq => (Bound::Included(value), Bound::Unbounded),
                 _ => return None,
             };
-            Some(Constraint::Range { key, range })
+            (key, range)
         }
         Expr::Between(Between {
             expr,
@@ -264,26 +274,44 @@ fn constraint(conjunct: &Expr, keys: &Fields) -> Option<Constraint> {
             let (key, field) = key_column(expr, keys)?;
             let low = bound(low, field.data_type())?;
             let high = bound(high, field.data_type())?;
-            let range = (Bound::Included(low), Bound::Included(high));
-            Some(Constraint::Range { key, range })
+            (key, (Bound::Included(low), Bound::Included(high)))
         }
-        Expr::IsNull(expr) => Some(Constraint::Values {
-            key: key_column(expr, keys)?.0,
-            values: KeyValues::Null,
-        }),
-        Expr::IsNotNull(expr) => Some(Constraint::Range {
-            key: key_column(expr, keys)?.0,
-            range: (Bound::Unbounded, Bound::Unbounded),
-        }),
-        Expr::BinaryExpr(BinaryExpr {
-            op: Operator::Eq | Operator::Or,
-            ..
-        })
-        | Expr::InList(_)
-        | Expr::Column(_)
-        | Expr::Not(_) => key_set(conjunct, keys),
-        _ => None,
+        Expr::IsNotNull(expr) => (
+            key_column(expr, keys)?.0,
+            (Bound::Unbounded, Bound::Unbounded),
+        ),
+        _ => return None,
+    };
+    Some((key, union_of(range)?))
+}
+
+fn union_of(range: KeyRange) -> Option<Vec<KeyRange>> {
+    let is_empty = Cut::lower(&range.0)
+        .partial_cmp(&Cut::upper(&range.1))?
+        .is_ge();
+    Some(if is_empty { Vec::new() } else { vec![range] })
+}
+
+fn intersect(a: &[KeyRange], b: &[KeyRange]) -> Option<Vec<KeyRange>> {
+    let mut ranges = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let a_starts_last = Cut::lower(&a[i].0)
+            .partial_cmp(&Cut::lower(&b[j].0))?
+            .is_ge();
+        let a_ends_first = Cut::upper(&a[i].1)
+            .partial_cmp(&Cut::upper(&b[j].1))?
+            .is_le();
+        let lower = if a_starts_last { &a[i].0 } else { &b[j].0 };
+        let upper = if a_ends_first { &a[i].1 } else { &b[j].1 };
+        ranges.extend(union_of((lower.clone(), upper.clone()))?);
+        if a_ends_first {
+            i += 1;
+        } else {
+            j += 1;
+        }
     }
+    Some(ranges)
 }
 
 fn key_column<'k>(expr: &Expr, keys: &'k Fields) -> Option<(usize, &'k FieldRef)> {
@@ -556,7 +584,7 @@ mod tests {
         let revalidated = TupleQuery::try_new(
             query.keys().clone(),
             query.prefix().to_vec(),
-            query.range().cloned(),
+            query.ranges().map(<[_]>::to_vec),
         )
         .unwrap();
         assert_eq!(&revalidated, query);
@@ -664,23 +692,23 @@ mod tests {
     )]
     #[case::empty_range_lower_above_upper(
         "tenant = 1 AND ts > 20 AND ts < 10",
-        planned("TupleQuery[tenant = 1, ts > 20 AND ts < 10]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::empty_range_equal_bounds_both_excluded(
         "tenant = 1 AND ts > 5 AND ts < 5",
-        planned("TupleQuery[tenant = 1, ts > 5 AND ts < 5]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::empty_range_equal_bounds_one_excluded(
         "tenant = 1 AND ts >= 5 AND ts < 5",
-        planned("TupleQuery[tenant = 1, ts >= 5 AND ts < 5]", &[], &[])
+        planned("TupleQuery[tenant = 1, FALSE]", &[], &[])
     )]
     #[case::second_lower_bound(
         "tenant = 1 AND ts > 5 AND ts >= 10",
-        planned("TupleQuery[tenant = 1, ts > 5]", &[2], &[])
+        planned("TupleQuery[tenant = 1, ts >= 10]", &[], &[])
     )]
     #[case::between_after_lower_bound(
         "tenant > 10 AND tenant BETWEEN 0 AND 100",
-        planned("TupleQuery[tenant > 10 AND tenant <= 100]", &[1], &[])
+        planned("TupleQuery[tenant > 10 AND tenant <= 100]", &[], &[])
     )]
     #[case::is_null_in_prefix(
         "tenant IS NULL AND ts = 10",
@@ -890,7 +918,7 @@ mod tests {
     )]
     #[case::between_after_upper_bound(
         "tenant = 1 AND ts < 20 AND ts BETWEEN 5 AND 10",
-        planned("TupleQuery[tenant = 1, ts < 20]", &[2], &[])
+        planned("TupleQuery[tenant = 1, ts >= 5 AND ts <= 10]", &[], &[])
     )]
     #[case::equals_null("tenant = NULL", planned("TupleQuery[FALSE]", &[], &[]))]
     #[case::null_range_bound(
