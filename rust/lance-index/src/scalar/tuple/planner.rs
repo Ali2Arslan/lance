@@ -569,6 +569,7 @@ mod tests {
         let flag = [None, Some(false), Some(true)];
         let x = [
             None,
+            Some(-f64::NAN),
             Some(f64::NEG_INFINITY),
             Some(-1.5),
             Some(-0.0),
@@ -579,9 +580,15 @@ mod tests {
         ];
         let (tenants, ts, at, status, flag, x): (Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>, Vec<_>) =
             iproduct!(tenants, ts, at, status, flag, x).multiunzip();
+        // Rust leaves the sign of a NaN cast to f32 unspecified.
         let y = x
             .iter()
-            .map(|value| value.map(|value| value as f32))
+            .map(|value| {
+                value.map(|value| {
+                    let sign = if value.is_sign_negative() { -1.0 } else { 1.0 };
+                    (value as f32).copysign(sign)
+                })
+            })
             .collect::<Vec<_>>();
         let rows = RecordBatch::try_new(
             schema.clone(),
@@ -1057,11 +1064,26 @@ mod tests {
         "x = 0.0 AND tenant = 1",
         planned("TupleQuery[x IN (-0, 0), tenant = 1]", &[], &[])
     )]
+    #[case::at_least_zero_or_negative_nan(
+        "x",
+        "x >= -0.0 OR x < CAST('-inf' AS DOUBLE)",
+        planned("TupleQuery[(x < -inf OR x >= -0)]", &[], &[])
+    )]
+    #[case::above_negative_infinity_or_negative_nan(
+        "x",
+        "x > CAST('-inf' AS DOUBLE) OR x < CAST('-inf' AS DOUBLE)",
+        planned("TupleQuery[(x < -inf OR x > -inf)]", &[], &[])
+    )]
     // DataFusion's SQL parser types a bare `0.0` as DOUBLE and casts `y` to match.
     #[case::float32_equals_zero(
         "y",
         "y = CAST(0.0 AS REAL)",
         planned("TupleQuery[y IN (-0, 0)]", &[], &[])
+    )]
+    #[case::float32_at_least_zero_or_negative_nan(
+        "y",
+        "y >= CAST(-0.0 AS REAL) OR y < CAST('-inf' AS REAL)",
+        planned("TupleQuery[(y < -inf OR y >= -0)]", &[], &[])
     )]
     fn plans_predicate_on_float_key(
         #[case] float_key: &str,
