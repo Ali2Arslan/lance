@@ -4,6 +4,7 @@
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 use lance_index_core::remapping::{BatchRowIdRemapper, remap_record_batch_async};
+use lance_index_core::scalar::OrderedScalarIndex;
 use std::{
     any::Any,
     cmp::Ordering,
@@ -3064,13 +3065,8 @@ impl ScalarIndex for BTreeIndex {
         )))
     }
 
-    async fn search_ordered(
-        &self,
-        query: Option<&dyn AnyQuery>,
-        options: SortOptions,
-        metrics: Arc<dyn MetricsCollector>,
-    ) -> Result<SendableRecordBatchStream> {
-        self.search_ordered_stream(query, options, metrics)
+    fn as_ordered(&self) -> Option<&dyn OrderedScalarIndex> {
+        Some(self)
     }
 
     fn lookup<'a>(

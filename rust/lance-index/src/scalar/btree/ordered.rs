@@ -44,6 +44,7 @@ use lance_core::deepsize::{Context, DeepSizeOf};
 use lance_core::utils::tracing::{IO_TYPE_LOAD_SCALAR_PART, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_index_core::remapping::remap_record_batch_async;
+use lance_index_core::scalar::OrderedScalarIndex;
 use tracing::info;
 
 use super::{
@@ -88,8 +89,8 @@ enum ValuePages {
     Matched(Vec<Matches>),
 }
 
-impl BTreeIndex {
-    pub(super) fn search_ordered_stream(
+impl OrderedScalarIndex for BTreeIndex {
+    fn search_ordered(
         &self,
         query: Option<&dyn AnyQuery>,
         options: SortOptions,
@@ -130,7 +131,9 @@ impl BTreeIndex {
             .map_err(DataFusionError::from);
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, batches)))
     }
+}
 
+impl BTreeIndex {
     fn plan_walk(
         &self,
         lookup: CheckedLookup<'_>,
@@ -667,8 +670,9 @@ mod tests {
         metrics: Arc<dyn MetricsCollector>,
     ) -> Vec<Row> {
         let batches: Vec<RecordBatch> = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(query.map(|query| query as &dyn AnyQuery), options, metrics)
-            .await
             .unwrap()
             .try_collect()
             .await
@@ -1141,8 +1145,9 @@ mod tests {
 
         let first_row = Arc::new(LocalMetricsCollector::default());
         let mut stream = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(Some(&query), options, first_row.clone())
-            .await
             .unwrap();
         stream.try_next().await.unwrap().unwrap();
         assert_eq!(
@@ -1304,12 +1309,13 @@ mod tests {
         let options = order(descending, true);
 
         let batches: Vec<RecordBatch> = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(
                 Some(&query.query(&literal_type)),
                 options,
                 Arc::new(NoOpMetricsCollector),
             )
-            .await
             .unwrap()
             .try_collect()
             .await
@@ -1354,12 +1360,13 @@ mod tests {
         let query = SargableQuery::LikePrefix(prefix.clone());
 
         let error = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(
                 Some(&query),
                 order(false, true),
                 Arc::new(NoOpMetricsCollector),
             )
-            .await
             .err()
             .expect("a LIKE prefix that is not a string has no key range");
 
@@ -1378,12 +1385,13 @@ mod tests {
         let query = SargableQuery::FullTextSearch(FullTextSearchQuery::new("ap".to_string()));
 
         let error = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(
                 Some(&query),
                 order(false, true),
                 Arc::new(NoOpMetricsCollector),
             )
-            .await
             .err()
             .expect("a B-tree cannot answer full text search");
 
@@ -1468,8 +1476,9 @@ mod tests {
             );
         } else {
             let error = index
+                .as_ordered()
+                .unwrap()
                 .search_ordered(None, options, Arc::new(NoOpMetricsCollector))
-                .await
                 .err()
                 .expect("an out-of-order lookup must not yield a stream");
             assert!(matches!(error, Error::NotSupported { .. }), "{error}");
@@ -1520,8 +1529,9 @@ mod tests {
             ),
         ] {
             let error = index
+                .as_ordered()
+                .unwrap()
                 .search_ordered(None, order(false, true), Arc::new(NoOpMetricsCollector))
-                .await
                 .err()
                 .unwrap_or_else(|| {
                     panic!("{name}: an out-of-order lookup must not yield a stream")
@@ -1576,9 +1586,11 @@ mod tests {
         let mut errors = Vec::new();
         for _ in 0..2 {
             let metrics = Arc::new(LocalMetricsCollector::default());
-            let result = index
-                .search_ordered(None, order(false, true), metrics.clone())
-                .await;
+            let result = index.as_ordered().unwrap().search_ordered(
+                None,
+                order(false, true),
+                metrics.clone(),
+            );
             comparisons.push(metrics.comparisons.load(AtomicOrdering::Relaxed));
             errors.push(result.err().map(|error| {
                 assert!(matches!(error, Error::NotSupported { .. }), "{error}");
@@ -1607,16 +1619,18 @@ mod tests {
         let unpolled = Arc::new(LocalMetricsCollector::default());
         drop(
             index
+                .as_ordered()
+                .unwrap()
                 .search_ordered(None, options, unpolled.clone())
-                .await
                 .unwrap(),
         );
         assert_eq!(parts_loaded(&unpolled), 0, "opening a stream reads no page");
 
         let first_ten = Arc::new(LocalMetricsCollector::default());
         let mut stream = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(None, options, first_ten.clone())
-            .await
             .unwrap();
         let mut taken = 0;
         while taken < 10 {
@@ -1669,8 +1683,9 @@ mod tests {
         assert!(page_reads > 0, "a page read reaches the object store");
 
         let mut stream = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(None, order(false, true), Arc::new(NoOpMetricsCollector))
-            .await
             .unwrap();
         stream.try_next().await.unwrap().unwrap();
         assert_eq!(
@@ -1705,8 +1720,9 @@ mod tests {
         .unwrap();
 
         let stream = index
+            .as_ordered()
+            .unwrap()
             .search_ordered(None, order(false, true), Arc::new(NoOpMetricsCollector))
-            .await
             .unwrap();
 
         assert_eq!(stream.schema().field(1).name(), expected);

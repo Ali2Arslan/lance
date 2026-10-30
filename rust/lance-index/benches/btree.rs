@@ -908,12 +908,13 @@ async fn ordered_first_k(
     options: SortOptions,
 ) -> usize {
     let mut stream = index
+        .as_ordered()
+        .unwrap()
         .search_ordered(
             query.map(|query| query as &dyn AnyQuery),
             options,
             Arc::new(NoOpMetricsCollector),
         )
-        .await
         .unwrap();
     let mut rows = 0;
     while rows < ORDERED_FIRST_K {
