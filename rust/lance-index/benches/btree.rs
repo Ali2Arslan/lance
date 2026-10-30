@@ -927,7 +927,7 @@ async fn ordered_first_k(
 }
 
 /// Training reads `_rowaddr`, which the generators in `common` do not write.
-async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
+async fn create_int_unique_row_addr_index(tempdir: &tempfile::TempDir) -> Arc<dyn ScalarIndex> {
     let stream = gen_batch()
         .col("value", array::step::<Int64Type>())
         .col(ROW_ADDR, array::step::<UInt64Type>())
@@ -935,7 +935,6 @@ async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
             RowCount::from(BATCH_SIZE),
             BatchCount::from(NUM_BATCHES as u32),
         );
-    let tempdir = tempfile::tempdir().unwrap();
     let store = Arc::new(LanceIndexStore::new(
         Arc::new(ObjectStore::local()),
         Path::from_filesystem_path(tempdir.path()).unwrap(),
@@ -944,7 +943,6 @@ async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
     train_btree_index(stream, store.as_ref(), DEFAULT_BTREE_BATCH_SIZE, None, None)
         .await
         .unwrap();
-    let _ = tempdir.keep();
     let details = prost_types::Any::from_msg(&pbold::BTreeIndexDetails::default()).unwrap();
     BTreeIndexPlugin
         .load_index(
@@ -962,10 +960,11 @@ async fn create_int_unique_row_addr_index() -> Arc<dyn ScalarIndex> {
 /// whole index.
 fn bench_ordered_first_k(c: &mut Criterion) {
     let rt = get_runtime();
+    let tempdir = tempfile::tempdir().unwrap();
     let lazy_index = OnceCell::new();
     let index = || {
         lazy_index
-            .get_or_init(|| rt.block_on(create_int_unique_row_addr_index()))
+            .get_or_init(|| rt.block_on(create_int_unique_row_addr_index(&tempdir)))
             .clone()
     };
     let range_size = TOTAL_ROWS / 100;
