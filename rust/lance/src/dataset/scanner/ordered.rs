@@ -10,7 +10,7 @@ use lance_file::version::ConcreteFileVersion;
 use lance_index::scalar::AnyQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::registry::IndexOrderingCapability;
-use lance_table::format::IndexMetadata;
+use roaring::RoaringBitmap;
 
 use super::{FilterPlan, Scanner};
 use crate::index::DatasetIndexExt;
@@ -151,22 +151,25 @@ impl Scanner {
                 continue;
             }
             let segments = load_named_scalar_segments(&self.dataset, column, &index.name).await?;
-            let Ok([segment]) = <[IndexMetadata; 1]>::try_from(segments) else {
-                continue;
-            };
-            let Some(coverage) = &segment.fragment_bitmap else {
-                continue;
-            };
-            if !self
-                .dataset
-                .fragments()
+            let Some(indexed) = segments
                 .iter()
-                .all(|fragment| coverage.contains(fragment.id as u32))
+                .try_fold(RoaringBitmap::new(), |indexed, segment| {
+                    Some(indexed | segment.fragment_bitmap.as_ref()?)
+                })
+            else {
+                continue;
+            };
+            if segments.is_empty()
+                || !self
+                    .dataset
+                    .fragments()
+                    .iter()
+                    .all(|fragment| indexed.contains(fragment.id as u32))
             {
                 continue;
             }
             let scan =
-                OrderedIndexScanExec::try_new(self.dataset.clone(), segment, query, options, None)
+                OrderedIndexScanExec::try_new(self.dataset.clone(), segments, query, options, None)
                     .await?;
             return Ok(Some(scan));
         }
@@ -191,6 +194,7 @@ mod tests {
     use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, utils::address::RowAddress};
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
+    use lance_index::optimize::OptimizeOptions;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -530,10 +534,144 @@ mod tests {
         .unwrap()
     }
 
+    async fn segmented_dataset(segment_fragments: &[&[u32]]) -> Dataset {
+        let mut dataset = write("memory://", WriteParams::default()).await;
+        let mut segments = Vec::new();
+        for fragment_ids in segment_fragments {
+            let segment = dataset
+                .create_index_builder(&["ts"], IndexType::BTree, &btree())
+                .name(INDEX.into())
+                .fragments(fragment_ids.to_vec())
+                .execute_uncommitted()
+                .await
+                .unwrap();
+            segments.push(segment);
+        }
+        dataset
+            .commit_existing_index_segments(INDEX, "ts", segments)
+            .await
+            .unwrap();
+        delete(&mut dataset).await;
+        dataset
+    }
+
+    async fn recommit_segment(dataset: &mut Dataset, segment: IndexMetadata, fragments: &[u32]) {
+        let recommitted = IndexMetadata {
+            fragment_bitmap: Some(fragments.iter().copied().collect()),
+            ..segment.clone()
+        };
+        let transaction = Transaction::new(
+            dataset.version().version,
+            Operation::CreateIndex {
+                new_indices: vec![recommitted],
+                removed_indices: vec![segment],
+            },
+            None,
+        );
+        dataset
+            .apply_commit(transaction, &Default::default(), &Default::default())
+            .await
+            .unwrap();
+    }
+
+    #[derive(Debug)]
+    enum Segments {
+        AppendedAndOptimized,
+        OnePerFragment,
+        OneEmptiedByDeletes,
+        FragmentClaimedTwice,
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ordered_read_merges_index_segments(
+        #[values(
+            Segments::AppendedAndOptimized,
+            Segments::OnePerFragment,
+            Segments::OneEmptiedByDeletes,
+            Segments::FragmentClaimedTwice
+        )]
+        segments: Segments,
+        #[values(true, false)] ascending: bool,
+        #[values(true, false)] nulls_first: bool,
+        #[values(None, Some("ts BETWEEN 20 AND 80"))] filter: Option<&str>,
+    ) {
+        let (dataset, count) = match segments {
+            Segments::AppendedAndOptimized => {
+                let mut dataset = dataset(WriteParams::default()).await;
+                let batch = rows(ROWS..ROWS + 30);
+                dataset
+                    .append(
+                        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                dataset
+                    .optimize_indices(&OptimizeOptions::append())
+                    .await
+                    .unwrap();
+                (dataset, 2)
+            }
+            Segments::OnePerFragment => (segmented_dataset(&[&[0], &[1], &[2]]).await, 3),
+            Segments::OneEmptiedByDeletes => {
+                let mut dataset = segmented_dataset(&[&[0], &[1], &[2]]).await;
+                dataset.delete("id >= 200").await.unwrap();
+                (dataset, 2)
+            }
+            Segments::FragmentClaimedTwice => {
+                // The commit finds the overlap and recomputes each segment's
+                // coverage from its rows, so the scan sees disjoint segments.
+                let mut dataset = segmented_dataset(&[&[0, 1], &[2]]).await;
+                let last = dataset
+                    .load_indices_by_name(INDEX)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(2))
+                    .unwrap();
+                recommit_segment(&mut dataset, last, &[1, 2]).await;
+                (dataset, 2)
+            }
+        };
+        let ordering = ColumnOrdering {
+            ascending,
+            nulls_first,
+            column_name: "ts".into(),
+        };
+        let order = SortOptions {
+            descending: !ascending,
+            nulls_first,
+        };
+        for (columns, limit, offset) in [(&["v"][..], 7, 0), (&["ts", "v"][..], 5, 4)] {
+            let configure = |scanner: &mut Scanner| {
+                scanner
+                    .project(columns)
+                    .unwrap()
+                    .order_by(Some(vec![ordering.clone()]))
+                    .unwrap()
+                    .limit(Some(limit), Some(offset))
+                    .unwrap();
+                if let Some(filter) = filter {
+                    scanner.filter(filter).unwrap();
+                }
+            };
+            let node = format!(
+                "OrderedIndexScan: index={INDEX}, segments={count}, order=[ts {order}], fetch={}",
+                offset + limit
+            );
+            let rows = assert_ordered_read(&dataset, configure, Expect::OrderedScan(&node)).await;
+            if offset == 0 {
+                assert!(rows.num_rows() > 0, "{filter:?} selects live rows");
+            }
+        }
+    }
+
     #[derive(Debug)]
     enum IndexShape {
         AppendedFragment,
-        TwoSegments,
+        SegmentsMissingAFragment,
+        SegmentWithNewerKeyOverlay,
         BitmapIndex,
         NestedKey,
         LegacyStorage,
@@ -562,28 +700,12 @@ mod tests {
         assert_eq!(updated.rows_updated, 6);
         let mut dataset = Arc::unwrap_or_clone(updated.new_dataset);
         let index = dataset.load_indices_by_name(INDEX).await.unwrap().remove(0);
-        let claimed = IndexMetadata {
-            fragment_bitmap: Some(
-                dataset
-                    .fragments()
-                    .iter()
-                    .map(|fragment| fragment.id as u32)
-                    .collect(),
-            ),
-            ..index.clone()
-        };
-        let transaction = Transaction::new(
-            dataset.version().version,
-            Operation::CreateIndex {
-                new_indices: vec![claimed],
-                removed_indices: vec![index],
-            },
-            None,
-        );
-        dataset
-            .apply_commit(transaction, &Default::default(), &Default::default())
-            .await
-            .unwrap();
+        let fragments = dataset
+            .fragments()
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<Vec<_>>();
+        recommit_segment(&mut dataset, index, &fragments).await;
         dataset
     }
 
@@ -592,7 +714,8 @@ mod tests {
     async fn test_ordered_read_declines_index_shapes(
         #[values(
             IndexShape::AppendedFragment,
-            IndexShape::TwoSegments,
+            IndexShape::SegmentsMissingAFragment,
+            IndexShape::SegmentWithNewerKeyOverlay,
             IndexShape::BitmapIndex,
             IndexShape::NestedKey,
             IndexShape::LegacyStorage,
@@ -619,25 +742,15 @@ mod tests {
                     .unwrap();
                 dataset
             }
-            IndexShape::TwoSegments => {
-                let mut dataset = write("memory://", WriteParams::default()).await;
-                let mut segments = Vec::new();
-                for fragment_ids in [vec![0, 1], vec![2]] {
-                    let segment = dataset
-                        .create_index_builder(&["ts"], IndexType::BTree, &btree())
-                        .name(INDEX.into())
-                        .fragments(fragment_ids)
-                        .execute_uncommitted()
-                        .await
-                        .unwrap();
-                    segments.push(segment);
-                }
-                dataset
-                    .commit_existing_index_segments(INDEX, "ts", segments)
-                    .await
-                    .unwrap();
-                delete(&mut dataset).await;
-                dataset
+            IndexShape::SegmentsMissingAFragment => segmented_dataset(&[&[0], &[2]]).await,
+            IndexShape::SegmentWithNewerKeyOverlay => {
+                let key_in_fragment_2 = 250;
+                overlay_key(
+                    segmented_dataset(&[&[0, 1], &[2]]).await,
+                    key_in_fragment_2,
+                    -1,
+                )
+                .await
             }
             IndexShape::BitmapIndex => {
                 let mut dataset = dataset(WriteParams::default()).await;

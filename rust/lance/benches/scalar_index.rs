@@ -7,7 +7,7 @@ use arrow_array::{
     RecordBatchReader,
     types::{UInt32Type, UInt64Type},
 };
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::dataset::WriteParams;
@@ -17,8 +17,9 @@ use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
-use lance_datagen::{BatchCount, RowCount, array, gen_batch};
+use lance_datagen::{BatchCount, DEFAULT_SEED, RowCount, Seed, array, gen_batch};
 use lance_index::IndexType;
+use lance_index::optimize::OptimizeOptions;
 use lance_index::scalar::{
     BuiltinIndexType, IndexStore, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
@@ -181,16 +182,29 @@ async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     assert_eq!(row_ids.true_rows().len(), Some(3));
 }
 
-async fn ordered_limit_dataset(tempdir: &TempStrDir) -> Dataset {
-    let data = gen_batch()
-        .col("ts", array::rand::<UInt64Type>())
-        .col("id", array::step::<UInt64Type>())
-        .into_reader_rows(RowCount::from(100_000), BatchCount::from(100));
+async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
+    const BATCHES: u32 = 100;
+    assert_eq!(
+        BATCHES % segments,
+        0,
+        "{segments} segments must split {BATCHES} batches evenly"
+    );
+    let batches_per_segment = BATCHES / segments;
+    let data = |segment: u32| {
+        gen_batch()
+            .with_seed(Seed::from(DEFAULT_SEED.0 + u64::from(segment)))
+            .col("ts", array::rand::<UInt64Type>())
+            .col("id", array::step::<UInt64Type>())
+            .into_reader_rows(
+                RowCount::from(100_000),
+                BatchCount::from(batches_per_segment),
+            )
+    };
     let params = WriteParams {
         max_rows_per_file: 1_000_000,
         ..Default::default()
     };
-    let mut dataset = Dataset::write(data, tempdir.as_str(), Some(params))
+    let mut dataset = Dataset::write(data(0), tempdir.as_str(), Some(params.clone()))
         .await
         .unwrap();
     dataset
@@ -203,6 +217,20 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir) -> Dataset {
         )
         .await
         .unwrap();
+    for segment in 1..segments {
+        dataset
+            .append(data(segment), Some(params.clone()))
+            .await
+            .unwrap();
+        dataset
+            .optimize_indices(&OptimizeOptions::append())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        dataset.load_indices_by_name("ts_idx").await.unwrap().len(),
+        segments as usize
+    );
     dataset
 }
 
@@ -264,26 +292,40 @@ fn bench_warm_indexed(c: &mut Criterion) {
 
 fn bench_ordered_limit(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let tempdir = TempStrDir::default();
-    let dataset = rt.block_on(ordered_limit_dataset(&tempdir));
     let mut group = c.benchmark_group("ordered_limit");
-    group.bench_function("ordered_index", |b| {
-        b.iter(|| rt.block_on(ordered_limit(&dataset, |_| {})));
-    });
-    group.bench_function("use_ordered_index_false", |b| {
-        b.iter(|| {
-            rt.block_on(ordered_limit(&dataset, |scanner| {
-                scanner.use_ordered_index(false);
-            }))
-        });
-    });
-    group.bench_function("declined_by_filter", |b| {
-        b.iter(|| {
-            rt.block_on(ordered_limit(&dataset, |scanner| {
-                scanner.filter("id >= 0").unwrap();
-            }))
-        });
-    });
+    for segments in [1, 4] {
+        let tempdir = TempStrDir::default();
+        let dataset = rt.block_on(ordered_limit_dataset(&tempdir, segments));
+        group.bench_with_input(
+            BenchmarkId::new("ordered_index", segments),
+            &dataset,
+            |b, dataset| {
+                b.iter(|| rt.block_on(ordered_limit(dataset, |_| {})));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("use_ordered_index_false", segments),
+            &dataset,
+            |b, dataset| {
+                b.iter(|| {
+                    rt.block_on(ordered_limit(dataset, |scanner| {
+                        scanner.use_ordered_index(false);
+                    }))
+                });
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("declined_by_filter", segments),
+            &dataset,
+            |b, dataset| {
+                b.iter(|| {
+                    rt.block_on(ordered_limit(dataset, |scanner| {
+                        scanner.filter("id >= 0").unwrap();
+                    }))
+                });
+            },
+        );
+    }
     group.finish();
 }
 

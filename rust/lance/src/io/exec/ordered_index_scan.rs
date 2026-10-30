@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Read one B-tree index segment in key order.
+//! Read a B-tree index in key order.
 //!
 //! [`OrderedIndexScanExec`] streams [`ScalarIndex::search_ordered`] and keeps
 //! only the rows the dataset still serves. Each index row falls in one of
@@ -26,18 +26,23 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
 use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
-use datafusion::execution::TaskContext;
+use datafusion::execution::{TaskContext, memory_pool::MemoryConsumer};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
     execution_plan::{Boundedness, EmissionType},
-    metrics::{Count, ExecutionPlanMetricsSet, MetricsSet},
+    metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricsSet},
+    sorts::streaming_merge::StreamingMergeBuilder,
+    stream::RecordBatchStreamAdapter,
 };
 use datafusion::scalar::ScalarValue;
-use datafusion_physical_expr::{EquivalenceProperties, PhysicalSortExpr, expressions::Column};
+use datafusion_physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
+};
+use futures::future::try_join_all;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use lance_core::{Error, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
+use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::scalar::{AnyQuery, ScalarIndex};
@@ -51,16 +56,17 @@ use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_f
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{Dataset, index::DatasetIndexInternalExt};
 
-/// Streams one segment of a B-tree index in key order as two columns: the key,
-/// named after the indexed column, then `_rowaddr`.
+/// Streams the segments of a B-tree index in key order as two columns: the
+/// key, named after the indexed column, then `_rowaddr`.
 ///
 /// Deleted rows and rows outside the fragment scope never reach the output, so
 /// they do not use up `fetch`. Rows with equal keys come in the order the
-/// index yields them. A fragment's deletion vector loads the first time the
-/// scan reaches one of its rows. Without a `fetch`, the scan reaches whole
-/// batches. With one, it first reaches the in-scope rows of a batch that the
-/// fetch still needs, then doubles the in-scope rows it has reached each time
-/// deleted rows use them up.
+/// index yields them within a segment, and the merge breaks key ties between
+/// segments by ascending `_rowaddr`. A fragment's deletion vector loads the
+/// first time the scan reaches one of its rows. Without a `fetch`, the scan
+/// reaches whole batches. With one, it first reaches the in-scope rows of a
+/// batch that the fetch still needs, then doubles the in-scope rows it has
+/// reached each time deleted rows use them up.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -70,9 +76,9 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 /// # use lance::io::exec::ordered_index_scan::OrderedIndexScanExec;
 /// # use lance::{Dataset, Result};
 /// # async fn test(dataset: Arc<Dataset>) -> Result<()> {
-/// let segment = dataset.load_indices_by_name("ts_idx").await?.remove(0);
+/// let segments = dataset.load_indices_by_name("ts_idx").await?;
 /// let newest_first = SortOptions { descending: true, nulls_first: false };
-/// let scan = OrderedIndexScanExec::try_new(dataset, segment, None, newest_first, None).await?;
+/// let scan = OrderedIndexScanExec::try_new(dataset, segments, None, newest_first, None).await?;
 /// let newest_ten = scan.with_fetch(Some(10));
 /// # Ok(())
 /// # }
@@ -80,41 +86,48 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 #[derive(Clone, Debug)]
 pub struct OrderedIndexScanExec {
     dataset: Arc<Dataset>,
-    segment: IndexMetadata,
-    index: Arc<dyn ScalarIndex>,
+    segments: Vec<SegmentScan>,
     column: String,
     query: Option<Arc<dyn AnyQuery>>,
     options: SortOptions,
-    scope: RoaringBitmap,
     fetch: Option<usize>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
+#[derive(Clone, Debug)]
+struct SegmentScan {
+    metadata: IndexMetadata,
+    index: Arc<dyn ScalarIndex>,
+    scope: RoaringBitmap,
+}
+
 impl OrderedIndexScanExec {
-    /// Plans an ordered read of `segment`, one segment of a single-column
+    /// Plans an ordered read of `segments`, the segments of a single-column
     /// B-tree index on `dataset`.
     ///
     /// `query` limits the read to the rows it selects, and `options` is the key
     /// order. `fragments`, when set, limits the output to rows in those
     /// fragments.
     ///
-    /// This opens the segment and checks that it can stream in key order
+    /// This opens every segment and checks that each can stream in key order
     /// without reading a data page, so a planner that gets an error can keep
     /// its sort.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidInput`] when the segment indexes more or fewer
+    /// Returns [`Error::InvalidInput`] when `segments` is empty or holds
+    /// segments of different indices, when a segment indexes more or fewer
     /// than one column, names a field the dataset does not have, or records no
     /// fragment coverage, or when the index rejects `query`.
     ///
     /// Returns [`Error::NotSupported`] in these cases:
     ///
-    /// - The dataset uses stable row ids and the segment stores them instead
+    /// - Two segments index the same fragment the scan reads.
+    /// - The dataset uses stable row ids and a segment stores them instead
     ///   of row addresses. Segments written before the row address migration
     ///   do.
-    /// - A data overlay committed after the segment changes the indexed column
+    /// - A data overlay committed after a segment changes the indexed column
     ///   in a fragment the scan reads.
     /// - The index cannot search in key order, because it is not a B-tree or
     ///   its pages are not in key order.
@@ -123,41 +136,30 @@ impl OrderedIndexScanExec {
     /// the column's.
     pub async fn try_new(
         dataset: Arc<Dataset>,
-        segment: IndexMetadata,
+        segments: Vec<IndexMetadata>,
         query: Option<Arc<dyn AnyQuery>>,
         options: SortOptions,
         fragments: Option<&RoaringBitmap>,
     ) -> Result<Self> {
-        let [field_id] = segment.fields[..] else {
+        let Some(first) = segments.first() else {
+            return Err(Error::invalid_input(
+                "ordered index scan needs at least one index segment",
+            ));
+        };
+        let [field_id] = first.fields[..] else {
             return Err(Error::invalid_input(format!(
                 "ordered index scan reads a single-column index, but segment {} of index '{}' \
                  has field ids {:?}",
-                segment.uuid, segment.name, segment.fields
+                first.uuid, first.name, first.fields
             )));
         };
-        let Some(coverage) = &segment.fragment_bitmap else {
-            return Err(Error::invalid_input(format!(
-                "ordered index scan needs fragment coverage, but segment {} of index '{}' \
-                 records none",
-                segment.uuid, segment.name
-            )));
-        };
-        let ids_are_addresses =
-            !dataset.manifest.uses_stable_row_ids() || segment.results_are_row_addrs();
-        if !ids_are_addresses {
-            return Err(Error::not_supported(format!(
-                "ordered index scan needs row addresses, but segment {} of index '{}' stores \
-                 stable row ids; rebuild the index to read it in order",
-                segment.uuid, segment.name
-            )));
-        }
         let schema = dataset.schema();
         let ancestry = schema.field_ancestry_by_id(field_id).unwrap_or_default();
         let [.., key] = ancestry.as_slice() else {
             return Err(Error::invalid_input(format!(
                 "ordered index scan reads field id {field_id}, but segment {} of index '{}' \
                  names a field the dataset schema does not have",
-                segment.uuid, segment.name
+                first.uuid, first.name
             )));
         };
         let column = schema.field_path_minimal(field_id)?;
@@ -173,47 +175,106 @@ impl OrderedIndexScanExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
-        let scope = match fragments {
-            Some(fragments) => coverage & fragments,
-            None => coverage.clone(),
-        };
 
-        // Dropping the stale rows is not enough: a row whose overlay moved its
-        // key into the requested range would be missing from the output.
-        if let Some((version, fragment_id)) = newer_key_overlay(&dataset, &segment, &scope)? {
-            return Err(Error::not_supported(format!(
-                "ordered index scan cannot read segment {} of index '{}' in key order: a data \
-                 overlay committed at version {version} changed column '{column}' in fragment \
-                 {fragment_id} after the segment was built at version {}; sort the rows instead",
-                segment.uuid, segment.name, segment.dataset_version
-            )));
+        let mut scanned = RoaringBitmap::new();
+        let mut scopes = Vec::with_capacity(segments.len());
+        for segment in &segments {
+            if segment.name != first.name || segment.fields != first.fields {
+                return Err(Error::invalid_input(format!(
+                    "ordered index scan merges the segments of one index, but segment {} is of \
+                     index '{}' on field ids {:?} and segment {} is of index '{}' on field ids \
+                     {:?}",
+                    first.uuid,
+                    first.name,
+                    first.fields,
+                    segment.uuid,
+                    segment.name,
+                    segment.fields
+                )));
+            }
+            let Some(coverage) = &segment.fragment_bitmap else {
+                return Err(Error::invalid_input(format!(
+                    "ordered index scan needs fragment coverage, but segment {} of index '{}' \
+                     records none",
+                    segment.uuid, segment.name
+                )));
+            };
+            let ids_are_addresses =
+                !dataset.manifest.uses_stable_row_ids() || segment.results_are_row_addrs();
+            if !ids_are_addresses {
+                return Err(Error::not_supported(format!(
+                    "ordered index scan needs row addresses, but segment {} of index '{}' stores \
+                     stable row ids; rebuild the index to read it in order",
+                    segment.uuid, segment.name
+                )));
+            }
+            let scope = match fragments {
+                Some(fragments) => coverage & fragments,
+                None => coverage.clone(),
+            };
+            if !scanned.is_disjoint(&scope) {
+                return Err(Error::not_supported(format!(
+                    "ordered index scan cannot merge segment {} of index '{}': it indexes \
+                     fragments {:?} that another segment also indexes",
+                    segment.uuid,
+                    segment.name,
+                    (&scanned & &scope).iter().collect::<Vec<_>>()
+                )));
+            }
+            scanned |= &scope;
+
+            // Dropping the stale rows is not enough: a row whose overlay moved its
+            // key into the requested range would be missing from the output.
+            if let Some((version, fragment_id)) = newer_key_overlay(&dataset, segment, &scope)? {
+                return Err(Error::not_supported(format!(
+                    "ordered index scan cannot read segment {} of index '{}' in key order: a \
+                     data overlay committed at version {version} changed column '{column}' in \
+                     fragment {fragment_id} after the segment was built at version {}; sort \
+                     the rows instead",
+                    segment.uuid, segment.name, segment.dataset_version
+                )));
+            }
+            scopes.push(scope);
         }
 
-        let index = dataset
-            .open_scalar_index(&column, &segment.uuid, &NoOpMetricsCollector)
-            .await?;
+        let segments = try_join_all(segments.into_iter().zip(scopes).map(|(metadata, scope)| {
+            let (dataset, column) = (&dataset, &column);
+            async move {
+                let index = dataset
+                    .open_scalar_index(column, &metadata.uuid, &NoOpMetricsCollector)
+                    .await?;
+                Result::Ok(SegmentScan {
+                    metadata,
+                    index,
+                    scope,
+                })
+            }
+        }))
+        .await?;
         let plan = Self {
             dataset,
-            segment,
-            index,
+            segments,
             column,
             query,
             options,
-            scope,
             fetch: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         };
-        plan.checked_ordered_stream(Arc::new(NoOpMetricsCollector))
-            .await?;
+        let preflights = plan
+            .segments
+            .iter()
+            .map(|segment| plan.checked_ordered_stream(segment, Arc::new(NoOpMetricsCollector)));
+        try_join_all(preflights).await?;
         Ok(plan)
     }
 
     async fn checked_ordered_stream(
         &self,
+        segment: &SegmentScan,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<SendableRecordBatchStream> {
-        let batches = self
+        let batches = segment
             .index
             .search_ordered(self.query.as_deref(), self.options, metrics)
             .await?;
@@ -230,8 +291,8 @@ impl OrderedIndexScanExec {
             return Err(Error::index(format!(
                 "ordered index scan expects segment {} of index '{}' to return column '{}' as \
                  {key_type} and row ids as UInt64, but it returned [{}]",
-                self.segment.uuid,
-                self.segment.name,
+                segment.metadata.uuid,
+                segment.metadata.name,
                 self.column,
                 returned_fields.join(", ")
             )));
@@ -242,23 +303,55 @@ impl OrderedIndexScanExec {
     async fn live_rows(
         self,
         partition: usize,
-    ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send> {
-        let pages_loaded = Arc::new(PagesLoaded(
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let pages_loaded: Arc<dyn MetricsCollector> = Arc::new(PagesLoaded(
             self.metrics.new_count("pages_loaded", partition),
         ));
-        let batches = self.checked_ordered_stream(pages_loaded).await?;
-        Ok(LiveRows {
-            schema: self.schema(),
-            batches,
-            dataset: self.dataset,
-            scope: self.scope,
-            loaded_fragments: RoaringBitmap::new(),
-            deleted: RowAddrTreeMap::new(),
-            remaining: self.fetch,
-            index_name: self.segment.name,
-            metrics: RowMetrics::new(&self.metrics, partition),
+        let metrics = RowMetrics::new(&self.metrics, partition);
+        let schema = self.schema();
+        let mut streams = try_join_all(self.segments.iter().map(|segment| {
+            let (plan, schema) = (&self, schema.clone());
+            let (pages_loaded, metrics) = (pages_loaded.clone(), metrics.clone());
+            async move {
+                let batches = plan.checked_ordered_stream(segment, pages_loaded).await?;
+                let rows = LiveRows {
+                    schema: schema.clone(),
+                    batches,
+                    dataset: plan.dataset.clone(),
+                    scope: segment.scope.clone(),
+                    loaded_fragments: RoaringBitmap::new(),
+                    deleted: RowAddrTreeMap::new(),
+                    remaining: plan.fetch,
+                    index_name: segment.metadata.name.clone(),
+                    metrics,
+                }
+                .into_stream()
+                .map_err(DataFusionError::from);
+                Result::Ok(Box::pin(RecordBatchStreamAdapter::new(schema, rows))
+                    as SendableRecordBatchStream)
+            }
+        }))
+        .await?;
+        if streams.len() == 1 {
+            return Ok(streams.remove(0));
         }
-        .into_stream())
+        let merge_order = LexOrdering::from([
+            PhysicalSortExpr::new(Arc::new(Column::new(&self.column, 0)), self.options),
+            PhysicalSortExpr::new(Arc::new(Column::new(ROW_ADDR, 1)), SortOptions::default()),
+        ]);
+        let unreported = ExecutionPlanMetricsSet::new();
+        Ok(StreamingMergeBuilder::new()
+            .with_streams(streams)
+            .with_schema(schema)
+            .with_expressions(&merge_order)
+            .with_metrics(BaselineMetrics::new(&unreported, partition))
+            .with_batch_size(context.session_config().batch_size())
+            .with_fetch(self.fetch)
+            .with_reservation(
+                MemoryConsumer::new("OrderedIndexScanExec").register(context.memory_pool()),
+            )
+            .build()?)
     }
 }
 
@@ -303,6 +396,7 @@ impl MetricsCollector for PagesLoaded {
     fn record_comparisons(&self, _num_comparisons: usize) {}
 }
 
+#[derive(Clone)]
 struct RowMetrics {
     scanned: Count,
     deleted: Count,
@@ -458,11 +552,11 @@ impl DisplayAs for OrderedIndexScanExec {
                 "\n"
             }
         };
-        write!(
-            f,
-            "index={}{separator}order=[{} {}]",
-            self.segment.name, self.column, self.options
-        )?;
+        write!(f, "index={}", self.segments[0].metadata.name)?;
+        if self.segments.len() > 1 {
+            write!(f, "{separator}segments={}", self.segments.len())?;
+        }
+        write!(f, "{separator}order=[{} {}]", self.column, self.options)?;
         if let Some(fetch) = self.fetch {
             write!(f, "{separator}fetch={fetch}")?;
         }
@@ -516,11 +610,11 @@ impl ExecutionPlan for OrderedIndexScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let rows = stream::once(self.clone().live_rows(partition))
-            .try_flatten()
-            .map_err(DataFusionError::from);
+        let rows = stream::once(self.clone().live_rows(partition, context))
+            .map_err(DataFusionError::from)
+            .try_flatten();
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             rows,
@@ -769,7 +863,7 @@ mod tests {
         });
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             query,
             options,
             allowed.as_ref(),
@@ -845,7 +939,7 @@ mod tests {
         let plan = || async {
             OrderedIndexScanExec::try_new(
                 dataset.clone(),
-                segment.clone(),
+                vec![segment.clone()],
                 None,
                 ASC_NULLS_LAST,
                 None,
@@ -904,9 +998,15 @@ mod tests {
         let dataset = fixture(false, false, None).await;
         let segment = key_segment(&dataset).await;
         let plan: Arc<dyn ExecutionPlan> = Arc::new(
-            OrderedIndexScanExec::try_new(dataset.clone(), segment.clone(), None, options, None)
-                .await
-                .unwrap(),
+            OrderedIndexScanExec::try_new(
+                dataset.clone(),
+                vec![segment.clone()],
+                None,
+                options,
+                None,
+            )
+            .await
+            .unwrap(),
         );
         let ordering = LexOrdering::new([PhysicalSortExpr::new(
             Arc::new(Column::new("key", 0)),
@@ -934,10 +1034,15 @@ mod tests {
             Bound::Included(ScalarValue::Int32(Some(40))),
             Bound::Excluded(ScalarValue::Int32(Some(120))),
         );
-        let filtered =
-            OrderedIndexScanExec::try_new(dataset, segment, Some(Arc::new(range)), options, None)
-                .await
-                .unwrap();
+        let filtered = OrderedIndexScanExec::try_new(
+            dataset,
+            vec![segment],
+            Some(Arc::new(range)),
+            options,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             displayable(&filtered).one_line().to_string().trim(),
             format!(
@@ -955,10 +1060,15 @@ mod tests {
         let dataset = fixture(false, false, None).await;
         let mut segment = key_segment(&dataset).await;
         malform(&mut segment);
-        let error =
-            OrderedIndexScanExec::try_new(dataset, segment.clone(), None, ASC_NULLS_FIRST, None)
-                .await
-                .unwrap_err();
+        let error = OrderedIndexScanExec::try_new(
+            dataset,
+            vec![segment.clone()],
+            None,
+            ASC_NULLS_FIRST,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
         assert!(error.to_string().contains("index 'key_idx'"), "{error}");
         assert!(
@@ -986,10 +1096,15 @@ mod tests {
         let mut segment = key_segment(&dataset).await;
         segment.fields = vec![dataset.schema().field("name").unwrap().id];
 
-        let error =
-            OrderedIndexScanExec::try_new(dataset, segment.clone(), None, ASC_NULLS_FIRST, None)
-                .await
-                .unwrap_err();
+        let error = OrderedIndexScanExec::try_new(
+            dataset,
+            vec![segment.clone()],
+            None,
+            ASC_NULLS_FIRST,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::Index { .. }), "{error}");
         for expected in [
             "index 'key_idx'",
@@ -1010,9 +1125,10 @@ mod tests {
             .await
             .unwrap()
             .remove(0);
-        let error = OrderedIndexScanExec::try_new(dataset, segment, None, ASC_NULLS_FIRST, None)
-            .await
-            .unwrap_err();
+        let error =
+            OrderedIndexScanExec::try_new(dataset, vec![segment], None, ASC_NULLS_FIRST, None)
+                .await
+                .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(error.to_string().contains("index 'value_idx'"), "{error}");
     }
@@ -1079,10 +1195,15 @@ mod tests {
             .unwrap();
 
         let segment = key_segment(&dataset).await;
-        let error =
-            OrderedIndexScanExec::try_new(Arc::new(dataset), segment, None, ASC_NULLS_LAST, None)
-                .await
-                .unwrap_err();
+        let error = OrderedIndexScanExec::try_new(
+            Arc::new(dataset),
+            vec![segment],
+            None,
+            ASC_NULLS_LAST,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(error, Error::NotSupported { .. }), "{error}");
         assert!(
             error.to_string().contains("previous max above current min"),
@@ -1154,7 +1275,7 @@ mod tests {
         );
         let error = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            segment.clone(),
+            vec![segment.clone()],
             Some(Arc::new(range)),
             ASC_NULLS_LAST,
             None,
@@ -1185,7 +1306,7 @@ mod tests {
         allowed.remove(overlaid);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             ASC_NULLS_LAST,
             Some(&allowed),
@@ -1243,7 +1364,7 @@ mod tests {
         let dataset = Arc::new(dataset);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             ASC_NULLS_LAST,
             None,
@@ -1280,7 +1401,7 @@ mod tests {
         let dataset = Arc::new(indexed_dataset(batch, "parent.key", false).await);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             options,
             None,
@@ -1316,7 +1437,7 @@ mod tests {
         let dataset = Arc::new(indexed_dataset(batch, "my-col", false).await);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             ASC_NULLS_LAST,
             None,
@@ -1370,7 +1491,7 @@ mod tests {
         let plan = || async {
             OrderedIndexScanExec::try_new(
                 dataset.clone(),
-                segment.clone(),
+                vec![segment.clone()],
                 None,
                 ASC_NULLS_LAST,
                 None,
@@ -1422,7 +1543,7 @@ mod tests {
         let dataset = Arc::new(dataset);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             ASC_NULLS_LAST,
             None,
@@ -1505,7 +1626,7 @@ mod tests {
         let allowed = allowed.map(RoaringBitmap::from_iter);
         let plan = OrderedIndexScanExec::try_new(
             dataset.clone(),
-            key_segment(&dataset).await,
+            vec![key_segment(&dataset).await],
             None,
             ASC_NULLS_LAST,
             allowed.as_ref(),
@@ -1614,5 +1735,196 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    const SEGMENTED_FRAGMENTS: u32 = 5;
+    const SEGMENTED_ROWS: i32 = SEGMENTED_FRAGMENTS as i32 * FRAGMENT_ROWS as i32;
+    const _: () = assert!(
+        SEGMENTED_ROWS as u64 <= DEFAULT_BTREE_BATCH_SIZE,
+        "each segment fits in one page, so its equal keys come in address order"
+    );
+
+    #[derive(Clone, Copy, Debug)]
+    enum Keys {
+        OverlappingRanges,
+        DuplicatedAcrossSegments,
+    }
+
+    impl Keys {
+        fn of(self, row: i32) -> Option<i32> {
+            let key = match self {
+                Self::OverlappingRanges => row * 7 % SEGMENTED_ROWS,
+                Self::DuplicatedAcrossSegments => row % 37,
+            };
+            (row % 20 != 3).then_some(key)
+        }
+    }
+
+    async fn segmented_fixture(keys: Keys, segments: u32) -> Dataset {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int32, true),
+            Field::new("id", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter(
+                    (0..SEGMENTED_ROWS).map(|row| keys.of(row)),
+                )),
+                Arc::new(Int32Array::from_iter_values(0..SEGMENTED_ROWS)),
+            ],
+        )
+        .unwrap();
+        let params = WriteParams {
+            max_rows_per_file: FRAGMENT_ROWS,
+            ..Default::default()
+        };
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(params),
+        )
+        .await
+        .unwrap();
+        let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let mut built = Vec::new();
+        for segment in 0..segments {
+            let fragments = (segment..SEGMENTED_FRAGMENTS).step_by(segments as usize);
+            built.push(
+                dataset
+                    .create_index_builder(&["key"], IndexType::BTree, &btree)
+                    .name(INDEX_NAME.into())
+                    .fragments(fragments.collect())
+                    .execute_uncommitted()
+                    .await
+                    .unwrap(),
+            );
+        }
+        dataset
+            .commit_existing_index_segments(INDEX_NAME, "key", built)
+            .await
+            .unwrap();
+        dataset
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn segments_merge_live_rows_by_key_then_address(
+        #[values(1, 2, 5)] segments: u32,
+        #[values(Keys::OverlappingRanges, Keys::DuplicatedAcrossSegments)] keys: Keys,
+        #[values(false, true)] empty_last_segment: bool,
+        #[values(ASC_NULLS_FIRST, ASC_NULLS_LAST, DESC_NULLS_FIRST, DESC_NULLS_LAST)]
+        options: SortOptions,
+        #[values(None, Some(25))] fetch: Option<usize>,
+    ) {
+        let mut dataset = segmented_fixture(keys, segments).await;
+        let last_segment = if empty_last_segment {
+            format!(" OR id / {FRAGMENT_ROWS} % {segments} = {}", segments - 1)
+        } else {
+            String::new()
+        };
+        dataset
+            .delete(&format!("key % 7 = 3{last_segment}"))
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let index_segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let shown_segments = match index_segments.len() {
+            1 => String::new(),
+            count => format!(", segments={count}"),
+        };
+        let plan =
+            OrderedIndexScanExec::try_new(dataset.clone(), index_segments, None, options, None)
+                .await
+                .unwrap()
+                .with_fetch(fetch)
+                .unwrap();
+
+        let mut expected = live_keys(&dataset)
+            .await
+            .into_iter()
+            .map(|(addr, key)| (key, addr))
+            .collect::<Vec<_>>();
+        expected.sort_by(|a, b| key_order(&a.0, &b.0, options).then(a.1.cmp(&b.1)));
+        let deleted = SEGMENTED_ROWS as usize - expected.len();
+        expected.truncate(fetch.unwrap_or(usize::MAX));
+        assert_eq!(run(plan.clone()).await, expected);
+        assert_eq!(plan.metrics().unwrap().output_rows(), Some(expected.len()));
+
+        if fetch.is_none() && !empty_last_segment {
+            assert_eq!(
+                metric(plan.as_ref(), "rows_scanned"),
+                SEGMENTED_ROWS as usize
+            );
+            assert_eq!(metric(plan.as_ref(), "rows_deleted"), deleted);
+        }
+        let shown_fetch = fetch.map_or(String::new(), |fetch| format!(", fetch={fetch}"));
+        assert_eq!(
+            displayable(plan.as_ref()).one_line().to_string().trim(),
+            format!(
+                "OrderedIndexScan: index=key_idx{shown_segments}, order=[key {options}]{shown_fetch}"
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::no_segments(
+        |segments: &mut Vec<IndexMetadata>| segments.clear(),
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "needs at least one index segment"
+    )]
+    #[case::segments_of_two_indices(
+        |segments: &mut Vec<IndexMetadata>| segments[1].name = "other_idx".into(),
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "is of index 'other_idx'"
+    )]
+    #[case::fragments_in_two_segments(
+        |segments: &mut Vec<IndexMetadata>| {
+            segments[1].fragment_bitmap = segments[0].fragment_bitmap.clone();
+        },
+        |error: &Error| matches!(error, Error::NotSupported { .. }),
+        "that another segment also indexes"
+    )]
+    #[tokio::test]
+    async fn segments_that_cannot_merge_are_rejected(
+        #[case] malform: fn(&mut Vec<IndexMetadata>),
+        #[case] is_expected_kind: fn(&Error) -> bool,
+        #[case] message: &str,
+    ) {
+        let dataset = Arc::new(segmented_fixture(Keys::OverlappingRanges, 2).await);
+        let mut segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        malform(&mut segments);
+        let error = OrderedIndexScanExec::try_new(dataset, segments, None, ASC_NULLS_LAST, None)
+            .await
+            .unwrap_err();
+        assert!(is_expected_kind(&error), "{error}");
+        assert!(error.to_string().contains(message), "{message}: {error}");
+    }
+
+    #[tokio::test]
+    async fn segments_overlapping_outside_the_allow_list_merge() {
+        let dataset = Arc::new(segmented_fixture(Keys::OverlappingRanges, 2).await);
+        let mut segments = dataset.load_indices_by_name(INDEX_NAME).await.unwrap();
+        let first_fragments = segments[0].fragment_bitmap.clone().unwrap();
+        *segments[1].fragment_bitmap.as_mut().unwrap() |= &first_fragments;
+        let allowed = segments[1].fragment_bitmap.as_ref().unwrap() - &first_fragments;
+        let plan = OrderedIndexScanExec::try_new(
+            dataset.clone(),
+            segments,
+            None,
+            ASC_NULLS_LAST,
+            Some(&allowed),
+        )
+        .await
+        .unwrap();
+
+        let mut expected = live_keys(&dataset)
+            .await
+            .into_iter()
+            .filter(|(addr, _)| allowed.contains(RowAddress::from(*addr).fragment_id()))
+            .map(|(addr, key)| (key, addr))
+            .collect::<Vec<_>>();
+        expected.sort_by(|a, b| key_order(&a.0, &b.0, ASC_NULLS_LAST).then(a.1.cmp(&b.1)));
+        assert_eq!(run(Arc::new(plan)).await, expected);
     }
 }
