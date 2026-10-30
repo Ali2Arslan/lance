@@ -61,12 +61,13 @@ use crate::{Dataset, index::DatasetIndexInternalExt};
 ///
 /// Deleted rows and rows outside the fragment scope never reach the output, so
 /// they do not use up `fetch`. Rows with equal keys come in the order the
-/// index yields them within a segment, and the merge breaks key ties between
-/// segments by ascending `_rowaddr`. A fragment's deletion vector loads the
-/// first time the scan reaches one of its rows. Without a `fetch`, the scan
-/// reaches whole batches. With one, it first reaches the in-scope rows of a
-/// batch that the fetch still needs, then doubles the in-scope rows it has
-/// reached each time deleted rows use them up.
+/// index yields them within a segment. Merging several segments compares only
+/// the next row of each, by key and then by ascending `_rowaddr`, so tied rows
+/// come in address order only where each segment yields them in address order.
+/// A fragment's deletion vector loads the first time the scan reaches one of
+/// its rows. Without a `fetch`, the scan reaches whole batches. With one, it
+/// first reaches the in-scope rows of a batch that the fetch still needs, then
+/// doubles the in-scope rows it has reached each time deleted rows use them up.
 ///
 /// ```
 /// # use std::sync::Arc;
@@ -1741,22 +1742,27 @@ mod tests {
     const SEGMENTED_ROWS: i32 = SEGMENTED_FRAGMENTS as i32 * FRAGMENT_ROWS as i32;
     const _: () = assert!(
         SEGMENTED_ROWS as u64 <= DEFAULT_BTREE_BATCH_SIZE,
-        "each segment fits in one page, so its equal keys come in address order"
+        "each segment fits in one default page, so its equal keys come in address order"
     );
 
     #[derive(Clone, Copy, Debug)]
     enum Keys {
         OverlappingRanges,
         DuplicatedAcrossSegments,
+        DuplicatedAcrossPages,
     }
 
     impl Keys {
         fn of(self, row: i32) -> Option<i32> {
             let key = match self {
                 Self::OverlappingRanges => row * 7 % SEGMENTED_ROWS,
-                Self::DuplicatedAcrossSegments => row % 37,
+                Self::DuplicatedAcrossSegments | Self::DuplicatedAcrossPages => row % 37,
             };
             (row % 20 != 3).then_some(key)
+        }
+
+        fn spans_pages(self) -> bool {
+            matches!(self, Self::DuplicatedAcrossPages)
         }
     }
 
@@ -1786,7 +1792,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree);
+        let btree = BTreeParameters {
+            zone_size: keys.spans_pages().then_some(PAGE_ROWS),
+            range_id: None,
+        };
+        let btree = ScalarIndexParams::for_builtin(BuiltinIndexType::BTree)
+            .with_params(&serde_json::to_value(btree).unwrap());
         let mut built = Vec::new();
         for segment in 0..segments {
             let fragments = (segment..SEGMENTED_FRAGMENTS).step_by(segments as usize);
@@ -1811,7 +1822,12 @@ mod tests {
     #[tokio::test]
     async fn segments_merge_live_rows_by_key_then_address(
         #[values(1, 2, 5)] segments: u32,
-        #[values(Keys::OverlappingRanges, Keys::DuplicatedAcrossSegments)] keys: Keys,
+        #[values(
+            Keys::OverlappingRanges,
+            Keys::DuplicatedAcrossSegments,
+            Keys::DuplicatedAcrossPages
+        )]
+        keys: Keys,
         #[values(false, true)] empty_last_segment: bool,
         #[values(ASC_NULLS_FIRST, ASC_NULLS_LAST, DESC_NULLS_FIRST, DESC_NULLS_LAST)]
         options: SortOptions,
@@ -1840,15 +1856,46 @@ mod tests {
                 .with_fetch(fetch)
                 .unwrap();
 
-        let mut expected = live_keys(&dataset)
-            .await
-            .into_iter()
-            .map(|(addr, key)| (key, addr))
+        let live = live_keys(&dataset).await;
+        let mut expected = live
+            .iter()
+            .map(|(addr, key)| (*key, *addr))
             .collect::<Vec<_>>();
         expected.sort_by(|a, b| key_order(&a.0, &b.0, options).then(a.1.cmp(&b.1)));
         let deleted = SEGMENTED_ROWS as usize - expected.len();
         expected.truncate(fetch.unwrap_or(usize::MAX));
-        assert_eq!(run(plan.clone()).await, expected);
+        let rows = run(plan.clone()).await;
+        if keys.spans_pages() {
+            let row_keys = |rows: &[Row]| rows.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+            assert_eq!(
+                row_keys(&rows),
+                row_keys(&expected),
+                "keys differ from the sorted scan"
+            );
+            for (key, addr) in &rows {
+                assert_eq!(
+                    live.get(addr),
+                    Some(key),
+                    "row {addr} is not live with key {key:?}"
+                );
+            }
+            let addrs = rows.iter().map(|(_, addr)| *addr).collect::<HashSet<_>>();
+            assert_eq!(addrs.len(), rows.len(), "a row was emitted twice");
+            if let Some(window) = fetch {
+                let read = |fetch| run(plan.with_fetch(fetch).unwrap().reset_state().unwrap());
+                let mut windows = Vec::new();
+                for offset in (0..).step_by(window) {
+                    let prefix = read(Some(offset + window)).await;
+                    windows.extend_from_slice(&prefix[offset..]);
+                    if prefix.len() < offset + window {
+                        break;
+                    }
+                }
+                assert_eq!(windows, read(None).await);
+            }
+        } else {
+            assert_eq!(rows, expected);
+        }
         assert_eq!(plan.metrics().unwrap().output_rows(), Some(expected.len()));
 
         if fetch.is_none() && !empty_last_segment {
