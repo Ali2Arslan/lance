@@ -581,11 +581,14 @@ impl TryFrom<&Transaction> for pb::Transaction {
                 new_indices,
                 removed_indices,
             } => pb::transaction::Operation::CreateIndex(pb::transaction::CreateIndex {
-                new_indices: new_indices.iter().map(pb::IndexMetadata::from).collect(),
+                new_indices: new_indices
+                    .iter()
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
                 removed_indices: removed_indices
                     .iter()
-                    .map(pb::IndexMetadata::from)
-                    .collect(),
+                    .map(IndexMetadata::to_transaction_proto)
+                    .collect::<Result<_>>()?,
             }),
             Operation::Merge {
                 fragments,
@@ -836,8 +839,84 @@ impl TryFrom<&Transaction> for crate::format::Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_flags::CoveringContract;
     use crate::format::DataFile;
     use crate::format::overlay::OverlayCoverage;
+    use crate::transaction::test_support::sample_index_metadata;
+
+    #[rstest::rstest]
+    #[case::suffix(CoveringContract::Suffix, vec![7, 11], vec![11], vec![7])]
+    #[case::keys_only(CoveringContract::Independent, vec![7], vec![11], vec![7])]
+    #[case::carries_its_key(CoveringContract::Independent, vec![7], vec![7, 11], vec![7])]
+    #[case::tail_shaped(CoveringContract::Independent, vec![7, 11], vec![11], vec![7, 11])]
+    fn test_create_index_entries_roundtrip_in_the_suffix_layout(
+        #[case] contract: CoveringContract,
+        #[case] stored_fields: Vec<i32>,
+        #[case] covering_fields: Vec<i32>,
+        #[case] keys: Vec<i32>,
+    ) {
+        let mut stored = pb::IndexMetadata::from(&sample_index_metadata("covered"));
+        stored.fields = stored_fields;
+        stored.covering_fields = covering_fields.clone();
+        let entry = IndexMetadata::from_manifest_proto(stored, contract).unwrap();
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry.clone()],
+                removed_indices: vec![entry],
+            },
+            None,
+        );
+
+        let message = pb::Transaction::try_from(&transaction).unwrap();
+        let Some(pb::transaction::Operation::CreateIndex(written)) = &message.operation else {
+            panic!("expected CreateIndex, got {:?}", message.operation);
+        };
+        let suffix_layout = [keys.as_slice(), &covering_fields].concat();
+        for entry in written.new_indices.iter().chain(&written.removed_indices) {
+            assert_eq!(entry.fields, suffix_layout);
+            IndexMetadata::from_manifest_proto(entry.clone(), CoveringContract::Suffix).unwrap();
+        }
+
+        let Operation::CreateIndex {
+            new_indices,
+            removed_indices,
+        } = Transaction::try_from(message).unwrap().operation
+        else {
+            panic!("expected CreateIndex");
+        };
+        for entry in new_indices.iter().chain(&removed_indices) {
+            assert_eq!(entry.keyed_fields(), keys);
+            assert_eq!(entry.covering_fields, covering_fields);
+        }
+    }
+
+    /// Appending the carried fields to an entry with no keys would write one
+    /// that reads back keyed on its carried field.
+    #[test]
+    fn test_create_index_entry_without_keys_is_not_encoded() {
+        let entry = IndexMetadata {
+            fields: vec![],
+            covering_fields: vec![11],
+            ..sample_index_metadata("covered")
+        };
+        let transaction = Transaction::new(
+            1,
+            Operation::CreateIndex {
+                new_indices: vec![entry],
+                removed_indices: vec![],
+            },
+            None,
+        );
+
+        let error = pb::Transaction::try_from(&transaction).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("at least one field must remain indexed"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn test_rewrite_frag_reuse_update_stays_in_memory() {
