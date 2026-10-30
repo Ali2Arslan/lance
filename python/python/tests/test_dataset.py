@@ -720,6 +720,11 @@ def test_tag(tmp_path: Path):
 
     assert len(ds.tags.list()) == 0
 
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag1 does not exist"
+    ):
+        ds.tags.get("tag1")
+
     with pytest.raises(ValueError):
         ds.tags.create("tag1", 3)
 
@@ -728,7 +733,11 @@ def test_tag(tmp_path: Path):
 
     ds.tags.create("tag1", 1)
     ds.tags.replace_metadata("tag1", {"description": "first tag"})
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
+    assert tag1_meta == ds.tags.list()["tag1"]
+    assert tag1_meta["version"] == 1
+    assert tag1_meta["branch"] is None
+    assert tag1_meta["manifest_size"] > 0
     assert tag1_meta["created_at"] is not None
     assert isinstance(tag1_meta["created_at"], datetime)
     assert tag1_meta["updated_at"] is not None
@@ -746,6 +755,7 @@ def test_tag(tmp_path: Path):
     ds.tags.create("tag2", 1)
 
     assert len(ds.tags.list()) == 2
+    assert ds.tags.get("tag1")["metadata"] == {}
 
     with pytest.raises(OSError):
         ds.checkout_version("tag3")
@@ -769,7 +779,7 @@ def test_tag(tmp_path: Path):
     ):
         ds.tags.update("tag3", 1)
 
-    tag1_meta = ds.tags.list()["tag1"]
+    tag1_meta = ds.tags.get("tag1")
     tag1_created_at = tag1_meta["created_at"]
     tag1_updated_at = tag1_meta["updated_at"]
     assert tag1_created_at is not None
@@ -777,17 +787,19 @@ def test_tag(tmp_path: Path):
     ds.tags.replace_metadata("tag1", {"description": "updated tag"})
     ds = lance.dataset(base_dir, "tag1")
     assert ds.version == 1
-    replaced_tag1_meta = ds.tags.list()["tag1"]
+    replaced_tag1_meta = ds.tags.get("tag1")
     assert replaced_tag1_meta["metadata"] == {"description": "updated tag"}
     assert replaced_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.replace_metadata("tag1", {"owner": "ml-team"})
-    replaced_again_tag1_meta = ds.tags.list()["tag1"]
+    replaced_again_tag1_meta = ds.tags.get("tag1")
     assert replaced_again_tag1_meta["metadata"] == {"owner": "ml-team"}
     assert replaced_again_tag1_meta["updated_at"] == tag1_updated_at
 
     ds.tags.update("tag1", 2)
-    updated_tag1_meta = ds.tags.list()["tag1"]
+    updated_tag1_meta = ds.tags.get("tag1")
+    assert updated_tag1_meta["version"] == 2
+    assert updated_tag1_meta["branch"] is None
     assert updated_tag1_meta["created_at"] == tag1_created_at
     assert updated_tag1_meta["updated_at"] is not None
     assert updated_tag1_meta["updated_at"] >= tag1_updated_at
@@ -810,7 +822,9 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch", "tag1")
     ds.tags.create("tag3", ("branch", None))
-    target_tag = ds.tags.list().get("tag3")
+    target_tag = ds.tags.get("tag3")
+    assert target_tag == ds.tags.list()["tag3"]
+    assert ds.checkout_version(("branch", 1)).tags.get("tag3") == target_tag
     assert ds.tags.get_version("tag3") == 1
     assert len(ds.tags.list()) == 3
     assert target_tag is not None
@@ -818,7 +832,7 @@ def test_tag(tmp_path: Path):
     assert target_tag["branch"] == "branch"
 
     ds.tags.update("tag3", (None, 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -826,7 +840,7 @@ def test_tag(tmp_path: Path):
 
     ds.create_branch("branch2", 2)
     ds.tags.update("tag3", ("branch2", 2))
-    target_tag = ds.tags.list()["tag3"]
+    target_tag = ds.tags.get("tag3")
     assert ds.tags.get_version("tag3") == 2
     assert target_tag is not None
     assert target_tag["version"] == 2
@@ -834,6 +848,19 @@ def test_tag(tmp_path: Path):
 
     ds.tags.delete("tag3")
     assert len(ds.tags.list()) == 2
+
+    with pytest.raises(
+        ValueError, match="Ref not found error: tag tag3 does not exist"
+    ):
+        ds.tags.get("tag3")
+
+
+@pytest.mark.parametrize("tag", ["", "invalid/tag", ".invalid"])
+def test_tag_get_invalid_name(tmp_path: Path, tag: str):
+    ds = lance.write_dataset(pa.table({"a": [1]}), tmp_path)
+
+    with pytest.raises(ValueError, match="Ref is invalid"):
+        ds.tags.get(tag)
 
 
 def test_tag_order(tmp_path: Path):
@@ -2106,6 +2133,80 @@ def test_strict_overwrite(tmp_path: Path):
         )
     # CommitConflict means commit-step retries were exhausted; it is safe to retry.
     assert exc_info.value.retryable is True
+
+
+def test_fragment_object_metadata_round_trips_through_append(tmp_path: Path):
+    """A fragment's generic metadata map crosses Python -> Rust -> Python intact."""
+    import dataclasses
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "fragment_metadata"
+    dataset = lance.write_dataset(table, base_dir)
+
+    metadata = {
+        "org.example.cluster.bucket": "3",
+        "org.example.unknown": "  opaque value: 東京  ",
+        "org.example.empty": "",
+    }
+    fragment = lance.fragment.LanceFragment.create(base_dir, table)
+    assert fragment.clustering_id is None
+    assert fragment.metadata == {}
+    stamped = dataclasses.replace(fragment, metadata=metadata)
+
+    dataset = lance.LanceDataset.commit(
+        dataset, lance.LanceOperation.Append([stamped]), read_version=dataset.version
+    )
+    committed = [f.metadata for f in dataset.get_fragments()]
+    assert committed[0].metadata == {}
+    assert committed[1].metadata == metadata
+    assert committed[1].clustering_id is None
+
+    # Operations on the same fragment keep the map.
+    dataset.delete("a = 3")
+    kept = dataset.get_fragments()[1].metadata
+    assert kept.metadata == metadata
+    assert kept.deletion_file is not None
+
+
+def test_nonzero_clustering_reference_reaches_rust_validation(tmp_path: Path):
+    """A nonzero clustering_id crosses Python -> Rust on fragments and indices.
+
+    No definition can exist in a table created from Python yet, so the manifest
+    validation error is the evidence that the reference arrived in Rust.
+    """
+    import dataclasses
+
+    from lance.dataset import Index
+
+    table = pa.Table.from_pydict({"a": range(10)})
+    base_dir = tmp_path / "clustering_reference"
+    dataset = lance.write_dataset(table, base_dir)
+
+    fragment = dataclasses.replace(
+        lance.fragment.LanceFragment.create(base_dir, table), clustering_id=7
+    )
+    with pytest.raises(OSError, match="references clustering definition 7"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.Append([fragment]),
+            read_version=dataset.version,
+        )
+
+    index = Index(
+        uuid="00000000-0000-0000-0000-000000000001",
+        name="a_idx",
+        fields=[0],
+        dataset_version=dataset.version,
+        fragment_ids=set(f.fragment_id for f in dataset.get_fragments()),
+        index_version=0,
+        clustering_id=9,
+    )
+    with pytest.raises(OSError, match="references clustering definition 9"):
+        lance.LanceDataset.commit(
+            dataset,
+            lance.LanceOperation.CreateIndex(new_indices=[index], removed_indices=[]),
+            read_version=dataset.version,
+        )
 
 
 def test_commit_timeout(tmp_path: Path):
@@ -7123,21 +7224,11 @@ def test_transaction_audit_fields(tmp_path):
         pa.table({"id": [3, 4]}), tmp_path / "base", mode="append"
     )
 
-    empty = lance.LanceOperation.UpdateMemWalState()
-    tagged = lance.Transaction(
-        read_version=dataset.version, operation=empty, tag="audit-window"
-    )
-    dataset = lance.LanceDataset.commit(dataset, tagged)
-    read_back = dataset.read_transaction(dataset.version)
-    assert read_back.tag == "audit-window"
-    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
-    assert list(read_back.operation.compacted_sstables) == []
-
     shard_id = str(uuid.uuid4())
     recorded = lance.LanceOperation.UpdateMemWalState(
         compacted_sstables=[CompactedSsTable(shard_id, 3)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="Stale MemWAL"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=recorded),
@@ -7146,11 +7237,24 @@ def test_transaction_audit_fields(tmp_path):
     update = lance.LanceOperation.Update(
         compacted_sstables=[CompactedSsTable(shard_id, 1)]
     )
-    with pytest.raises(OSError, match="__lance_mem_wal"):
+    with pytest.raises(OSError, match="mem_wal_dir_id"):
         lance.LanceDataset.commit(
             dataset,
             lance.Transaction(read_version=dataset.version, operation=update),
         )
+
+    dataset.initialize_mem_wal(unsharded=True)
+    dir_id = dataset.mem_wal_index_details()["dir_id"]
+    empty = lance.LanceOperation.UpdateMemWalState(dir_id=dir_id)
+    tagged = lance.Transaction(
+        read_version=dataset.version, operation=empty, tag="audit-window"
+    )
+    dataset = lance.LanceDataset.commit(dataset, tagged)
+    read_back = dataset.read_transaction(dataset.version)
+    assert read_back.tag == "audit-window"
+    assert isinstance(read_back.operation, lance.LanceOperation.UpdateMemWalState)
+    assert list(read_back.operation.compacted_sstables) == []
+    assert read_back.operation.dir_id == dir_id
 
     dataset.optimize.compact_files()
     rewrite = dataset.read_transaction(dataset.version)

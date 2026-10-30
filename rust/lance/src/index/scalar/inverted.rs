@@ -1089,6 +1089,8 @@ pub(crate) async fn merge_segments(
         created_at: Some(chrono::Utc::now()),
         base_id: None,
         files: Some(index_files_to_table(created_index.files)),
+        clustering_id: None,
+        metadata: Default::default(),
         ..segments[0].clone()
     })
 }
@@ -1363,6 +1365,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details =
             normalize_inverted_details(&metadata, InvertedIndexDetails::default()).unwrap();
@@ -1387,6 +1391,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
         let details = InvertedIndexDetails::try_from(&InvertedIndexParams::default()).unwrap();
 

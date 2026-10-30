@@ -92,6 +92,7 @@ pub mod optimize;
 pub mod prefilter;
 pub mod scalar;
 pub(crate) mod scalar_logical;
+pub(crate) mod segment_coverage;
 pub mod vector;
 
 use self::frag_reuse_with_stable_row_ids::{
@@ -1123,6 +1124,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         }
         .validate_covering_fields()?;
         if !segment.declares_same_fields(expected) {
@@ -1158,6 +1161,8 @@ pub(crate) async fn build_index_metadata_from_segments(
         .await?;
 
     let new_indices = futures::stream::iter(segments.into_iter().map(|segment| async move {
+        let clustering_id = segment.clustering_id();
+        let metadata = segment.metadata().clone();
         let (
             uuid,
             fragment_bitmap,
@@ -1181,6 +1186,8 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                clustering_id,
+                metadata: metadata.clone(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1202,6 +1209,8 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            clustering_id,
+            metadata,
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -2017,10 +2026,13 @@ async fn remap_deletes_all_indexed_rows(
     Ok(true)
 }
 
+/// Restrict rows to `owned_fragments` only for sources of a staging merge,
+/// before translating their addresses. Independent and deferred remaps pass None.
 pub(crate) async fn remap_index(
     dataset: &Dataset,
     index_id: &Uuid,
     row_id_map: &RowAddrTranslator,
+    owned_fragments: Option<&RoaringBitmap>,
 ) -> Result<RemapResult> {
     // A remap is maintenance: a segment the tagged reader excludes from the
     // listing is still reachable here (its caller decided whether to touch
@@ -2132,6 +2144,7 @@ pub(crate) async fn remap_index(
                             None,
                             true, // Legacy reindexing should always train
                             None,
+                            None,
                         )
                         .await?;
                         InvertedIndexPlugin::train_inverted_index(
@@ -2163,6 +2176,7 @@ pub(crate) async fn remap_index(
                 &new_id,
                 matched,
                 row_id_map,
+                owned_fragments,
             )
             .await?;
 
@@ -3283,10 +3297,10 @@ impl DatasetIndexExt for Dataset {
         let mut indices = indices
             .iter()
             .filter(|idx| {
-                // We shouldn't have any indices with empty fields, but just in case, log an error
-                // but don't fail the operation (we might not be using that index)
+                // System indices are fieldless by design. Report malformed user indices,
+                // but don't fail the operation (we might not be using that index).
                 if idx.fields.is_empty() {
-                    if idx.name != FRAG_REUSE_INDEX_NAME {
+                    if !is_system_index(idx) {
                         log::error!("Index {} has no fields", idx.name);
                     }
                     false
@@ -3949,9 +3963,8 @@ pub(crate) async fn load_all_indices(dataset: &Dataset) -> Result<Arc<Vec<IndexM
     if let Some(frag_reuse_index_meta) =
         indices.iter().find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
     {
-        let fri_key = FragReuseIndexKey {
-            uuid: &frag_reuse_index_meta.uuid,
-        };
+        let identity = frag_reuse::v0_cache_identity(dataset, frag_reuse_index_meta);
+        let fri_key = FragReuseIndexKey { uuid: &identity };
         let frag_reuse_index = dataset
             .index_cache
             .get_or_insert_with_key(fri_key, || async move {
@@ -4099,7 +4112,7 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     async fn initialize_indices(&mut self, source_dataset: &Dataset) -> Result<()>;
 }
 
-/// The FRI UUID that belongs in the vector cache keys before any remapping
+/// The FRI identity that belongs in the vector cache keys before any remapping
 /// is resolved: only a v0 history, whose remapper is applied while the index
 /// is decoded, identifies cached content (see [`frag_reuse::fri_cache_id`]).
 async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
@@ -4108,7 +4121,22 @@ async fn v0_frag_reuse_cache_id(dataset: &Dataset) -> Option<Uuid> {
         .ok()?
         .iter()
         .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME && idx.index_version == 0)
-        .map(|idx| idx.uuid)
+        .map(|idx| frag_reuse::v0_cache_identity(dataset, idx))
+}
+
+/// The FRI part of a cache key for content read alongside the dataset's
+/// history: [`frag_reuse::v0_cache_identity`] for `index_version = 0`, or the
+/// entry UUID for tagged history, which every change to that history replaces.
+pub(crate) async fn frag_reuse_cache_scope(dataset: &Dataset) -> Option<Uuid> {
+    load_all_indices(dataset)
+        .await
+        .ok()?
+        .iter()
+        .find(|idx| idx.name == FRAG_REUSE_INDEX_NAME)
+        .map(|idx| match idx.index_version {
+            0 => frag_reuse::v0_cache_identity(dataset, idx),
+            _ => idx.uuid,
+        })
 }
 
 impl Dataset {
@@ -4818,9 +4846,8 @@ impl DatasetIndexInternalExt for Dataset {
                 };
             }
             let frag_reuse_uuid = frag_reuse_index_meta.uuid;
-            let frag_reuse_key = FragReuseIndexKey {
-                uuid: &frag_reuse_uuid,
-            };
+            let identity = frag_reuse::v0_cache_identity(self, &frag_reuse_index_meta);
+            let frag_reuse_key = FragReuseIndexKey { uuid: &identity };
 
             let index = self
                 .index_cache
@@ -4852,7 +4879,7 @@ impl DatasetIndexInternalExt for Dataset {
             return Ok(None);
         };
 
-        let frag_reuse_uuid = self.frag_reuse_index_uuid().await;
+        let frag_reuse_uuid = frag_reuse_cache_scope(self).await;
         let cache_key = MemWalCacheKey::new(&mem_wal_meta.uuid, frag_reuse_uuid.as_ref());
         if let Some(index) = self.index_cache.get_with_key(&cache_key).await {
             log::debug!("Found MemWAL index in cache uuid: {}", mem_wal_meta.uuid);
@@ -5221,6 +5248,7 @@ mod tests {
     use crate::dataset::optimize::{CompactionOptions, compact_files};
     use crate::dataset::{WriteMode, WriteParams};
     use crate::index::vector::VectorIndexParams;
+    use crate::index::vector::details::target_partition_size_from_details;
     use crate::session::Session;
     use crate::utils::test::{
         DatagenExt, FragmentCount, FragmentRowCount, compact_into_two, copy_test_data_to_tmp,
@@ -5267,7 +5295,7 @@ mod tests {
     };
     use lance_linalg::distance::{DistanceType, MetricType};
     use lance_table::feature_flags::{
-        FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS,
+        FLAG_COVERED_INDEX_METADATA, FLAG_INDEPENDENT_COVERING_FIELDS, FLAG_ROW_ADDR_INDICES,
     };
     use lance_testing::datagen::generate_random_array;
     use object_store::ObjectStoreExt;
@@ -5314,6 +5342,8 @@ mod tests {
                 size_bytes: payload.len() as u64,
                 file_metadata_size_bytes: None,
             }]),
+            clustering_id: None,
+            metadata: Default::default(),
         }
     }
 
@@ -5896,6 +5926,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let merged = IndexMetadata {
@@ -7333,6 +7365,24 @@ mod tests {
             let num_rows = dataset.count_all_rows().await.unwrap();
             assert_eq!(indexed_rows, expected_indexed_rows);
             assert_eq!(unindexed_rows, num_rows - expected_indexed_rows);
+            for metadata in dataset
+                .load_indices()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|metadata| metadata.name == "text_idx")
+            {
+                let index = dataset
+                    .open_scalar_index("text", &metadata.uuid, &NoOpMetricsCollector)
+                    .await
+                    .unwrap();
+                let live_index = Arc::downgrade(&index);
+                drop(index);
+                assert!(
+                    live_index.upgrade().is_none(),
+                    "optimization retained a live FTS index in the session cache"
+                );
+            }
         }
 
         let num_rows = dataset.count_all_rows().await.unwrap();
@@ -7473,6 +7523,7 @@ mod tests {
             compact_files(&mut dataset, CompactionOptions::default(), None)
                 .await
                 .unwrap();
+            assert_indexed_rows(&dataset, num_rows).await;
             for &word in uppercase_words.iter() {
                 let query_result = dataset
                     .scan()
@@ -7693,6 +7744,84 @@ mod tests {
 
         // 300 / 256 = 1, not the 1000 requested.
         assert_eq!(trained_partitions(&dataset).await, vec![1]);
+
+        // The target recorded is the 300 vectors the one partition holds, not
+        // 300 / 1000, which would have optimize split it apart.
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(300));
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![1]);
+    }
+
+    /// An index built from a partition count, or from centroids that fix one,
+    /// records the vectors per partition it was built at and keeps its
+    /// partitions through an optimize with nothing new to index. With no target
+    /// partition size recorded, optimize joined every partition under a quarter
+    /// of the index type's default, and 500 vectors a partition is under that
+    /// for every IVF type. Null rows are not indexed, so they do not count: a
+    /// target taken from 50,000 rows would join partitions under 625.
+    #[rstest]
+    #[case::num_partitions(VectorIndexParams::ivf_flat(20, DistanceType::L2))]
+    #[case::centroids(ivf_flat_from_centroids(20))]
+    #[tokio::test]
+    async fn test_optimize_keeps_trained_partitions(
+        #[case] params: VectorIndexParams,
+        #[values(0, 40_000)] null_rows: usize,
+    ) {
+        let test_dir = tempfile::tempdir().unwrap();
+        let mut dataset =
+            partly_null_vector_dataset(test_dir.path(), 10_000 + null_rows, 10_000).await;
+        dataset
+            .create_index(&["vector"], IndexType::Vector, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+        let details = dataset.load_indices().await.unwrap()[0]
+            .index_details
+            .clone()
+            .unwrap();
+        assert_eq!(target_partition_size_from_details(&details), Some(500));
+
+        dataset
+            .optimize_indices(&OptimizeOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(trained_partitions(&dataset).await, vec![20]);
+    }
+
+    /// IVF_FLAT params carrying `partitions` precomputed centroids and no
+    /// partition count. The centroids are trained on a fresh sample of the
+    /// distribution `vector_reader` draws from, so the partitions they cut are
+    /// balanced; random centroids could leave one under the join threshold.
+    fn ivf_flat_from_centroids(partitions: usize) -> VectorIndexParams {
+        let dimension = 16;
+        let sample = generate_random_array(partitions * 256 * dimension as usize);
+        let centroids = train_kmeans::<Float32Type>(
+            &sample,
+            KMeansParams::new(None, 10, 1, DistanceType::L2),
+            dimension as usize,
+            partitions,
+            256,
+        )
+        .unwrap()
+        .centroids
+        .as_primitive::<Float32Type>()
+        .clone();
+        let centroids =
+            Arc::new(FixedSizeListArray::try_new_from_values(centroids, dimension).unwrap());
+        VectorIndexParams::with_ivf_flat_params(
+            DistanceType::L2,
+            IvfBuildParams {
+                centroids: Some(centroids),
+                ..Default::default()
+            },
+        )
     }
 
     /// Partition counts for a trained logical vector index, one per segment.
@@ -7957,7 +8086,8 @@ mod tests {
             .unwrap()
     }
 
-    /// A dataset of `rows` rows where only the first `non_null` hold a vector.
+    /// A dataset of `rows` rows where only the first `non_null` hold a vector,
+    /// each random.
     async fn partly_null_vector_dataset(
         dir: &std::path::Path,
         rows: usize,
@@ -7977,11 +8107,13 @@ mod tests {
             arrow_array::builder::Float32Builder::new(),
             dimensions,
         );
+        let values = generate_random_array(non_null * dimensions as usize);
         for row in 0..rows {
             if row < non_null {
-                for value in 0..dimensions {
-                    builder.values().append_value(value as f32);
-                }
+                let start = row * dimensions as usize;
+                builder
+                    .values()
+                    .append_slice(&values.values()[start..start + dimensions as usize]);
                 builder.append(true);
             } else {
                 for _ in 0..dimensions {
@@ -8801,6 +8933,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(remap_to_empty.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8838,6 +8971,7 @@ mod tests {
             &dataset,
             &index_meta.uuid,
             &RowAddrTranslator::sync(remap.clone()),
+            None,
         )
         .await
         .unwrap();
@@ -8913,6 +9047,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .unwrap_err();
@@ -8985,6 +9120,7 @@ mod tests {
             &dataset,
             &index_uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .expect_err("malformed covering metadata must not be silently accepted");
@@ -8994,13 +9130,17 @@ mod tests {
         );
     }
 
-    async fn write_btree_table(uri: &str, indexed: &[&str]) -> Dataset {
+    async fn write_btree_table(
+        uri: &str,
+        indexed: &[&str],
+        params: Option<WriteParams>,
+    ) -> Dataset {
         let data = gen_batch()
             .col("a", array::step::<Int32Type>())
             .col("b", array::step::<Int32Type>())
             .col("c", array::step::<Int32Type>())
             .into_reader_rows(RowCount::from(20), BatchCount::from(1));
-        let mut dataset = Dataset::write(data, uri, None).await.unwrap();
+        let mut dataset = Dataset::write(data, uri, params).await.unwrap();
         for column in indexed {
             dataset
                 .create_index(
@@ -9049,15 +9189,31 @@ mod tests {
     /// to builds without the independent layout. An index keyed on `a` that
     /// carries `a` and `b` needs both bits. Either reads back as declared, an
     /// unrelated commit keeps the bits, and dropping the index clears them.
+    /// On a stable-row-id table the B-tree also stores row addresses, so it
+    /// sets the writer-only row-address bit too, which the unrelated commit
+    /// keeps and the drop clears.
     #[rstest]
-    #[case::suffix(false, FLAG_COVERED_INDEX_METADATA)]
-    #[case::independent(true, FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::suffix(false, false, FLAG_COVERED_INDEX_METADATA)]
+    #[case::independent(true, false, FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
+    #[case::independent_row_addr_btree(true, true, FLAG_COVERED_INDEX_METADATA | FLAG_INDEPENDENT_COVERING_FIELDS)]
     #[tokio::test]
     async fn test_covering_bits_follow_the_committed_declarations(
         #[case] keys_only: bool,
+        #[case] stable_row_ids: bool,
         #[case] expected: u64,
     ) {
-        let mut dataset = write_btree_table("memory://", &["a"]).await;
+        let params = stable_row_ids.then(|| WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        });
+        let mut dataset = write_btree_table("memory://", &["a"], params).await;
+        let row_addr_fence = |dataset: &Dataset| {
+            assert_eq!(
+                dataset.manifest.reader_feature_flags & FLAG_ROW_ADDR_INDICES,
+                0
+            );
+            dataset.manifest.writer_feature_flags & FLAG_ROW_ADDR_INDICES != 0
+        };
         let a = dataset.schema().field_id("a").unwrap();
         let b = dataset.schema().field_id("b").unwrap();
         let plain = dataset.load_indices().await.unwrap()[0].clone();
@@ -9078,9 +9234,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(covering_bits(&dataset), (expected, expected));
+        assert_eq!(row_addr_fence(&dataset), stable_row_ids);
 
         dataset.delete("a = 0").await.unwrap();
         assert_eq!(covering_bits(&dataset), (expected, expected));
+        assert_eq!(row_addr_fence(&dataset), stable_row_ids);
         let stored = read_manifest_indexes(
             &dataset.object_store,
             &dataset.manifest_location,
@@ -9096,6 +9254,7 @@ mod tests {
 
         dataset.drop_index(&plain.name).await.unwrap();
         assert_eq!(covering_bits(&dataset), (0, 0));
+        assert!(!row_addr_fence(&dataset));
     }
 
     /// A segment keyed on `a` and `b` that carries `a` is composite, so it
@@ -9109,7 +9268,7 @@ mod tests {
         #[case] covering_fields: &[&str],
         #[case] commits: bool,
     ) {
-        let mut dataset = write_btree_table("memory://", &[]).await;
+        let mut dataset = write_btree_table("memory://", &[], None).await;
         let ids = |names: &[&str]| -> Vec<i32> {
             names
                 .iter()
@@ -9167,7 +9326,7 @@ mod tests {
         #[case] carried_by_second: &str,
         #[case] describes: bool,
     ) {
-        let dataset = write_btree_table("memory://", &["a"]).await;
+        let dataset = write_btree_table("memory://", &["a"], None).await;
         let [a, b, carried] =
             ["a", "b", carried_by_second].map(|name| dataset.schema().field_id(name).unwrap());
         let plain = dataset.load_indices().await.unwrap()[0].clone();
@@ -9329,7 +9488,7 @@ mod tests {
     /// never published beside a suffix-layout entry.
     #[tokio::test]
     async fn test_retry_stores_the_winners_suffix_entry_as_its_keys() {
-        let mut dataset = write_btree_table("memory://", &["a", "c"]).await;
+        let mut dataset = write_btree_table("memory://", &["a", "c"], None).await;
         let [a, b, c] = ["a", "b", "c"].map(|name| dataset.schema().field_id(name).unwrap());
         let indices = dataset.load_indices().await.unwrap();
         let plain = |keyed: i32| {
@@ -9408,7 +9567,7 @@ mod tests {
     #[tokio::test]
     async fn test_independent_bit_outlives_the_index_that_set_it(#[case] cold: bool) {
         let dir = TempStrDir::default();
-        let mut dataset = write_btree_table(dir.as_str(), &["a", "c"]).await;
+        let mut dataset = write_btree_table(dir.as_str(), &["a", "c"], None).await;
         let [a, b, c] = ["a", "b", "c"].map(|name| dataset.schema().field_id(name).unwrap());
         let indices = dataset.load_indices().await.unwrap();
         let plain = |keyed: i32| {
@@ -9457,7 +9616,7 @@ mod tests {
     #[tokio::test]
     async fn test_shallow_clone_keeps_the_independent_covering_contract() {
         let dir = TempStrDir::default();
-        let mut dataset = write_btree_table(dir.as_str(), &["a"]).await;
+        let mut dataset = write_btree_table(dir.as_str(), &["a"], None).await;
         let a = dataset.schema().field_id("a").unwrap();
         let b = dataset.schema().field_id("b").unwrap();
         let plain = dataset.load_indices().await.unwrap()[0].clone();
@@ -9496,7 +9655,7 @@ mod tests {
     #[case::keys_only(true)]
     #[tokio::test]
     async fn test_remap_index_drops_a_covered_index(#[case] keys_only: bool) {
-        let mut dataset = write_btree_table("memory://", &["a"]).await;
+        let mut dataset = write_btree_table("memory://", &["a"], None).await;
         let a = dataset.schema().field_id("a").unwrap();
         let b = dataset.schema().field_id("b").unwrap();
         let plain = dataset.load_indices().await.unwrap()[0].clone();
@@ -9516,6 +9675,7 @@ mod tests {
             &dataset,
             &plain.uuid,
             &RowAddrTranslator::sync(RowAddrRemap::empty()),
+            None,
         )
         .await
         .unwrap();
@@ -10014,6 +10174,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -10055,6 +10217,8 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -10369,24 +10533,21 @@ mod tests {
 
         // Verify index is NOT being used in queries after delete (empty bitmap)
         if column_name == "text" {
-            // Inverted indexes will still appear to be used in FTS queries.
-            // TODO: once metrics are working on FTS queries, we can check the
-            // analyze plan output instead for index usage.
-            let _plan_after_delete = dataset
-                .scan()
-                .project(&[column_name])
+            // The retained index has no live fragments, so an empty snapshot
+            // needs no index scan to return an empty FTS result.
+            let mut scan = dataset.scan();
+            scan.project(&[column_name])
                 .unwrap()
                 .full_text_search(FullTextSearchQuery::new("test".to_string()))
-                .unwrap()
-                .explain_plan(false)
-                .await
                 .unwrap();
+            let plan_after_delete = scan.explain_plan(false).await.unwrap();
             assert_index_usage(
-                &_plan_after_delete,
+                &plan_after_delete,
                 column_name,
-                true,
+                false,
                 "after delete (empty bitmap)",
             );
+            assert_eq!(scan.try_into_batch().await.unwrap().num_rows(), 0);
         } else {
             // Use equality filter for btree/bitmap indices
             let _plan_after_delete = dataset
@@ -13016,6 +13177,8 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            clustering_id: None,
+            metadata: Default::default(),
         };
 
         let err = dataset
@@ -15901,6 +16064,8 @@ mod tests {
                     .filter(|fragment| covered.contains(fragment.id as u32))
                     .cloned()
                     .collect(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),
@@ -16017,6 +16182,8 @@ mod tests {
         let plan = CompactionPlan {
             tasks: vec![TaskData {
                 fragments: dataset.fragments().as_ref().clone(),
+                output_clustering_id: None,
+                output_metadata: Default::default(),
             }],
             read_version: dataset.version().version,
             options: CompactionOptions::default(),

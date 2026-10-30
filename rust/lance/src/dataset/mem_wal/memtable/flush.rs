@@ -27,6 +27,7 @@ use uuid::Uuid;
 use super::super::index::{FlushContext, FlushOutcome, GenerationWrite, IndexStore, MemIndexSpec};
 use super::super::memtable::MemTable;
 use crate::Dataset;
+use crate::dataset::blob::prepared_sidecar_bytes;
 use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::mem_wal::manifest::ShardManifestStore;
 use crate::dataset::mem_wal::scanner::SsTableWarmer;
@@ -70,6 +71,8 @@ pub struct MemTableFlusher {
     object_store: Arc<ObjectStore>,
     base_path: Path,
     base_uri: String,
+    /// The MemWAL's `dir_id`; generations are written under its directory.
+    dir_id: String,
     shard_id: Uuid,
     manifest_store: Arc<ShardManifestStore>,
     /// When present, each new generation is warmed before it is committed, so
@@ -100,16 +103,25 @@ impl FlushedSize {
     /// Zero reads as unmeasured. An empty memtable is refused before a flush
     /// gets here, so a flushed generation always holds rows and a zero can only
     /// mean the accounting failed.
-    fn of(memtable: &MemTable) -> Self {
-        Self {
+    fn of(memtable: &MemTable) -> Result<Self> {
+        // Blob payloads in packed and dedicated sidecars sit outside the
+        // batches, but a reader of this generation reads them back too.
+        let mut sidecar_bytes = 0u64;
+        for stored in memtable.batch_store().iter() {
+            sidecar_bytes = sidecar_bytes.saturating_add(prepared_sidecar_bytes(&stored.data)?);
+        }
+        Ok(Self {
             // `row_bytes`, not the store's retained heap: the window being
             // written is what a reader of this generation gets back.
-            in_memory_bytes: Some(memtable.batch_store().row_bytes() as u64).filter(|b| *b > 0),
+            in_memory_bytes: Some(
+                (memtable.batch_store().row_bytes() as u64).saturating_add(sidecar_bytes),
+            )
+            .filter(|b| *b > 0),
             physical_rows: Some(memtable.row_count() as u64).filter(|r| *r > 0),
             // Zero means the table has no primary key, which is not a
             // measurement of one.
             primary_key_bytes: Some(memtable.pk_bytes() as u64).filter(|b| *b > 0),
-        }
+        })
     }
 
     fn sstable(self, generation: u64, path: String) -> SsTable {
@@ -127,10 +139,12 @@ impl FlushedSize {
 const TRAINING_BATCH_SIZE: usize = 8192;
 
 impl MemTableFlusher {
+    /// Create a flusher writing `shard_id`'s generations under the MemWAL `dir_id`.
     pub fn new(
         object_store: Arc<ObjectStore>,
         base_path: Path,
         base_uri: impl Into<String>,
+        dir_id: impl Into<String>,
         shard_id: Uuid,
         manifest_store: Arc<ShardManifestStore>,
     ) -> Self {
@@ -138,6 +152,7 @@ impl MemTableFlusher {
             object_store,
             base_path,
             base_uri: base_uri.into(),
+            dir_id: dir_id.into(),
             shard_id,
             manifest_store,
             warmer: None,
@@ -229,6 +244,8 @@ impl MemTableFlusher {
         }
     }
 
+    /// The generation's folder name, path, and reserved data file name (`None`
+    /// when no target was reserved). Errors if the target is for another generation.
     fn generation_target(&self, memtable: &MemTable) -> Result<(String, Path, Option<String>)> {
         let generation = memtable.generation();
         if let Some(target) = memtable.target() {
@@ -240,7 +257,7 @@ impl MemTableFlusher {
             }
             return Ok((
                 target.generation_dir.clone(),
-                target.generation_path(&self.base_path, &self.shard_id),
+                target.generation_path(&self.base_path, &self.dir_id, &self.shard_id),
                 Some(target.data_file_name.clone()),
             ));
         }
@@ -251,7 +268,13 @@ impl MemTableFlusher {
         let random_hash = generate_random_hash();
         Ok((
             format!("{}_gen_{}", random_hash, generation),
-            sstable_path(&self.base_path, &self.shard_id, &random_hash, generation),
+            sstable_path(
+                &self.base_path,
+                &self.dir_id,
+                &self.shard_id,
+                &random_hash,
+                generation,
+            ),
             None,
         ))
     }
@@ -306,7 +329,7 @@ impl MemTableFlusher {
         }
 
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let size = FlushedSize::of(memtable)?;
         let (gen_folder_name, gen_path, preassigned_data_file_name) =
             self.generation_target(memtable)?;
 
@@ -457,12 +480,13 @@ impl MemTableFlusher {
         let reader =
             RecordBatchIterator::new(batches.into_iter().map(Ok), memtable.schema().clone());
 
-        // Use very large max_rows_per_file to ensure 1 fragment per SSTable.
+        // A fragment stores its physical row count as u32, so this is the
+        // largest limit that still guarantees one fragment per SSTable.
         // Inherit the base dataset's storage version so the SSTable
         // matches it (a 2.2 base also fixes the v2.1 miniblock 32 KiB chunk cap
         // that the dense HNSW graph List columns overflow at scale).
         let write_params = WriteParams {
-            max_rows_per_file: usize::MAX,
+            max_rows_per_file: u32::MAX as usize,
             data_storage_version: Some(storage_version.to_selector()),
             // Write the generation through the base's store params + session so it
             // uses the same store the base was opened with. Adapted for the
@@ -472,11 +496,11 @@ impl MemTableFlusher {
             session: self.session.clone(),
             ..Default::default()
         };
-        // The generation's columns keep the base table's field ids: reads and
-        // the merge into base resolve them by id, across renames and drops.
+        // The batches carry the base table's field ids and the new table keeps
+        // them, however large: reads and the merge into base find columns by id.
         let mut builder = InsertBuilder::new(uri.as_str())
             .with_params(&write_params)
-            .with_table_field_ids();
+            .with_inherited_field_ids();
         if let Some(preassigned_data_file_name) = preassigned_data_file_name {
             builder = builder.with_preassigned_data_file_name(preassigned_data_file_name);
         }
@@ -584,7 +608,7 @@ impl MemTableFlusher {
         }
 
         let generation = memtable.generation();
-        let size = FlushedSize::of(memtable);
+        let size = FlushedSize::of(memtable)?;
         let (gen_folder_name, gen_path, preassigned_data_file_name) =
             self.generation_target(memtable)?;
 
@@ -802,13 +826,14 @@ impl MemTableFlusher {
             std::cmp::Ordering::Greater => {
                 // A compactor may already have drained the SSTable from the
                 // manifest, leaving no path to report.
-                let sstable = manifest
+                let sstable = match manifest
                     .sstables
                     .into_iter()
                     .find(|sstable| sstable.generation == generation)
-                    .unwrap_or_else(|| {
-                        FlushedSize::of(memtable).sstable(generation, String::new())
-                    });
+                {
+                    Some(sstable) => sstable,
+                    None => FlushedSize::of(memtable)?.sstable(generation, String::new()),
+                };
                 Ok(Some(FlushResult {
                     sstable,
                     rows_flushed: memtable.row_count(),
@@ -957,12 +982,19 @@ mod tests {
             let manifest_store = Arc::new(ShardManifestStore::new(
                 store.clone(),
                 &base_path,
+                "",
                 shard_id,
                 2,
             ));
             let (epoch, _) = manifest_store.claim_epoch(0).await.unwrap();
-            let flusher =
-                MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store.clone());
+            let flusher = MemTableFlusher::new(
+                store,
+                base_path,
+                base_uri,
+                "",
+                shard_id,
+                manifest_store.clone(),
+            );
             Self {
                 manifest_store,
                 flusher,
@@ -1041,6 +1073,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1059,7 +1092,8 @@ mod tests {
         let durable = 0;
         assert!(!memtable.all_flushed_to_wal(durable));
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
+        let flusher =
+            MemTableFlusher::new(store, base_path, base_uri, "", shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
@@ -1078,6 +1112,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1088,7 +1123,8 @@ mod tests {
         let schema = create_test_schema();
         let memtable = MemTable::new(schema, 1, vec![]).unwrap();
 
-        let flusher = MemTableFlusher::new(store, base_path, base_uri, shard_id, manifest_store);
+        let flusher =
+            MemTableFlusher::new(store, base_path, base_uri, "", shard_id, manifest_store);
         let result = flusher.flush(&memtable, epoch, 0, 0).await;
 
         assert!(result.is_err());
@@ -1102,6 +1138,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1124,6 +1161,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1189,6 +1227,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1197,6 +1236,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1258,6 +1298,47 @@ mod tests {
         assert_eq!(entry.primary_key_bytes, None);
     }
 
+    /// Blob payloads in packed and dedicated sidecars count on top of the
+    /// MemTable's rows; an inline payload is already in them.
+    #[tokio::test]
+    async fn flushed_sstable_counts_blob_sidecar_payloads() {
+        use crate::blob::{BlobDescriptor, BlobDescriptorArrayBuilder};
+
+        let fixture = FlushFixture::new().await;
+        let mut blobs = BlobDescriptorArrayBuilder::new("blob");
+        for blob in [
+            BlobDescriptor::Inline { data: "abc".into() },
+            BlobDescriptor::Packed {
+                blob_id: 1,
+                offset: 0,
+                size: 20,
+            },
+            BlobDescriptor::Dedicated {
+                blob_id: 2,
+                size: 1000,
+            },
+        ] {
+            blobs.push(blob).unwrap();
+        }
+        let (field, blobs) = blobs.finish().unwrap().into_parts();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            field,
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])), blobs],
+        )
+        .unwrap();
+        let mut memtable = MemTable::new(schema, 1, vec![]).unwrap();
+        let frag_id = memtable.insert(batch).await.unwrap();
+        let rows = memtable.batch_store().row_bytes() as u64;
+
+        let entry = fixture.flush_and_read_back(&memtable, frag_id + 1).await;
+
+        assert_eq!(entry.in_memory_bytes, Some(rows + 20 + 1000));
+    }
+
     /// With a primary key, its size is recorded too -- the term neither of the
     /// others carries, since a narrow key over many rows and a wide key over
     /// few weigh the same in `in_memory_bytes`.
@@ -1317,6 +1398,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1340,6 +1422,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri,
+            "",
             shard_id,
             manifest_store.clone(),
         )
@@ -1372,6 +1455,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1395,6 +1479,7 @@ mod tests {
             store.clone(),
             base_path,
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store,
         );
@@ -1470,6 +1555,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1498,6 +1584,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             _base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1577,6 +1664,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1604,6 +1692,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             _base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1671,6 +1760,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1701,6 +1791,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1800,6 +1891,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1830,6 +1922,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -1898,6 +1991,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -1965,6 +2059,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2063,6 +2158,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2136,6 +2232,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2189,6 +2286,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2235,6 +2333,7 @@ mod tests {
             store.clone(),
             base_path.clone(),
             base_uri.clone(),
+            "",
             shard_id,
             manifest_store.clone(),
         );
@@ -2341,6 +2440,7 @@ mod tests {
         let manifest_store = Arc::new(ShardManifestStore::new(
             store.clone(),
             &base_path,
+            "",
             shard_id,
             2,
         ));
@@ -2351,10 +2451,16 @@ mod tests {
         let mut memtable = MemTable::new(batch.schema(), 1, vec![]).unwrap();
         memtable.set_indexes(IndexStore::from_specs(&specs, &lance_schema, 1000, 16).unwrap());
         let durable = memtable.insert(batch).await.unwrap() + 1;
-        let result =
-            MemTableFlusher::new(store, base_path, base_uri.clone(), shard_id, manifest_store)
-                .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
-                .await?;
+        let result = MemTableFlusher::new(
+            store,
+            base_path,
+            base_uri.clone(),
+            "",
+            shard_id,
+            manifest_store,
+        )
+        .flush_with_indexes(&memtable, epoch, &specs, 1, durable)
+        .await?;
         let generation = Dataset::open(&format!(
             "{}/_mem_wal/{}/{}",
             base_uri.trim_end_matches('/'),

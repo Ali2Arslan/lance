@@ -155,7 +155,7 @@ async fn test_btree_merge_drops_coverage_a_restore_took_an_overlay_from() {
 
     let mut dataset = dataset.checkout_version(before_overlay).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 0").await,
@@ -199,7 +199,7 @@ async fn test_btree_merge_drops_coverage_a_restore_revived_a_row_in() {
 
     let mut dataset = dataset.checkout_version(before_delete).await.unwrap();
     dataset.restore().await.unwrap();
-    let dataset = btree_merge_and_commit(dataset, staged).await;
+    let dataset = Box::pin(btree_merge_and_commit(dataset, staged)).await;
 
     assert_eq!(
         ids_matching(&dataset, "age = 30").await,
@@ -1945,6 +1945,8 @@ async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             assert_eq!(
                 check.marks_stale(&dataset, segment).await,

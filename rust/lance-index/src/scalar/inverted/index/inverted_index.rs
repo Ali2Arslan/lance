@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::scalar::RowAddrTranslatorRef;
+use crate::scalar::inverted::documents::DocumentRemapping;
 use lance_core::utils::row_addr_remap::RowAddrRemap;
 use lance_index_core::remapping::RowAddrTranslator;
 
@@ -161,6 +162,12 @@ impl InvertedIndex {
         self
     }
 
+    /// The rows this segment may answer for, when the opener restricted it
+    /// (see [`Self::with_allowed_rows`]).
+    pub fn allowed_rows(&self) -> Option<&Arc<RowAddrMask>> {
+        self.allowed_rows.as_ref()
+    }
+
     /// The mask this segment searches with: `mask` restricted to its allowed rows.
     pub(crate) fn restrict_mask(&self, mask: Arc<RowAddrMask>) -> Arc<RowAddrMask> {
         match &self.allowed_rows {
@@ -228,13 +235,41 @@ impl InvertedIndex {
 }
 
 impl InvertedIndex {
+    /// Preserve shared decoded state without retaining request-owned readers.
+    pub(in super::super) fn cache_snapshot(&self) -> Result<Option<Self>> {
+        if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
+            return Ok(None);
+        }
+        let mut snapshot = self.clone();
+        snapshot.partitions = self
+            .partitions
+            .iter()
+            .map(|part| {
+                let Some(docs) = part.docs.modern() else {
+                    return Err(Error::internal("modern FTS partition has legacy documents"));
+                };
+                Ok(Arc::new(InvertedPartition {
+                    inverted_list: Arc::new(
+                        part.inverted_list
+                            .with_store(part.store.clone(), posting_file_path(part.id))?,
+                    ),
+                    docs: PartitionDocumentStore::Modern(Arc::new(
+                        docs.with_store(part.store.clone(), None),
+                    )),
+                    ..part.as_ref().clone()
+                }))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Some(snapshot))
+    }
+
     /// Rebind a modern index within its immutable index/fragment-reuse cache
     /// namespace. Only reader-free state crosses the request boundary; all
     /// future posting and document I/O uses the supplied store and remapper.
     pub(in super::super) fn with_store(
         &self,
         store: Arc<dyn IndexStore>,
-        frag_reuse_index: Option<Arc<dyn RowIdRemapper>>,
+        remapping: Option<DocumentRemapping>,
     ) -> Result<Option<Self>> {
         if self.is_legacy() || self.partitions.iter().any(|part| part.is_legacy()) {
             return Ok(None);
@@ -254,7 +289,7 @@ impl InvertedIndex {
                         .with_store(store.clone(), posting_file_path(part.id))?,
                 ),
                 docs: PartitionDocumentStore::Modern(Arc::new(
-                    docs.with_store(store, frag_reuse_index.clone()),
+                    docs.with_store(store, remapping.clone()),
                 )),
                 token_set_format: part.token_set_format,
             }));
