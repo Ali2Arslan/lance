@@ -103,7 +103,7 @@ pub trait BasicTrainer: Send + Sync {
 #[non_exhaustive]
 pub enum IndexOrderingCapability {
     /// The index cannot stream keys in order.
-    None,
+    Unordered,
     /// The index streams keys in either direction, with nulls first or last.
     Bidirectional,
 }
@@ -160,6 +160,7 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///
     /// ```
     /// # use lance_index::pbold;
+    /// # use lance_index::scalar::bitmap::BitmapIndexPlugin;
     /// # use lance_index::scalar::btree::BTreeIndexPlugin;
     /// # use lance_index::scalar::registry::{IndexOrderingCapability, ScalarIndexPlugin};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,11 +169,16 @@ pub trait ScalarIndexPlugin: Send + Sync + std::fmt::Debug {
     ///     BTreeIndexPlugin.ordering_capability(&details),
     ///     IndexOrderingCapability::Bidirectional
     /// );
+    /// let details = prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())?;
+    /// assert_eq!(
+    ///     BitmapIndexPlugin.ordering_capability(&details),
+    ///     IndexOrderingCapability::Unordered
+    /// );
     /// # Ok(())
     /// # }
     /// ```
     fn ordering_capability(&self, _index_details: &prost_types::Any) -> IndexOrderingCapability {
-        IndexOrderingCapability::None
+        IndexOrderingCapability::Unordered
     }
 
     /// The version of the index plugin
