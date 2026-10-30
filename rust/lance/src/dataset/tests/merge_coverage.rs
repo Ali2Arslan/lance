@@ -1945,6 +1945,8 @@ async fn test_covering_dependency(#[case] check: SegmentFreshnessCheck) {
                 created_at: None,
                 base_id: None,
                 files: None,
+                clustering_id: None,
+                metadata: Default::default(),
             };
             assert_eq!(
                 check.marks_stale(&dataset, segment).await,
