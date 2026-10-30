@@ -139,17 +139,18 @@ impl BTreeIndex {
     ) -> Result<Visits> {
         let query = query
             .map(|query| {
-                query
+                let query = query
                     .as_any()
                     .downcast_ref::<SargableQuery>()
                     .ok_or_else(|| {
                         Error::invalid_input(format!(
                             "B-tree ordered search expects a SargableQuery, got {query:?}"
                         ))
-                    })
+                    })?;
+                strings_in_key_type(query, &self.data_type)
             })
             .transpose()?;
-        let (mut null_run, value_pages, predicate) = match query {
+        let (mut null_run, value_pages, predicate) = match &query {
             // An unbounded range is the literal `true`, so it selects null keys too.
             None | Some(SargableQuery::Range(Bound::Unbounded, Bound::Unbounded)) => (
                 null_pages(lookup),
@@ -329,6 +330,40 @@ impl RowSelection {
 
 fn is_null_bound(bound: &Bound<ScalarValue>) -> bool {
     matches!(bound, Bound::Included(value) | Bound::Excluded(value) if value.is_null())
+}
+
+/// Page bounds and the page predicate compare only arrays of one type, so a
+/// string literal of another string type is cast to the type of a string key.
+fn strings_in_key_type(query: &SargableQuery, key_type: &DataType) -> Result<SargableQuery> {
+    let is_string = |data_type: &DataType| {
+        matches!(
+            data_type,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    let cast = |value: &ScalarValue| -> Result<ScalarValue> {
+        if is_string(key_type) && is_string(&value.data_type()) {
+            Ok(value.cast_to(key_type)?)
+        } else {
+            Ok(value.clone())
+        }
+    };
+    let cast_bound = |bound: &Bound<ScalarValue>| match bound {
+        Bound::Included(value) => cast(value).map(Bound::Included),
+        Bound::Excluded(value) => cast(value).map(Bound::Excluded),
+        Bound::Unbounded => Ok(Bound::Unbounded),
+    };
+    Ok(match query {
+        SargableQuery::Equals(value) => SargableQuery::Equals(cast(value)?),
+        SargableQuery::Range(start, end) => {
+            SargableQuery::Range(cast_bound(start)?, cast_bound(end)?)
+        }
+        SargableQuery::IsIn(values) => {
+            SargableQuery::IsIn(values.iter().map(cast).collect::<Result<_>>()?)
+        }
+        SargableQuery::LikePrefix(prefix) => SargableQuery::LikePrefix(cast(prefix)?),
+        SargableQuery::IsNull() | SargableQuery::FullTextSearch(_) => query.clone(),
+    })
 }
 
 fn null_pages(lookup: CheckedLookup<'_>) -> Visits {
@@ -511,6 +546,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering as AtomicOrdering;
 
+    use arrow::compute::cast;
     use arrow_array::types::{Int32Type, UInt64Type};
     use arrow_array::{
         ArrayRef, Int32Array, RecordBatch, StringArray, UInt32Array, UInt64Array, cast::AsArray,
@@ -1195,18 +1231,46 @@ mod tests {
         assert_eq!(parts_loaded(&metrics), 0);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum StringQuery {
+        LikePrefix,
+        Equals,
+        Range,
+        In,
+    }
+
+    impl StringQuery {
+        fn query(self, literal_type: &DataType) -> SargableQuery {
+            let literal = |text: &str| ScalarValue::from(text).cast_to(literal_type).unwrap();
+            match self {
+                Self::LikePrefix => SargableQuery::LikePrefix(literal("ap")),
+                Self::Equals => SargableQuery::Equals(literal("apple")),
+                Self::Range => SargableQuery::Range(
+                    Bound::Included(literal("ap")),
+                    Bound::Excluded(literal("aq")),
+                ),
+                Self::In => {
+                    SargableQuery::IsIn(vec![literal("apple"), literal("zebra"), literal("ap")])
+                }
+            }
+        }
+    }
+
+    /// B-tree training rejects `Utf8View` keys. Every query matches "ap",
+    /// whose page also holds keys the query rejects, so the page predicate runs.
     #[rstest]
-    #[case::ascending(false, vec!["ap", "apex", "apple", "apricot"])]
-    #[case::descending(true, vec!["apricot", "apple", "apex", "ap"])]
     #[tokio::test]
-    async fn test_ordered_like_prefix(
-        #[case] descending: bool,
-        #[case] expected: Vec<&str>,
+    async fn test_ordered_string_literal_types(
+        #[values(false, true)] descending: bool,
+        #[values(DataType::Utf8, DataType::LargeUtf8)] key_type: DataType,
+        #[values(DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View)] literal_type: DataType,
         #[values(
-            ScalarValue::Utf8(Some("ap".to_string())),
-            ScalarValue::Utf8View(Some("ap".to_string()))
+            StringQuery::LikePrefix,
+            StringQuery::Equals,
+            StringQuery::Range,
+            StringQuery::In
         )]
-        prefix: ScalarValue,
+        query: StringQuery,
     ) {
         let keys = [
             None,
@@ -1219,39 +1283,65 @@ mod tests {
             Some("banana"),
         ];
         let schema = Arc::new(Schema::new(vec![
-            Field::new(VALUE_COLUMN_NAME, DataType::Utf8, true),
+            Field::new(VALUE_COLUMN_NAME, key_type.clone(), true),
             Field::new(ROW_ADDR, DataType::UInt64, false),
         ]));
         let batch = RecordBatch::try_new(
             schema,
             vec![
-                Arc::new(StringArray::from(keys.to_vec())),
+                cast(&StringArray::from(keys.to_vec()), &key_type).unwrap(),
                 Arc::new(UInt64Array::from_iter_values(0..keys.len() as u64)),
             ],
         )
         .unwrap();
         let (store, _tmpdir) = new_store();
-        train_btree_index(batch_stream(batch), store.as_ref(), 2, None, None)
+        train_btree_index(batch_stream(batch), store.as_ref(), 3, None, None)
             .await
             .unwrap();
         let index = BTreeIndex::load(store, None, &LanceCache::no_cache(), true)
             .await
             .unwrap();
         let options = order(descending, true);
-        let prefix = SargableQuery::LikePrefix(prefix);
 
         let batches: Vec<RecordBatch> = index
-            .search_ordered(Some(&prefix), options, Arc::new(NoOpMetricsCollector))
+            .search_ordered(
+                Some(&query.query(&literal_type)),
+                options,
+                Arc::new(NoOpMetricsCollector),
+            )
             .await
             .unwrap()
             .try_collect()
             .await
             .unwrap();
-        let actual: Vec<Option<&str>> = batches
+        let actual: Vec<u64> = batches
             .iter()
-            .flat_map(|batch| batch.column(0).as_string::<i32>().iter())
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .to_vec()
+            })
             .collect();
-        assert_eq!(actual, expected.into_iter().map(Some).collect::<Vec<_>>());
+        let mut expected: Vec<u64> = index
+            .search(&query.query(&key_type), &NoOpMetricsCollector)
+            .await
+            .unwrap()
+            .row_addrs()
+            .true_rows()
+            .row_addrs()
+            .unwrap()
+            .map(u64::from)
+            .collect();
+        expected.sort_by_key(|&id| keys[id as usize]);
+        if descending {
+            expected.reverse();
+        }
+        assert_eq!(
+            actual, expected,
+            "{query:?} with a {literal_type} literal on a {key_type} index"
+        );
     }
 
     #[rstest]
