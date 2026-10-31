@@ -3890,6 +3890,10 @@ impl Scanner {
             },
             None => (None, None),
         };
+        let (ordered_scan, residual_read) = match ordered_read {
+            Some(ordered::OrderedRead { scan, residual }) => (Some(scan), residual),
+            None => (None, None),
+        };
         let mut use_limit_node = true;
         let mut is_index_ordered = false;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
@@ -3933,9 +3937,9 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
-                } else if let Some(ordered_read) = ordered_read {
+                } else if let Some(ordered_scan) = ordered_scan {
                     is_index_ordered = true;
-                    ordered_read
+                    ordered_scan
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
@@ -3989,6 +3993,9 @@ impl Scanner {
 
         // Filter
         plan = filter_plan.refine_filter(plan, self, session).await?;
+        if let Some(residual_read) = &residual_read {
+            plan = residual_read.stop_at_fetch(plan)?;
+        }
 
         // Aggregate (if set, applies aggregate and returns early)
         if let Some(agg) = &self.aggregate {
@@ -4118,6 +4125,11 @@ impl Scanner {
         }
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
+        }
+        if let Some(residual_read) = &residual_read {
+            plan = self
+                .with_sort_fallback(plan, residual_read, session)
+                .await?;
         }
 
         Ok((plan, ordered_index_decline))

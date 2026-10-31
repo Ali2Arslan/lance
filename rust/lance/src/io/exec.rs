@@ -17,6 +17,7 @@ pub mod fts;
 pub(crate) mod knn;
 pub mod minhash;
 mod optimizer;
+pub(crate) mod ordered_fallback;
 pub mod ordered_index_scan;
 mod projection;
 mod pushdown_scan;
