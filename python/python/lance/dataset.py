@@ -1252,6 +1252,7 @@ class LanceDataset(pa.dataset.Dataset):
         ] = None,
         use_scalar_index: Optional[bool] = None,
         use_ordered_index: Optional[bool] = None,
+        require_ordered_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None,
         strict_batch_size: Optional[bool] = None,
@@ -1416,6 +1417,10 @@ class LanceDataset(pa.dataset.Dataset):
             Allows custom control over reading a B-tree index in key order to serve
             ``order_by`` with a limit.  See ``ScannerBuilder.use_ordered_index`` for
             more information.
+        require_ordered_index: bool, default False
+            Raise ``ValueError`` with the reason instead of sorting when ``order_by``
+            cannot be served from an index.  See
+            ``ScannerBuilder.require_ordered_index`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
@@ -1595,6 +1600,7 @@ class LanceDataset(pa.dataset.Dataset):
         setopt(builder.use_stats, use_stats)
         setopt(builder.use_scalar_index, use_scalar_index)
         setopt(builder.use_ordered_index, use_ordered_index)
+        setopt(builder.require_ordered_index, require_ordered_index)
         setopt(builder.fast_search, fast_search)
         setopt(builder.include_deleted_rows, include_deleted_rows)
         setopt(builder.scan_stats_callback, scan_stats_callback)
@@ -1698,6 +1704,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         use_ordered_index: Optional[bool] = None,
+        require_ordered_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1767,6 +1774,9 @@ class LanceDataset(pa.dataset.Dataset):
         use_ordered_index: bool, default True
             Allows custom control over ordered index reads.  See
             ``ScannerBuilder.use_ordered_index`` for more information.
+        require_ordered_index: bool, default False
+            Fail instead of sorting when ``order_by`` cannot be served from an index.
+            See ``ScannerBuilder.require_ordered_index`` for more information.
         with_row_id: bool, optional, default False
             Return row ID.
         with_row_address: bool, optional, default False
@@ -1831,6 +1841,7 @@ class LanceDataset(pa.dataset.Dataset):
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             use_ordered_index=use_ordered_index,
+            require_ordered_index=require_ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -1866,6 +1877,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_mode: str = _BLOB_PANDAS_MODE_LAZY,
         use_scalar_index: Optional[bool] = None,
         use_ordered_index: Optional[bool] = None,
+        require_ordered_index: Optional[bool] = None,
         include_deleted_rows: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -1900,6 +1912,7 @@ class LanceDataset(pa.dataset.Dataset):
             late_materialization=late_materialization,
             use_scalar_index=use_scalar_index,
             use_ordered_index=use_ordered_index,
+            require_ordered_index=require_ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -2304,6 +2317,7 @@ class LanceDataset(pa.dataset.Dataset):
         blob_handling: Optional[str] = None,
         use_scalar_index: Optional[bool] = None,
         use_ordered_index: Optional[bool] = None,
+        require_ordered_index: Optional[bool] = None,
         strict_batch_size: Optional[bool] = None,
         order_by: Optional[List[ColumnOrdering]] = None,
         disable_scoring_autoprojection: Optional[bool] = None,
@@ -2335,6 +2349,7 @@ class LanceDataset(pa.dataset.Dataset):
             blob_handling=blob_handling,
             use_scalar_index=use_scalar_index,
             use_ordered_index=use_ordered_index,
+            require_ordered_index=require_ordered_index,
             scan_in_order=scan_in_order,
             prefilter=prefilter,
             with_row_id=with_row_id,
@@ -7138,6 +7153,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._use_ordered_index = None
+        self._require_ordered_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -7394,6 +7410,22 @@ class ScannerBuilder:
         Other uses of scalar indices are not affected.
         """
         self._use_ordered_index = use_ordered_index
+        return self
+
+    def require_ordered_index(
+        self, require_ordered_index: bool = True
+    ) -> ScannerBuilder:
+        """
+        Set whether a scan with ``order_by`` must read an index in key order
+
+        When True and the scan cannot serve ``order_by`` from an index, as
+        ``use_ordered_index`` describes, the scan raises ``ValueError`` instead of
+        sorting.  The message says why, for example that the scan has no limit.
+        ``explain_plan(verbose=True)`` prints the same reason without this option.
+        With ``use_ordered_index(False)``, the scan raises ``ValueError`` even without
+        ``order_by``.  Otherwise a scan without ``order_by`` is not affected.
+        """
+        self._require_ordered_index = require_ordered_index
         return self
 
     def with_fragments(
@@ -7704,6 +7736,7 @@ class ScannerBuilder:
             self._row_addr_blocklist,
             self._minhash_query,
             self._use_ordered_index,
+            self._require_ordered_index,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

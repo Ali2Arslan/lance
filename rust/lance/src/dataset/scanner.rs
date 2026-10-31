@@ -53,7 +53,7 @@ use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use lance_arrow::floats::{FloatType, coerce_float_vector};
 use lance_arrow::{DataTypeExt, SchemaExt as ArrowSchemaExt};
 use lance_core::datatypes::{
@@ -152,6 +152,10 @@ pub use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts}
 use lance_datafusion::substrait::parse_substrait;
 
 mod ordered;
+
+pub use ordered::OrderedIndexDecline;
+
+type PlanWithDecline = (Arc<dyn ExecutionPlan>, Option<OrderedIndexDecline>);
 
 /// Rows per output batch when neither the scan options nor
 /// `LANCE_DEFAULT_BATCH_SIZE` specify one.
@@ -1229,6 +1233,8 @@ pub struct Scanner {
 
     use_ordered_index: bool,
 
+    require_ordered_index: bool,
+
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.
@@ -1722,6 +1728,7 @@ impl Scanner {
             fast_search: false,
             use_scalar_index: true,
             use_ordered_index: true,
+            require_ordered_index: false,
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,
@@ -3568,6 +3575,12 @@ impl Scanner {
             }
         }
 
+        if self.require_ordered_index && !self.use_ordered_index {
+            return Err(Error::invalid_input(
+                "require_ordered_index=true and use_ordered_index=false are mutually exclusive",
+            ));
+        }
+
         Ok(())
     }
 
@@ -3817,21 +3830,28 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub fn create_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
-        Box::pin(self.create_plan_impl(None))
+        Box::pin(self.create_plan_impl(None).map_ok(|(plan, _)| plan))
     }
 
     pub(crate) fn create_plan_with_session<'a>(
         &'a self,
         session: &'a dyn Session,
     ) -> BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
-        Box::pin(self.create_plan_impl(Some(session)))
+        Box::pin(
+            self.create_plan_impl(Some(session))
+                .map_ok(|(plan, _)| plan),
+        )
+    }
+
+    // A boxed `dyn Future`: awaiting the `create_plan_impl` future inline in
+    // `explain_plan` exceeds rustc's depth limit, and its `Send` check overflows
+    // the trait solver in downstream crates (E0275).
+    fn create_plan_with_decline(&self) -> BoxFuture<'_, Result<PlanWithDecline>> {
+        Box::pin(self.create_plan_impl(None))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn create_plan_impl(
-        &self,
-        session: Option<&dyn Session>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan_impl(&self, session: Option<&dyn Session>) -> Result<PlanWithDecline> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
         if let Some(rows) = &self.physical_row_addr_prefilter {
@@ -3860,6 +3880,10 @@ impl Scanner {
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
 
+        let ordered_read = match self.ordering.as_deref() {
+            Some(ordering) => Some(self.try_ordered_read(ordering, &mut filter_plan).await),
+            None => None,
+        };
         let mut use_limit_node = true;
         let mut is_index_ordered = false;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
@@ -3903,9 +3927,9 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
-                } else if let Some(ordered_read) = self.try_ordered_read(&mut filter_plan).await {
+                } else if let Some(Ok(ordered_read)) = &ordered_read {
                     is_index_ordered = true;
-                    ordered_read
+                    ordered_read.clone()
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
@@ -3929,6 +3953,13 @@ impl Scanner {
                     "Cannot combine a MinHash search with nearest or full text search".into(),
                 ));
             }
+        };
+        let ordered_index_decline = match ordered_read {
+            Some(Err(decline)) if self.require_ordered_index => {
+                return Err(Error::invalid_input_source(decline.into()));
+            }
+            Some(Err(decline)) => Some(decline),
+            _ => None,
         };
 
         // Load columns needed for filter and ordering
@@ -3984,7 +4015,7 @@ impl Scanner {
                 plan = rule.optimize(plan, &options)?;
             }
 
-            return Ok(plan);
+            return Ok((plan, ordered_index_decline));
         }
 
         // Sort
@@ -4090,7 +4121,7 @@ impl Scanner {
             plan = rule.optimize(plan, &options)?;
         }
 
-        Ok(plan)
+        Ok((plan, ordered_index_decline))
     }
 
     // Check if a filter plan references version columns
@@ -8926,15 +8957,14 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
-        // Box the plan-building future at the call site: `create_plan`'s inlined async
-        // layout otherwise exceeds rustc's depth limit here. It has to be boxed at the
-        // call site rather than inside `create_plan` — boxing internally turns the
-        // future's `Send` check into a `Box<Future>: Send` trait obligation that
-        // overflows the solver through the cache types (E0275 in downstream crates).
-        let plan = Box::pin(self.create_plan()).await?;
-        let display = DisplayableExecutionPlan::new(plan.as_ref());
-
-        Ok(format!("{}", display.indent(verbose)))
+        let (plan, ordered_index_decline) = self.create_plan_with_decline().await?;
+        let explained = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(verbose)
+            .to_string();
+        Ok(match ordered_index_decline {
+            Some(decline) if verbose => format!("{explained}{decline}\n"),
+            _ => explained,
+        })
     }
 
     /// Run [`Self::count_rows`]'s underlying plan and return it formatted with
