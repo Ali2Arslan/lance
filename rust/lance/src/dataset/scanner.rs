@@ -3880,9 +3880,15 @@ impl Scanner {
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
 
-        let ordered_read = match self.ordering.as_deref() {
-            Some(ordering) => Some(self.try_ordered_read(ordering, &mut filter_plan).await),
-            None => None,
+        let (ordered_read, ordered_index_decline) = match self.ordering.as_deref() {
+            Some(ordering) => match self.try_ordered_read(ordering, &mut filter_plan).await {
+                Ok(ordered_read) => (Some(ordered_read), None),
+                Err(decline) if self.require_ordered_index => {
+                    return Err(Error::invalid_input_source(decline.into()));
+                }
+                Err(decline) => (None, Some(decline)),
+            },
+            None => (None, None),
         };
         let mut use_limit_node = true;
         let mut is_index_ordered = false;
@@ -3927,9 +3933,9 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
-                } else if let Some(Ok(ordered_read)) = &ordered_read {
+                } else if let Some(ordered_read) = ordered_read {
                     is_index_ordered = true;
-                    ordered_read.clone()
+                    ordered_read
                 } else {
                     let planned_read = self
                         .filtered_read_source(&mut filter_plan.expr_filter_plan, session)
@@ -3953,13 +3959,6 @@ impl Scanner {
                     "Cannot combine a MinHash search with nearest or full text search".into(),
                 ));
             }
-        };
-        let ordered_index_decline = match ordered_read {
-            Some(Err(decline)) if self.require_ordered_index => {
-                return Err(Error::invalid_input_source(decline.into()));
-            }
-            Some(Err(decline)) => Some(decline),
-            _ => None,
         };
 
         // Load columns needed for filter and ordering

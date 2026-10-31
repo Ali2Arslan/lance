@@ -1374,8 +1374,8 @@ public class ScannerTest {
         assertScanFails(
             dataset,
             required.build(),
-            "OrderedIndexScan declined: the scan has no limit, so an ordered read of index "
-                + "'id_idx' on column 'id' could not stop early");
+            "OrderedIndexScan declined: the scan has no limit, so an ordered index read of "
+                + "column 'id' could not stop early");
         assertScanFails(
             dataset,
             required.limit(10).useOrderedIndex(false).build(),

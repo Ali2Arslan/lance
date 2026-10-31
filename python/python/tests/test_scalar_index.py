@@ -7202,8 +7202,8 @@ def ts_index_dataset(tmp_path):
 
 def test_require_ordered_index_without_limit(ts_index_dataset):
     reason = (
-        "OrderedIndexScan declined: the scan has no limit, so an ordered read of "
-        "index 'ts_idx' on column 'ts' could not stop early"
+        "OrderedIndexScan declined: the scan has no limit, so an ordered index read "
+        "of column 'ts' could not stop early"
     )
     with pytest.raises(ValueError, match=re.escape(reason)):
         ts_index_dataset.to_table(order_by=["ts"], require_ordered_index=True)
