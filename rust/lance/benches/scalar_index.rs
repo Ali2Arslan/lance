@@ -314,17 +314,19 @@ fn bench_ordered_limit(c: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("declined_by_filter", segments),
-            &dataset,
-            |b, dataset| {
-                b.iter(|| {
-                    rt.block_on(ordered_limit(dataset, |scanner| {
-                        scanner.filter("id >= 0").unwrap();
-                    }))
-                });
-            },
-        );
+        for (selectivity, residual) in [("50%", "id % 2 = 0"), ("0.01%", "id % 10000 = 0")] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("residual_{selectivity}"), segments),
+                &dataset,
+                |b, dataset| {
+                    b.iter(|| {
+                        rt.block_on(ordered_limit(dataset, |scanner| {
+                            scanner.filter(residual).unwrap();
+                        }))
+                    });
+                },
+            );
+        }
     }
     group.finish();
 }
