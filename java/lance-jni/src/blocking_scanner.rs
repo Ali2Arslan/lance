@@ -307,6 +307,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
     pub use_ordered_index: jboolean,
+    pub require_ordered_index: jboolean,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
     pub include_deleted_rows: jboolean,
@@ -443,6 +444,7 @@ pub(crate) fn build_scanner_with_options<'a>(
 
     scanner.use_scalar_index(options.use_scalar_index == JNI_TRUE);
     scanner.use_ordered_index(options.use_ordered_index == JNI_TRUE);
+    scanner.require_ordered_index(options.require_ordered_index == JNI_TRUE);
 
     env.get_optional(&options.query_obj, |env, java_obj| {
         // Set column and key for nearest search
@@ -669,6 +671,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     column_orderings: JObject<'local>,    // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,           // boolean
     use_ordered_index: jboolean,          // boolean
+    require_ordered_index: jboolean,      // boolean
     fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,              // boolean
@@ -704,6 +707,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             column_orderings,
             use_scalar_index,
             use_ordered_index,
+            require_ordered_index,
             fast_search,
             substrait_aggregate_obj,
             collect_stats,
@@ -741,6 +745,7 @@ fn inner_create_scanner<'local>(
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     use_ordered_index: jboolean,
+    require_ordered_index: jboolean,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
@@ -777,6 +782,7 @@ fn inner_create_scanner<'local>(
         column_orderings,
         use_scalar_index,
         use_ordered_index,
+        require_ordered_index,
         fast_search,
         substrait_aggregate_obj,
         include_deleted_rows,

@@ -1346,6 +1346,58 @@ public class ScannerTest {
   }
 
   @Test
+  void testRequireOrderedIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_require_ordered_index").toString();
+    try (BufferAllocator allocator = new RootAllocator()) {
+      TestUtils.SimpleTestDataset testDataset =
+          new TestUtils.SimpleTestDataset(allocator, datasetPath);
+      testDataset.createEmptyDataset().close();
+      List<FragmentMetadata> fragments = testDataset.createNewFragment(60, 20);
+      FragmentOperation.Append appendOp = new FragmentOperation.Append(fragments);
+      try (Dataset dataset = Dataset.commit(allocator, datasetPath, appendOp, Optional.of(1L))) {
+        ScalarIndexParams scalarParams = ScalarIndexParams.create("btree", "{}");
+        IndexParams indexParams = IndexParams.builder().setScalarIndexParams(scalarParams).build();
+        dataset.createIndex(
+            IndexOptions.builder(Collections.singletonList("id"), IndexType.BTREE, indexParams)
+                .withIndexName("id_idx")
+                .build());
+
+        ColumnOrdering.Builder ordering = new ColumnOrdering.Builder();
+        ordering.setColumnName("id");
+        ordering.setAscending(true);
+        ordering.setNullFirst(true);
+        ScanOptions.Builder required =
+            new ScanOptions.Builder()
+                .columns(Collections.singletonList("id"))
+                .setColumnOrderings(Collections.singletonList(ordering.build()))
+                .requireOrderedIndex(true);
+        assertScanFails(
+            dataset,
+            required.build(),
+            "OrderedIndexScan declined: the scan has no limit, so an ordered index read of "
+                + "column 'id' could not stop early");
+        assertScanFails(
+            dataset,
+            required.limit(10).useOrderedIndex(false).build(),
+            "require_ordered_index=true and use_ordered_index=false are mutually exclusive");
+      }
+    }
+  }
+
+  private static void assertScanFails(Dataset dataset, ScanOptions options, String message) {
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> {
+              try (LanceScanner scanner = dataset.newScan(options);
+                  ArrowReader reader = scanner.scanBatches()) {
+                reader.loadNextBatch();
+              }
+            });
+    assertTrue(error.getMessage().contains(message), error.getMessage());
+  }
+
+  @Test
   void testFastSearchSkipsUnindexedFragments(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("dataset_scanner_fast_search_scalar_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {

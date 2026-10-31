@@ -1,23 +1,182 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_schema::SortOptions;
 use datafusion::physical_plan::ExecutionPlan;
 use lance_file::version::ConcreteFileVersion;
-use lance_index::scalar::AnyQuery;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::registry::IndexOrderingCapability;
 use roaring::RoaringBitmap;
 
-use super::{FilterPlan, Scanner};
+use super::{ColumnOrdering, FilterPlan, Scanner};
+use crate::Error;
 use crate::index::DatasetIndexExt;
 use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::scalar_logical::load_named_scalar_segments;
 use crate::io::exec::ordered_index_scan::OrderedIndexScanExec;
-use crate::{Error, Result};
+
+/// Why a scan that orders by a column sorts its rows instead of reading an
+/// index on that column in key order.
+///
+/// With [`Scanner::require_ordered_index`] set, planning fails with an
+/// [`Error::InvalidInput`] whose source is this value.
+/// [`Scanner::explain_plan`] with `verbose` prints it after the plan.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum OrderedIndexDecline {
+    /// The scan orders by more than one column.
+    MultipleOrderKeys { columns: Vec<String> },
+    /// The scan option named by `option`, `use_ordered_index` or
+    /// `use_scalar_index`, is `false`.
+    Disabled {
+        column: String,
+        option: &'static str,
+    },
+    /// The order column is not a top-level field, such as a field of a struct.
+    NotPlainColumn { column: String },
+    /// The scan runs a vector, full-text, or MinHash search.
+    UnsupportedSearch {
+        column: String,
+        search: &'static str,
+    },
+    /// No index on the column can be read in key order. When the filter is an
+    /// exact search of one index on the column, only that index counts.
+    NoIndex { column: String },
+    /// The scan has no limit.
+    NoLimit { column: String },
+    /// The dataset or the scan has a property, described by `reason`, that
+    /// the ordered read does not handle.
+    UnsupportedScan {
+        column: String,
+        reason: Cow<'static, str>,
+    },
+    /// `filter` would have to run after the read, so the read could not stop
+    /// at the limit.
+    ResidualFilter {
+        column: String,
+        filter: Cow<'static, str>,
+    },
+    /// The index covers `indexed_fragments` of the dataset's `fragments`
+    /// fragments. `indexed_fragments` is `None` when a segment of the index
+    /// records no fragment coverage, so the count is unknown.
+    PartialCoverage {
+        column: String,
+        index: String,
+        indexed_fragments: Option<usize>,
+        fragments: usize,
+    },
+    /// `source` stopped the read. With an `index`, that index failed to open
+    /// or rejected a read in key order. Without one, the dataset's indices
+    /// failed to load.
+    UnreadableIndex {
+        column: String,
+        index: Option<String>,
+        source: Box<Error>,
+    },
+}
+
+impl OrderedIndexDecline {
+    fn unreadable(column: &str, index: Option<&str>, source: Error) -> Self {
+        // The sort never needed the index, so an index that fails to open
+        // must not fail the scan unless it requires the ordered read.
+        if !matches!(source, Error::NotSupported { .. }) {
+            log::warn!("sorting instead of reading the index on '{column}' in order: {source}");
+        }
+        Self::UnreadableIndex {
+            column: column.to_owned(),
+            index: index.map(str::to_owned),
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for OrderedIndexDecline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OrderedIndexScan declined: ")?;
+        match self {
+            Self::MultipleOrderKeys { columns } => write!(
+                f,
+                "the scan orders by {} columns ({}), and an ordered index read serves one",
+                columns.len(),
+                columns.join(", ")
+            ),
+            Self::Disabled { column, option } => write!(
+                f,
+                "{option}=false turns off ordered index reads for column '{column}'"
+            ),
+            Self::NotPlainColumn { column } => {
+                write!(f, "order column '{column}' is not a top-level field")
+            }
+            Self::UnsupportedSearch { column, search } => write!(
+                f,
+                "the scan runs a {search}, which an ordered index read of column '{column}' \
+                 cannot serve"
+            ),
+            Self::NoIndex { column } => write!(
+                f,
+                "column '{column}' has no ordered index that this scan can read"
+            ),
+            Self::NoLimit { column } => write!(
+                f,
+                "the scan has no limit, so an ordered index read of column '{column}' could not \
+                 stop early"
+            ),
+            Self::UnsupportedScan { column, reason } => write!(
+                f,
+                "column '{column}' cannot be read in key order from an index because {reason}"
+            ),
+            Self::ResidualFilter { column, filter } => write!(
+                f,
+                "{filter} is not one exact search of an index on column '{column}', so an \
+                 ordered read cannot apply it before the limit"
+            ),
+            Self::PartialCoverage {
+                column,
+                index,
+                indexed_fragments: Some(indexed_fragments),
+                fragments,
+            } => write!(
+                f,
+                "index '{index}' on column '{column}' covers {indexed_fragments} of the \
+                 dataset's {fragments} fragments"
+            ),
+            Self::PartialCoverage {
+                column,
+                index,
+                indexed_fragments: None,
+                fragments,
+            } => write!(
+                f,
+                "index '{index}' on column '{column}' has a segment that records no fragment \
+                 coverage, so it cannot prove that it covers the dataset's {fragments} fragments"
+            ),
+            Self::UnreadableIndex {
+                column,
+                index: Some(index),
+                source,
+            } => write!(
+                f,
+                "index '{index}' on column '{column}' cannot be read in key order: {source}"
+            ),
+            Self::UnreadableIndex {
+                column,
+                index: None,
+                source,
+            } => write!(
+                f,
+                "the dataset's indices failed to load to read column '{column}' in key order: \
+                 {source}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OrderedIndexDecline {}
 
 impl Scanner {
     /// Set whether to read a B-tree index in key order to serve `order_by`.
@@ -46,134 +205,274 @@ impl Scanner {
         self
     }
 
+    /// Set whether a scan that orders by a column must read an index in key
+    /// order.
+    ///
+    /// When this is `true` and the scan cannot serve `order_by` from an index,
+    /// as [`Self::use_ordered_index`] describes, planning fails with
+    /// [`Error::InvalidInput`] instead of sorting. The error's source is the
+    /// [`OrderedIndexDecline`] that says why. With `use_ordered_index(false)`,
+    /// planning fails with [`Error::InvalidInput`] even without `order_by`.
+    /// Otherwise a scan without `order_by` is not affected.
+    ///
+    /// ```
+    /// # use lance::dataset::scanner::ColumnOrdering;
+    /// # use lance::{Dataset, Result};
+    /// # async fn test(dataset: &Dataset) -> Result<()> {
+    /// let mut scan = dataset.scan();
+    /// scan.order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".to_string())]))?
+    ///     .limit(Some(10), None)?
+    ///     .require_ordered_index(true);
+    /// let newest_ten = scan.try_into_batch().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn require_ordered_index(&mut self, require_ordered_index: bool) -> &mut Self {
+        self.require_ordered_index = require_ordered_index;
+        self
+    }
+
     pub(super) async fn try_ordered_read(
         &self,
+        ordering: &[ColumnOrdering],
         filter_plan: &mut FilterPlan,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
-        let (Some([ordering]), Some(limit)) = (self.ordering.as_deref(), self.limit) else {
-            return None;
+    ) -> Result<Arc<dyn ExecutionPlan>, OrderedIndexDecline> {
+        let [ordering] = ordering else {
+            return Err(OrderedIndexDecline::MultipleOrderKeys {
+                columns: ordering
+                    .iter()
+                    .map(|ordering| ordering.column_name.clone())
+                    .collect(),
+            });
         };
-        let is_legacy_storage = self
-            .dataset
-            .manifest()
-            .data_storage_format
-            .lance_file_format()
-            == ConcreteFileVersion::V1;
-        // The node applies the dataset's deletion files, not the list's, and has to
-        // skip the index rows of every other fragment, which can be most of the index.
-        let is_fragment_subset = self
-            .fragments
-            .as_ref()
-            .is_some_and(|fragments| fragments != self.dataset.fragments().as_ref());
-        // With stable row ids, an update can add the fragment it writes to the index's
-        // fragment bitmap without indexing its rows (issue 10351), so the bitmap
-        // cannot prove that the index covers every fragment.
-        let has_stable_row_ids = self.dataset.manifest().uses_stable_row_ids();
-        if !self.use_ordered_index
-            || !self.use_scalar_index
-            || self.external_row_mask.is_some()
-            || self.physical_row_addr_prefilter.is_some()
-            || self.include_deleted_rows
-            || is_legacy_storage
-            || is_fragment_subset
-            || has_stable_row_ids
-        {
-            return None;
+        let column = &ordering.column_name;
+        let disabled_by = if !self.use_ordered_index {
+            Some("use_ordered_index")
+        } else if !self.use_scalar_index {
+            Some("use_scalar_index")
+        } else {
+            None
+        };
+        if let Some(option) = disabled_by {
+            return Err(OrderedIndexDecline::Disabled {
+                column: column.clone(),
+                option,
+            });
         }
-        let fetch = self
-            .offset
-            .unwrap_or(0)
-            .checked_add(limit)
-            .and_then(|fetch| usize::try_from(fetch).ok())?;
+        let search = if self.nearest.is_some() {
+            Some("vector search")
+        } else if self.full_text_query.is_some() {
+            Some("full-text search")
+        } else if self.minhash_query.is_some() {
+            Some("MinHash search")
+        } else {
+            None
+        };
+        if let Some(search) = search {
+            return Err(OrderedIndexDecline::UnsupportedSearch {
+                column: column.clone(),
+                search,
+            });
+        }
         let schema = self.dataset.schema();
-        let field = schema
-            .fields
-            .iter()
-            .find(|field| field.name == ordering.column_name)?;
+        let Some(field) = schema.fields.iter().find(|field| &field.name == column) else {
+            return Err(OrderedIndexDecline::NotPlainColumn {
+                column: column.clone(),
+            });
+        };
+        let fetch = self.ordered_fetch(column)?;
+        let residual_filter = |filter: String| OrderedIndexDecline::ResidualFilter {
+            column: column.clone(),
+            filter: filter.into(),
+        };
         let expr_filter = &filter_plan.expr_filter_plan;
-        let (index_name, query) = match &expr_filter.index_query {
-            None if expr_filter.full_expr.is_none() => (None, None),
-            Some(ScalarIndexExpr::Query(search)) if expr_filter.is_exact_index_search() => {
+        let search = match (&expr_filter.index_query, &expr_filter.full_expr) {
+            (None, None) => None,
+            (Some(ScalarIndexExpr::Query(search)), _) if expr_filter.is_exact_index_search() => {
+                Some(search)
+            }
+            (_, Some(expr)) => return Err(residual_filter(format!("filter `{expr}`"))),
+            (Some(index_query), None) => {
+                return Err(residual_filter(format!("index query `{index_query}`")));
+            }
+        };
+        let indices = self
+            .dataset
+            .load_indices()
+            .await
+            .map_err(|source| OrderedIndexDecline::unreadable(column, None, source))?;
+        let (index_name, query) = match search {
+            None => (None, None),
+            Some(search)
+                if indices
+                    .iter()
+                    .any(|index| index.name == search.index_name && index.fields == [field.id]) =>
+            {
                 (Some(search.index_name.clone()), Some(search.query.clone()))
             }
-            _ => return None,
+            Some(search) => {
+                return Err(residual_filter(format!(
+                    "the filter's search of index '{}'",
+                    search.index_name
+                )));
+            }
         };
         let options = SortOptions {
             descending: !ordering.ascending,
             nulls_first: ordering.nulls_first,
         };
-        // The sort never needed the index, so an index that fails to open
-        // must not fail the scan.
-        let scan = match self
-            .ordered_index_scan(&field.name, field.id, index_name.as_deref(), query, options)
-            .await
-        {
-            Ok(scan) => scan?,
-            Err(error @ Error::NotSupported { .. }) => {
-                log::debug!("sorting instead of reading the index in order: {error}");
-                return None;
-            }
-            Err(error) => {
-                log::warn!(
-                    "sorting instead of reading the index on '{}' in order: {error}",
-                    field.name
-                );
-                return None;
-            }
+        let fragments = self.dataset.fragments();
+        let mut decline = OrderedIndexDecline::NoIndex {
+            column: column.clone(),
         };
-        let plan = scan.with_fetch(Some(fetch))?;
-        filter_plan.disable_refine();
-        Some(plan)
-    }
-
-    async fn ordered_index_scan(
-        &self,
-        column: &str,
-        field_id: i32,
-        index_name: Option<&str>,
-        query: Option<Arc<dyn AnyQuery>>,
-        options: SortOptions,
-    ) -> Result<Option<OrderedIndexScanExec>> {
-        let indices = self.dataset.load_indices().await?;
         let mut checked = HashSet::new();
         for index in indices.iter() {
-            if index.fields != [field_id]
-                || index_name.is_some_and(|name| name != index.name)
+            if index.fields != [field.id]
+                || index_name.as_ref().is_some_and(|name| *name != index.name)
                 || !checked.insert(index.name.as_str())
             {
                 continue;
             }
-            let details = IndexDetails(fetch_index_details(&self.dataset, column, index).await?);
+            let unreadable =
+                |source| OrderedIndexDecline::unreadable(column, Some(&index.name), source);
+            let details = IndexDetails(
+                fetch_index_details(&self.dataset, column, index)
+                    .await
+                    .map_err(unreadable)?,
+            );
             if details.is_vector()
-                || details.get_plugin()?.ordering_capability(&details.0)
+                || details
+                    .get_plugin()
+                    .map_err(unreadable)?
+                    .ordering_capability(&details.0)
                     != IndexOrderingCapability::Bidirectional
             {
                 continue;
             }
-            let segments = load_named_scalar_segments(&self.dataset, column, &index.name).await?;
-            let Some(indexed) = segments
+            let segments = load_named_scalar_segments(&self.dataset, column, &index.name)
+                .await
+                .map_err(unreadable)?;
+            let indexed_fragments = segments
                 .iter()
                 .try_fold(RoaringBitmap::new(), |indexed, segment| {
                     Some(indexed | segment.fragment_bitmap.as_ref()?)
                 })
-            else {
-                continue;
-            };
-            if segments.is_empty()
-                || !self
-                    .dataset
-                    .fragments()
+                .map(|indexed| {
+                    fragments
+                        .iter()
+                        .filter(|fragment| indexed.contains(fragment.id as u32))
+                        .count()
+                });
+            if segments.is_empty() || indexed_fragments != Some(fragments.len()) {
+                // `segments` leaves out the segments that record no fragment coverage.
+                let is_coverage_unknown = indices
                     .iter()
-                    .all(|fragment| indexed.contains(fragment.id as u32))
-            {
+                    .any(|segment| segment.name == index.name && segment.fragment_bitmap.is_none());
+                decline = OrderedIndexDecline::PartialCoverage {
+                    column: column.clone(),
+                    index: index.name.clone(),
+                    indexed_fragments: indexed_fragments.filter(|_| !is_coverage_unknown),
+                    fragments: fragments.len(),
+                };
                 continue;
             }
-            let scan =
+            let plan =
                 OrderedIndexScanExec::try_new(self.dataset.clone(), segments, query, options, None)
-                    .await?;
-            return Ok(Some(scan));
+                    .await
+                    .map_err(unreadable)?
+                    .with_fetch(Some(fetch))
+                    .ok_or_else(|| {
+                        unreadable(Error::internal(
+                            "OrderedIndexScanExec does not accept a fetch",
+                        ))
+                    })?;
+            filter_plan.disable_refine();
+            return Ok(plan);
         }
-        Ok(None)
+        Err(decline)
+    }
+
+    /// Returns `offset + limit` when the dataset and the scan's options let an
+    /// ordered read stop there, or the reason they do not.
+    fn ordered_fetch(&self, column: &str) -> Result<usize, OrderedIndexDecline> {
+        let offset = self.offset.unwrap_or(0);
+        let Some(limit) = self.limit else {
+            return Err(OrderedIndexDecline::NoLimit {
+                column: column.to_owned(),
+            });
+        };
+        let Some(fetch) = offset
+            .checked_add(limit)
+            .and_then(|fetch| usize::try_from(fetch).ok())
+        else {
+            return Err(OrderedIndexDecline::UnsupportedScan {
+                column: column.to_owned(),
+                reason: format!(
+                    "offset {offset} plus limit {limit} overflows the number of rows the read \
+                     can fetch"
+                )
+                .into(),
+            });
+        };
+        let dataset_fragments = self.dataset.fragments();
+        let unsupported: Option<Cow<'static, str>> = if self
+            .dataset
+            .manifest()
+            .data_storage_format
+            .lance_file_format()
+            == ConcreteFileVersion::V1
+        {
+            Some("the dataset stores its rows in the legacy file format".into())
+        } else if let Some(fragments) = self
+            .fragments
+            .as_ref()
+            .filter(|fragments| *fragments != dataset_fragments.as_ref())
+        {
+            // The node applies the dataset's deletion files, not the list's, and has to
+            // skip the index rows of every other fragment, which can be most of the index.
+            Some(
+                format!(
+                    "the scan reads a list of {} fragments that differs from the dataset's {} \
+                     fragments",
+                    fragments.len(),
+                    dataset_fragments.len()
+                )
+                .into(),
+            )
+        } else if self.dataset.manifest().uses_stable_row_ids() {
+            // With stable row ids, an update can add the fragment it writes to the index's
+            // fragment bitmap without indexing its rows (issue 10351), so the bitmap
+            // cannot prove that the index covers every fragment.
+            Some(
+                "the dataset uses stable row ids, so an index's fragment bitmap cannot prove \
+                 that it covers every fragment"
+                    .into(),
+            )
+        } else if self.include_deleted_rows {
+            Some("the scan includes deleted rows".into())
+        } else {
+            None
+        };
+        if let Some(reason) = unsupported {
+            return Err(OrderedIndexDecline::UnsupportedScan {
+                column: column.to_owned(),
+                reason,
+            });
+        }
+        let filter = if self.external_row_mask.is_some() {
+            Some("the row id prefilter")
+        } else if self.physical_row_addr_prefilter.is_some() {
+            Some("the physical row address prefilter")
+        } else {
+            None
+        };
+        if let Some(filter) = filter {
+            return Err(OrderedIndexDecline::ResidualFilter {
+                column: column.to_owned(),
+                filter: filter.into(),
+            });
+        }
+        Ok(fetch)
     }
 }
 
@@ -195,6 +494,7 @@ mod tests {
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::scalar::minhash_lsh::MinHashQuery;
     use lance_index::scalar::{
         BuiltinIndexType, FullTextSearchQuery, InvertedIndexParams, ScalarIndexParams,
     };
@@ -202,10 +502,10 @@ mod tests {
     use rstest::rstest;
 
     use super::super::{ColumnOrdering, RowAddrMask, RowAddrTreeMap, Scanner};
-    use crate::Dataset;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::{Dataset, Error};
 
     const ROWS: i32 = 300;
     const FRAGMENT_ROWS: usize = 100;
@@ -314,7 +614,7 @@ mod tests {
 
     enum Expect<'a> {
         OrderedScan(&'a str),
-        Sort,
+        Sort { reason_prefix: &'a str },
     }
 
     async fn assert_ordered_read(
@@ -325,11 +625,33 @@ mod tests {
         let (plan, rows) = scan(dataset, &configure, true).await;
         let (sorted_plan, sorted_rows) = scan(dataset, &configure, false).await;
         assert!(!sorted_plan.contains("OrderedIndexScan"), "{sorted_plan}");
+        let mut scanner = dataset.scan();
+        configure(&mut scanner);
+        let verbose_plan = scanner.explain_plan(true).await.unwrap();
+        let required_plan = scanner
+            .require_ordered_index(true)
+            .explain_plan(false)
+            .await;
         match expect {
             Expect::OrderedScan(node) => {
-                assert!(plan.contains(node) && !plan.contains("SortExec"), "{plan}")
+                assert!(plan.contains(node) && !plan.contains("SortExec"), "{plan}");
+                assert!(!verbose_plan.contains("declined"), "{verbose_plan}");
+                assert_eq!(required_plan.unwrap(), plan);
             }
-            Expect::Sort => assert_eq!(plan, sorted_plan),
+            Expect::Sort { reason_prefix } => {
+                assert_eq!(plan, sorted_plan);
+                let declined = format!("OrderedIndexScan declined: {reason_prefix}");
+                let last_line = verbose_plan.lines().last().unwrap();
+                assert!(
+                    last_line.starts_with(&declined)
+                        && verbose_plan.matches("declined").count() == 1
+                        && !plan.contains("declined"),
+                    "{verbose_plan}"
+                );
+                let error = required_plan.unwrap_err();
+                assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+                assert!(error.to_string().contains(&declined), "{error}");
+            }
         }
         assert_eq!(rows, sorted_rows);
         rows
@@ -420,7 +742,10 @@ mod tests {
         };
         let node = format!("OrderedIndexScan: index={INDEX}, order=[ts DESC NULLS LAST], fetch=23");
         let expect = if enable_stable_row_ids {
-            Expect::Sort
+            Expect::Sort {
+                reason_prefix: "column 'ts' cannot be read in key order from an index because the dataset uses stable row ids, so an index's fragment \
+                 bitmap cannot prove that it covers every fragment",
+            }
         } else {
             Expect::OrderedScan(&node)
         };
@@ -431,13 +756,13 @@ mod tests {
     #[rstest]
     #[case::scalar_index_disabled(|scanner: &mut Scanner| {
         scanner.use_scalar_index(false);
-    })]
+    }, "use_scalar_index=false turns off ordered index reads for column 'ts'")]
     #[case::no_limit(|scanner: &mut Scanner| {
         scanner.limit(None, Some(3)).unwrap();
-    })]
+    }, "the scan has no limit, so an ordered index read of column 'ts' could not stop early")]
     #[case::offset_plus_limit_overflows(|scanner: &mut Scanner| {
         scanner.limit(Some(i64::MAX), Some(i64::MAX)).unwrap();
-    })]
+    }, "column 'ts' cannot be read in key order from an index because offset 9223372036854775807 plus limit 9223372036854775807 overflows the number of rows the read can fetch")]
     #[case::two_order_columns(|scanner: &mut Scanner| {
         scanner
             .order_by(Some(vec![
@@ -445,44 +770,117 @@ mod tests {
                 ColumnOrdering::asc_nulls_last("id".into()),
             ]))
             .unwrap();
-    })]
+    }, "the scan orders by 2 columns (ts, id), and an ordered index read serves one")]
     #[case::unindexed_order_column(|scanner: &mut Scanner| {
         scanner
             .order_by(Some(vec![ColumnOrdering::asc_nulls_last("v".into())]))
             .unwrap();
-    })]
+    }, "column 'v' has no ordered index that this scan can read")]
     #[case::filter_on_another_column(|scanner: &mut Scanner| {
         scanner.filter("v > 100").unwrap();
-    })]
+    }, "filter `v > Int64(100)` is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::filter_with_a_residual(|scanner: &mut Scanner| {
         scanner.filter("ts > 5 AND v < 2000").unwrap();
-    })]
+    }, "filter `ts > Int32(5) AND v < Int64(2000)` is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::filter_of_two_index_queries(|scanner: &mut Scanner| {
         scanner.filter("ts < 10 OR ts > 290").unwrap();
-    })]
+    }, "filter `ts < Int32(10) OR ts > Int32(290)` is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::row_id_prefilter(|scanner: &mut Scanner| {
         scanner.with_row_id_prefilter(RowAddrMask::from_allowed(RowAddrTreeMap::from_iter(0..50)));
-    })]
+    }, "the row id prefilter is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::physical_row_prefilter(|scanner: &mut Scanner| {
         scanner.with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter(0..50));
-    })]
+    }, "the physical row address prefilter is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::deleted_rows_included(|scanner: &mut Scanner| {
         scanner.with_row_id().include_deleted_rows();
-    })]
+    }, "column 'ts' cannot be read in key order from an index because the scan includes deleted rows")]
     #[case::fragment_subset(|scanner: &mut Scanner| {
         let fragments = scanner.dataset.fragments()[1..].to_vec();
         scanner.with_fragments(fragments);
-    })]
+    }, "column 'ts' cannot be read in key order from an index because the scan reads a list of 2 fragments that differs from the dataset's 3 fragments")]
+    #[case::row_id_take(|scanner: &mut Scanner| {
+        scanner.filter("_rowid IN (1, 2, 3)").unwrap();
+    }, "filter `_rowid = UInt64(1) OR _rowid = UInt64(2) OR _rowid = UInt64(3)` is not one exact search of an index on column 'ts', so an ordered read cannot apply it before the limit")]
     #[case::vector_search(|scanner: &mut Scanner| {
         scanner.nearest("vec", &Float32Array::from(vec![10.0, 10.0]), 30).unwrap();
-    })]
+    }, "the scan runs a vector search, which an ordered index read of column 'ts' cannot serve")]
     #[tokio::test]
-    async fn test_ordered_read_declines_scan_options(#[case] decline: fn(&mut Scanner)) {
+    async fn test_ordered_decline_scan_options(
+        #[case] decline: fn(&mut Scanner),
+        #[case] reason: &str,
+    ) {
         let dataset = dataset(WriteParams::default()).await;
         let configure = |scanner: &mut Scanner| {
             decline(order_by_ts(scanner));
         };
-        assert_ordered_read(&dataset, configure, Expect::Sort).await;
+        let expect = Expect::Sort {
+            reason_prefix: reason,
+        };
+        assert_ordered_read(&dataset, configure, expect).await;
+    }
+
+    #[rstest]
+    #[case::required_first(true)]
+    #[case::disabled_first(false)]
+    #[tokio::test]
+    async fn test_ordered_decline_with_use_ordered_index_false(#[case] required_first: bool) {
+        let dataset = dataset(WriteParams::default()).await;
+        let mut scanner = dataset.scan();
+        order_by_ts(&mut scanner);
+        if required_first {
+            scanner.require_ordered_index(true).use_ordered_index(false);
+        } else {
+            scanner.use_ordered_index(false).require_ordered_index(true);
+        }
+        let error = scanner.explain_plan(false).await.unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "require_ordered_index=true and use_ordered_index=false are mutually exclusive"
+            ),
+            "{error}"
+        );
+        let plan = scanner
+            .require_ordered_index(false)
+            .explain_plan(true)
+            .await
+            .unwrap();
+        assert!(
+            plan.ends_with(
+                "OrderedIndexScan declined: use_ordered_index=false turns off ordered index \
+                 reads for column 'ts'\n"
+            ),
+            "{plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ordered_decline_precedes_a_failing_source() {
+        let dataset = dataset(WriteParams::default()).await;
+        let mut scanner = dataset.scan();
+        order_by_ts(&mut scanner)
+            .minhash_search(MinHashQuery::new("even", "text"))
+            .unwrap();
+        let source_error = scanner.explain_plan(false).await.unwrap_err();
+        assert!(
+            source_error
+                .to_string()
+                .contains("No MinHash LSH index found for column text"),
+            "{source_error}"
+        );
+        let error = scanner
+            .require_ordered_index(true)
+            .explain_plan(false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "OrderedIndexScan declined: the scan runs a MinHash search, which an ordered \
+                 index read of column 'ts' cannot serve"
+            ),
+            "{error}"
+        );
     }
 
     async fn overlay_key(dataset: Dataset, old_key: i32, new_key: i32) -> Dataset {
@@ -534,8 +932,8 @@ mod tests {
         .unwrap()
     }
 
-    async fn segmented_dataset(segment_fragments: &[&[u32]]) -> Dataset {
-        let mut dataset = write("memory://", WriteParams::default()).await;
+    async fn segmented_dataset(uri: &str, segment_fragments: &[&[u32]]) -> Dataset {
+        let mut dataset = write(uri, WriteParams::default()).await;
         let mut segments = Vec::new();
         for fragment_ids in segment_fragments {
             let segment = dataset
@@ -555,9 +953,13 @@ mod tests {
         dataset
     }
 
-    async fn recommit_segment(dataset: &mut Dataset, segment: IndexMetadata, fragments: &[u32]) {
+    async fn recommit_segment(
+        dataset: &mut Dataset,
+        segment: IndexMetadata,
+        fragments: Option<&[u32]>,
+    ) {
         let recommitted = IndexMetadata {
-            fragment_bitmap: Some(fragments.iter().copied().collect()),
+            fragment_bitmap: fragments.map(|fragments| fragments.iter().copied().collect()),
             ..segment.clone()
         };
         let transaction = Transaction::new(
@@ -613,16 +1015,18 @@ mod tests {
                     .unwrap();
                 (dataset, 2)
             }
-            Segments::OnePerFragment => (segmented_dataset(&[&[0], &[1], &[2]]).await, 3),
+            Segments::OnePerFragment => {
+                (segmented_dataset("memory://", &[&[0], &[1], &[2]]).await, 3)
+            }
             Segments::OneEmptiedByDeletes => {
-                let mut dataset = segmented_dataset(&[&[0], &[1], &[2]]).await;
+                let mut dataset = segmented_dataset("memory://", &[&[0], &[1], &[2]]).await;
                 dataset.delete("id >= 200").await.unwrap();
                 (dataset, 2)
             }
             Segments::FragmentClaimedTwice => {
                 // The commit finds the overlap and recomputes each segment's
                 // coverage from its rows, so the scan sees disjoint segments.
-                let mut dataset = segmented_dataset(&[&[0, 1], &[2]]).await;
+                let mut dataset = segmented_dataset("memory://", &[&[0, 1], &[2]]).await;
                 let last = dataset
                     .load_indices_by_name(INDEX)
                     .await
@@ -630,7 +1034,7 @@ mod tests {
                     .into_iter()
                     .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(2))
                     .unwrap();
-                recommit_segment(&mut dataset, last, &[1, 2]).await;
+                recommit_segment(&mut dataset, last, Some(&[1, 2])).await;
                 (dataset, 2)
             }
         };
@@ -670,7 +1074,9 @@ mod tests {
     #[derive(Debug)]
     enum IndexShape {
         AppendedFragment,
+        FragmentSubsetOfPartialIndex,
         SegmentsMissingAFragment,
+        SegmentWithoutCoverage,
         SegmentWithNewerKeyOverlay,
         BitmapIndex,
         NestedKey,
@@ -679,6 +1085,54 @@ mod tests {
         MissingIndexFiles,
         FullTextSearch,
         StableRowIdsClaimingAnUpdatedFragment,
+        FilterOnAnotherIndex,
+    }
+
+    impl IndexShape {
+        fn reason(&self) -> &'static str {
+            match self {
+                Self::AppendedFragment => {
+                    "index 'ts_idx' on column 'ts' covers 3 of the dataset's 4 fragments"
+                }
+                Self::FragmentSubsetOfPartialIndex => {
+                    "column 'ts' cannot be read in key order from an index because the scan reads \
+                     a list of 3 fragments that differs from the dataset's 4 fragments"
+                }
+                Self::SegmentsMissingAFragment => {
+                    "index 'ts_idx' on column 'ts' covers 2 of the dataset's 3 fragments"
+                }
+                Self::SegmentWithoutCoverage => {
+                    "index 'ts_idx' on column 'ts' has a segment that records no fragment \
+                     coverage, so it cannot prove that it covers the dataset's 3 fragments"
+                }
+                Self::SegmentWithNewerKeyOverlay | Self::NewerKeyOverlay => {
+                    "index 'ts_idx' on column 'ts' cannot be read in key order: Not supported: \
+                     ordered index scan cannot read segment"
+                }
+                Self::BitmapIndex => "column 'id' has no ordered index that this scan can read",
+                Self::NestedKey => "order column 's.k' is not a top-level field",
+                Self::LegacyStorage => {
+                    "column 'ts' cannot be read in key order from an index because the dataset \
+                     stores its rows in the legacy file format"
+                }
+                Self::MissingIndexFiles => {
+                    "index 'ts_idx' on column 'ts' cannot be read in key order: "
+                }
+                Self::FullTextSearch => {
+                    "the scan runs a full-text search, which an ordered index read of column 'ts' \
+                     cannot serve"
+                }
+                Self::StableRowIdsClaimingAnUpdatedFragment => {
+                    "column 'ts' cannot be read in key order from an index because the dataset \
+                     uses stable row ids, so an index's fragment bitmap cannot prove that it \
+                     covers every fragment"
+                }
+                Self::FilterOnAnotherIndex => {
+                    "the filter's search of index 'id_idx' is not one exact search of an index on \
+                     column 'ts', so an ordered read cannot apply it before the limit"
+                }
+            }
+        }
     }
 
     async fn claim_updated_fragment() -> Dataset {
@@ -705,16 +1159,18 @@ mod tests {
             .iter()
             .map(|fragment| fragment.id as u32)
             .collect::<Vec<_>>();
-        recommit_segment(&mut dataset, index, &fragments).await;
+        recommit_segment(&mut dataset, index, Some(&fragments)).await;
         dataset
     }
 
     #[rstest]
     #[tokio::test]
-    async fn test_ordered_read_declines_index_shapes(
+    async fn test_ordered_decline_index_shapes(
         #[values(
             IndexShape::AppendedFragment,
+            IndexShape::FragmentSubsetOfPartialIndex,
             IndexShape::SegmentsMissingAFragment,
+            IndexShape::SegmentWithoutCoverage,
             IndexShape::SegmentWithNewerKeyOverlay,
             IndexShape::BitmapIndex,
             IndexShape::NestedKey,
@@ -722,15 +1178,17 @@ mod tests {
             IndexShape::NewerKeyOverlay,
             IndexShape::MissingIndexFiles,
             IndexShape::FullTextSearch,
-            IndexShape::StableRowIdsClaimingAnUpdatedFragment
+            IndexShape::StableRowIdsClaimingAnUpdatedFragment,
+            IndexShape::FilterOnAnotherIndex
         )]
         shape: IndexShape,
     ) {
         let mut order_column = "ts";
         let mut full_text_query = None;
+        let mut filter = None;
         let tempdir = TempStrDir::default();
         let dataset = match shape {
-            IndexShape::AppendedFragment => {
+            IndexShape::AppendedFragment | IndexShape::FragmentSubsetOfPartialIndex => {
                 let mut dataset = dataset(WriteParams::default()).await;
                 let batch = rows(ROWS..ROWS + 30);
                 dataset
@@ -742,11 +1200,32 @@ mod tests {
                     .unwrap();
                 dataset
             }
-            IndexShape::SegmentsMissingAFragment => segmented_dataset(&[&[0], &[2]]).await,
+            IndexShape::SegmentsMissingAFragment => {
+                segmented_dataset("memory://", &[&[0], &[2]]).await
+            }
+            IndexShape::SegmentWithoutCoverage => {
+                let dataset = segmented_dataset(tempdir.as_str(), &[&[0, 1], &[2]]).await;
+                let segment = dataset
+                    .load_indices_by_name(INDEX)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|segment| segment.fragment_bitmap.as_ref().unwrap().contains(2))
+                    .unwrap();
+                // A commit recomputes a missing bitmap from any segment it can open.
+                dataset
+                    .object_store
+                    .remove_dir_all(dataset.indices_dir().join(segment.uuid.to_string()))
+                    .await
+                    .unwrap();
+                let mut dataset = Dataset::open(tempdir.as_str()).await.unwrap();
+                recommit_segment(&mut dataset, segment, None).await;
+                dataset
+            }
             IndexShape::SegmentWithNewerKeyOverlay => {
                 let key_in_fragment_2 = 250;
                 overlay_key(
-                    segmented_dataset(&[&[0, 1], &[2]]).await,
+                    segmented_dataset("memory://", &[&[0, 1], &[2]]).await,
                     key_in_fragment_2,
                     -1,
                 )
@@ -822,6 +1301,19 @@ mod tests {
                 dataset
             }
             IndexShape::StableRowIdsClaimingAnUpdatedFragment => claim_updated_fragment().await,
+            IndexShape::FilterOnAnotherIndex => {
+                let mut dataset = dataset(WriteParams::default()).await;
+                dataset
+                    .create_index(&["id"], IndexType::BTree, None, &btree(), false)
+                    .await
+                    .unwrap();
+                filter = Some("id < 100");
+                dataset
+            }
+        };
+        let fragments = match shape {
+            IndexShape::FragmentSubsetOfPartialIndex => Some(dataset.fragments()[..3].to_vec()),
+            _ => None,
         };
         let configure = |scanner: &mut Scanner| {
             scanner
@@ -836,8 +1328,65 @@ mod tests {
             if let Some(query) = &full_text_query {
                 scanner.full_text_search(query.clone()).unwrap();
             }
+            if let Some(filter) = filter {
+                scanner.filter(filter).unwrap();
+            }
+            if let Some(fragments) = &fragments {
+                scanner.with_fragments(fragments.clone());
+            }
         };
-        let rows = assert_ordered_read(&dataset, configure, Expect::Sort).await;
+        let expect = Expect::Sort {
+            reason_prefix: shape.reason(),
+        };
+        let rows = assert_ordered_read(&dataset, configure, expect).await;
         assert_eq!(rows.num_rows(), 10, "{shape:?}");
+    }
+
+    #[tokio::test]
+    async fn test_ordered_decline_with_a_partial_index_before_a_full_one() {
+        let mut dataset = write("memory://", WriteParams::default()).await;
+        let partial = dataset
+            .create_index_builder(&["ts"], IndexType::BTree, &btree())
+            .name("partial_ts_idx".into())
+            .fragments(vec![0])
+            .execute_uncommitted()
+            .await
+            .unwrap();
+        dataset
+            .commit_existing_index_segments("partial_ts_idx", "ts", vec![partial])
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ts"],
+                IndexType::BTree,
+                Some(INDEX.into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        delete(&mut dataset).await;
+        let node = format!("OrderedIndexScan: index={INDEX}, order=[ts ASC NULLS LAST], fetch=10");
+        assert_ordered_read(
+            &dataset,
+            |scanner: &mut Scanner| {
+                order_by_ts(scanner);
+            },
+            Expect::OrderedScan(&node),
+        )
+        .await;
+        let expect = Expect::Sort {
+            reason_prefix: "the scan has no limit, so an ordered index read of column 'ts' \
+                            could not stop early",
+        };
+        assert_ordered_read(
+            &dataset,
+            |scanner: &mut Scanner| {
+                order_by_ts(scanner).limit(None, None).unwrap();
+            },
+            expect,
+        )
+        .await;
     }
 }

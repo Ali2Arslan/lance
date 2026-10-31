@@ -46,6 +46,7 @@ public class ScanOptions {
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
   private final boolean useOrderedIndex;
+  private final boolean requireOrderedIndex;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -246,6 +247,7 @@ public class ScanOptions {
         columnOrderings,
         useScalarIndex,
         true,
+        false,
         substraitAggregate,
         collectStats,
         fastSearch,
@@ -278,6 +280,7 @@ public class ScanOptions {
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
       boolean useOrderedIndex,
+      boolean requireOrderedIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -327,6 +330,7 @@ public class ScanOptions {
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
     this.useOrderedIndex = useOrderedIndex;
+    this.requireOrderedIndex = requireOrderedIndex;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -541,6 +545,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get whether a scan with column orderings must read an index in key order.
+   *
+   * @return true if the scan must read an index in key order, false otherwise.
+   */
+  public boolean isRequireOrderedIndex() {
+    return requireOrderedIndex;
+  }
+
+  /**
    * Get whether to only search indexed fragments.
    *
    * @return true if unindexed fragments should be skipped, false otherwise.
@@ -617,6 +630,7 @@ public class ScanOptions {
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
         .add("useOrderedIndex", useOrderedIndex)
+        .add("requireOrderedIndex", requireOrderedIndex)
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -653,6 +667,7 @@ public class ScanOptions {
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
     private boolean useOrderedIndex = true;
+    private boolean requireOrderedIndex = false;
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -691,6 +706,7 @@ public class ScanOptions {
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
       this.useOrderedIndex = options.isUseOrderedIndex();
+      this.requireOrderedIndex = options.isRequireOrderedIndex();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -988,6 +1004,24 @@ public class ScanOptions {
     }
 
     /**
+     * Set whether a scan with column orderings must read an index in key order.
+     *
+     * <p>When true and the scan cannot serve the column orderings from an index, as {@link
+     * #useOrderedIndex(boolean)} describes, the scan throws {@link IllegalArgumentException}
+     * instead of sorting. The message says why, for example that the scan has no limit. With {@code
+     * useOrderedIndex(false)}, the scan throws {@link IllegalArgumentException} even without column
+     * orderings. Otherwise a scan without column orderings is not affected.
+     *
+     * @param requireOrderedIndex true to fail instead of sorting, false otherwise. Default is
+     *     false.
+     * @return Builder instance for method chaining.
+     */
+    public Builder requireOrderedIndex(boolean requireOrderedIndex) {
+      this.requireOrderedIndex = requireOrderedIndex;
+      return this;
+    }
+
+    /**
      * Set whether to only search indexed fragments.
      *
      * <p>This is a weak-consistency mode for vector search, full text search, and scalar-indexed
@@ -1090,6 +1124,7 @@ public class ScanOptions {
           columnOrderings,
           useScalarIndex,
           useOrderedIndex,
+          requireOrderedIndex,
           substraitAggregate,
           collectStats,
           fastSearch,

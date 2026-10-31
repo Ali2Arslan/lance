@@ -7190,3 +7190,44 @@ def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
     assert scanner.to_table() == newest
     to_table = dataset.to_table(columns=["v"], order_by=order_by, limit=10, **options)
     assert to_table == newest
+
+
+@pytest.fixture
+def ts_index_dataset(tmp_path):
+    table = pa.table({"ts": pa.array(range(59, -1, -1), pa.int32())})
+    dataset = lance.write_dataset(table, tmp_path, max_rows_per_file=20)
+    dataset.create_scalar_index("ts", "BTREE", name="ts_idx")
+    return dataset
+
+
+def test_require_ordered_index_without_limit(ts_index_dataset):
+    reason = (
+        "OrderedIndexScan declined: the scan has no limit, so an ordered index read "
+        "of column 'ts' could not stop early"
+    )
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        ts_index_dataset.to_table(order_by=["ts"], require_ordered_index=True)
+    plan = ts_index_dataset.scanner(order_by=["ts"]).explain_plan(verbose=True)
+    assert plan.endswith(reason + "\n") and "SortExec" in plan, plan
+
+
+def test_require_ordered_index_with_use_ordered_index_false(ts_index_dataset):
+    error = (
+        "require_ordered_index=true and use_ordered_index=false are mutually exclusive"
+    )
+    with pytest.raises(ValueError, match=re.escape(error)):
+        ts_index_dataset.to_table(
+            order_by=["ts"],
+            limit=10,
+            require_ordered_index=True,
+            use_ordered_index=False,
+        )
+
+
+def test_require_ordered_index_reads_the_index(ts_index_dataset):
+    scanner = ts_index_dataset.scanner(
+        order_by=["ts"], limit=10, require_ordered_index=True
+    )
+    plan = scanner.explain_plan(verbose=True)
+    assert "OrderedIndexScan: index=ts_idx" in plan and "declined" not in plan, plan
+    assert scanner.to_table()["ts"].to_pylist() == list(range(10))
