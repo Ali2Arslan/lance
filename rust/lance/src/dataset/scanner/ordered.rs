@@ -24,7 +24,10 @@ use crate::io::exec::LanceFilterExec;
 use crate::io::exec::ordered_fallback::OrderedFallbackExec;
 use crate::io::exec::ordered_index_scan::OrderedIndexScanExec;
 
-const ROWS_PER_RESIDUAL_CANDIDATE: usize = 1024;
+// On 10,000,000 rows with `LIMIT 100`, 1024 was the fastest of 256, 512, 1024, and 2048 that
+// kept the read's p50 at most 0.3 times the sort's with a residual that keeps 50% of rows and
+// at most 1.5 times with one that keeps 0.01%. `rows / 256` took 2.0 times the sort at 0.01%.
+const ROWS_PER_RESIDUAL_CANDIDATE: u64 = 1024;
 const MIN_RESIDUAL_CANDIDATES_PER_ROW: usize = 4;
 
 pub(super) struct OrderedRead {
@@ -43,15 +46,20 @@ impl ResidualRead {
         &self,
         filter: Arc<dyn ExecutionPlan>,
     ) -> Result<Arc<dyn ExecutionPlan>, Error> {
-        filter
-            .downcast_ref::<LanceFilterExec>()
-            .and_then(|filter| filter.filter.with_fetch(Some(self.fetch)))
-            .ok_or_else(|| {
-                Error::internal(
-                    "the residual filter of an ordered index read is not a LanceFilterExec",
-                )
-            })
+        let filter = filter.downcast_ref::<LanceFilterExec>().ok_or_else(|| {
+            Error::internal("the residual filter of an ordered index read is not a LanceFilterExec")
+        })?;
+        Ok(Arc::new(filter.with_fetch_limit(self.fetch)?))
     }
+}
+
+fn residual_budget(live_rows: impl IntoIterator<Item = usize>, fetch: usize) -> usize {
+    let rows = live_rows.into_iter().fold(0_u64, |rows, fragment_rows| {
+        rows.saturating_add(fragment_rows as u64)
+    });
+    usize::try_from(rows / ROWS_PER_RESIDUAL_CANDIDATE)
+        .unwrap_or(usize::MAX)
+        .max(fetch.saturating_mul(MIN_RESIDUAL_CANDIDATES_PER_ROW))
 }
 
 /// Why a scan that orders by a column sorts its rows instead of reading an
@@ -92,8 +100,9 @@ pub enum OrderedIndexDecline {
     /// The filter's index query `search` is not an exact search of an index
     /// on the column, so the ordered read cannot use it. The sort reads only
     /// the rows that query selects, which can cost far less than reading the
-    /// column in key order. With [`Scanner::require_ordered_index`], the
-    /// ordered read applies the whole filter to the rows it reads instead.
+    /// column in key order. With [`Scanner::require_ordered_index`] and
+    /// without [`Scanner::fast_search`], the ordered read applies the whole
+    /// filter to the rows it reads instead.
     IndexSearch { column: String, search: String },
     /// The index covers `indexed_fragments` of the dataset's `fragments`
     /// fragments. `indexed_fragments` is `None` when a segment of the index
@@ -251,8 +260,11 @@ impl Scanner {
     /// [`OrderedIndexDecline`] that says why. A required read applies the part
     /// of the filter the index does not answer, including a search of another
     /// index, to each row it reads and never sorts instead, so a selective
-    /// filter can make it read the whole index. With `use_ordered_index(false)`,
-    /// planning fails with [`Error::InvalidInput`] even without `order_by`.
+    /// filter can make it read the whole index. With [`Self::fast_search`],
+    /// planning fails instead when the read would apply an index search this
+    /// way, because `fast_search` skips the fragments that search's index does
+    /// not cover. With `use_ordered_index(false)`, planning fails with
+    /// [`Error::InvalidInput`] even without `order_by`.
     /// Otherwise a scan without `order_by` is not affected.
     ///
     /// ```
@@ -340,18 +352,36 @@ impl Scanner {
                 reason,
             });
         }
-        let index_search = |index_query: &ScalarIndexExpr| OrderedIndexDecline::IndexSearch {
-            column: column.clone(),
-            search: index_query.to_string(),
+        let allow_in_residual = |index_query: &ScalarIndexExpr| {
+            let search = index_query.to_string();
+            if !self.require_ordered_index {
+                Err(OrderedIndexDecline::IndexSearch {
+                    column: column.clone(),
+                    search,
+                })
+            } else if self.fast_search {
+                Err(OrderedIndexDecline::UnsupportedScan {
+                    column: column.clone(),
+                    reason: format!(
+                        "fast_search reads only the fragments that the filter's index query \
+                         `{search}` covers, and the read would evaluate the filter on every \
+                         fragment"
+                    )
+                    .into(),
+                })
+            } else {
+                Ok(())
+            }
         };
         let search = match &expr_filter.index_query {
             Some(index_query @ ScalarIndexExpr::Query(search)) if expr_filter.skip_recheck => {
                 Some((index_query, search))
             }
-            Some(index_query) if !self.require_ordered_index => {
-                return Err(index_search(index_query));
+            Some(index_query) => {
+                allow_in_residual(index_query)?;
+                None
             }
-            _ => None,
+            None => None,
         };
         let indices = self
             .dataset
@@ -370,15 +400,23 @@ impl Scanner {
                     expr_filter.refine_expr.clone(),
                 )
             }
-            Some((index_query, _)) if !self.require_ordered_index => {
-                return Err(index_search(index_query));
+            Some((index_query, _)) => {
+                allow_in_residual(index_query)?;
+                (None, None, expr_filter.full_expr.clone())
             }
-            _ => (None, None, expr_filter.full_expr.clone()),
+            None => (None, None, expr_filter.full_expr.clone()),
         };
         let residual_read = residual.as_ref().map(|_| ResidualRead {
             fetch,
             limit: fetch - self.offset.unwrap_or(0) as usize,
-            budget: (!self.require_ordered_index).then(|| self.residual_budget(fetch)),
+            budget: (!self.require_ordered_index).then(|| {
+                let live_rows = self
+                    .dataset
+                    .fragments()
+                    .iter()
+                    .filter_map(Fragment::num_rows);
+                residual_budget(live_rows, fetch)
+            }),
         });
         let scan_fetch = match &residual_read {
             None => Some(fetch),
@@ -490,17 +528,6 @@ impl Scanner {
         )?))
     }
 
-    fn residual_budget(&self, fetch: usize) -> usize {
-        let rows: usize = self
-            .dataset
-            .fragments()
-            .iter()
-            .filter_map(Fragment::num_rows)
-            .sum();
-        (rows / ROWS_PER_RESIDUAL_CANDIDATE)
-            .max(fetch.saturating_mul(MIN_RESIDUAL_CANDIDATES_PER_ROW))
-    }
-
     /// Returns `offset + limit` when the dataset and the scan's options let an
     /// ordered read stop there, or the reason they do not.
     fn ordered_fetch(&self, column: &str) -> Result<usize, OrderedIndexDecline> {
@@ -601,6 +628,8 @@ mod tests {
         types::{Int32Type, Int64Type, UInt64Type},
     };
     use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::physical_plan::ExecutionPlan;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, utils::address::RowAddress};
     use lance_file::version::LanceFileVersion;
@@ -615,8 +644,9 @@ mod tests {
 
     use super::super::{ColumnOrdering, RowAddrMask, RowAddrTreeMap, Scanner};
     use crate::dataset::transaction::{Operation, Transaction};
-    use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
+    use crate::dataset::{NewColumnTransform, UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::io::exec::LanceFilterExec;
     use crate::{Dataset, Error};
 
     const ROWS: i32 = 300;
@@ -1532,6 +1562,88 @@ mod tests {
         assert_ordered_read(&dataset, configure, expect).await;
     }
 
+    #[tokio::test]
+    async fn test_ordered_decline_fast_search_with_another_index() {
+        let batch = |ids: Range<i32>| {
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
+                ),
+                ("ts", Arc::new(Int32Array::from_iter_values(ids))),
+            ])
+            .unwrap()
+        };
+        let indexed = batch(0..100);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(indexed.clone())], indexed.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(&["id"], IndexType::BTree, None, &btree(), false)
+            .await
+            .unwrap();
+        let appended = batch(100..200);
+        dataset
+            .append(
+                RecordBatchIterator::new([Ok(appended.clone())], appended.schema()),
+                None,
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["ts"],
+                IndexType::BTree,
+                Some(INDEX.into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            scanner
+                .project(&["id"])
+                .unwrap()
+                .filter("id >= 0")
+                .unwrap()
+                .order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".into())]))
+                .unwrap()
+                .limit(Some(5), None)
+                .unwrap()
+                .fast_search();
+        };
+
+        let mut required = dataset.scan();
+        configure(&mut required);
+        let error = required
+            .require_ordered_index(true)
+            .explain_plan(false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "OrderedIndexScan declined: column 'ts' cannot be read in key order from an \
+                 index because fast_search reads only the fragments that the filter's index \
+                 query `[id >= 0]@id_idx(BTree)` covers, and the read would evaluate the filter \
+                 on every fragment"
+            ),
+            "{error}"
+        );
+
+        let mut scanner = dataset.scan();
+        configure(&mut scanner);
+        let mut sorted = scanner.clone();
+        sorted.use_ordered_index(false);
+        let rows = scanner.try_into_batch().await.unwrap();
+        assert_eq!(ids(&rows), [99, 98, 97, 96, 95]);
+        assert_eq!(rows, sorted.try_into_batch().await.unwrap());
+    }
+
     #[derive(Debug)]
     struct Row {
         id: i32,
@@ -1597,6 +1709,8 @@ mod tests {
         Indexed,
         MoreDeleted,
         Segmented,
+        AllNullColumn,
+        Many,
     }
 
     impl Rows {
@@ -1609,6 +1723,66 @@ mod tests {
                     dataset
                 }
                 Self::Segmented => segmented_dataset("memory://", &[&[0], &[1], &[2]]).await,
+                Self::AllNullColumn => {
+                    let mut dataset = dataset(WriteParams::default()).await;
+                    let column = Field::new("w", DataType::Int64, true);
+                    dataset
+                        .add_columns(
+                            NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![column]))),
+                            None,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    dataset
+                }
+                Self::Many => {
+                    let ids = 0..8192;
+                    let batch = RecordBatch::try_from_iter([
+                        (
+                            "id",
+                            Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
+                        ),
+                        (
+                            "ts",
+                            Arc::new(Int32Array::from_iter_values(
+                                ids.clone().map(|id| id * 37 % 8192),
+                            )),
+                        ),
+                        (
+                            "v",
+                            Arc::new(Int64Array::from_iter_values(ids.clone().map(i64::from))),
+                        ),
+                        (
+                            "text",
+                            Arc::new(StringArray::from_iter_values(
+                                ids.map(|id| if id % 2 == 0 { "even" } else { "odd" }),
+                            )),
+                        ),
+                    ])
+                    .unwrap();
+                    let mut dataset = Dataset::write(
+                        RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+                        "memory://",
+                        Some(WriteParams {
+                            max_rows_per_file: 4096,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    dataset
+                        .create_index(
+                            &["ts"],
+                            IndexType::BTree,
+                            Some(INDEX.into()),
+                            &btree(),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                    dataset
+                }
             }
         }
     }
@@ -1738,6 +1912,24 @@ mod tests {
         Read::Required,
         "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], residual=CAST(ts AS Int64) % Int64(50) = Int64(7) OR ts > Int32(250)"
     )]
+    #[case::all_null_column(
+        Rows::AllNullColumn,
+        "w IS NULL",
+        |_: &Row| true,
+        ColumnOrdering::desc_nulls_last("ts".into()),
+        (10, 0),
+        Read::Ordered,
+        "OrderedIndexScan: index=ts_idx, order=[ts DESC NULLS LAST], fetch=40, residual=w IS NULL"
+    )]
+    #[case::row_share(
+        Rows::Many,
+        "ts % 8 = 6",
+        |row: &Row| row.ts.is_some_and(|ts| ts % 8 == 6),
+        ColumnOrdering::asc_nulls_last("ts".into()),
+        (1, 0),
+        Read::Ordered,
+        "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=8, residual=CAST(ts AS Int64) % Int64(8) = Int64(6)"
+    )]
     #[tokio::test]
     async fn test_ordered_residual(
         #[case] rows: Rows,
@@ -1772,6 +1964,23 @@ mod tests {
                 line.trim_start().starts_with("FilterExec: ") && line.ends_with(&filter_fetch)
             }),
             "{plan}"
+        );
+        let mut filters = Vec::new();
+        scanner
+            .create_plan()
+            .await
+            .unwrap()
+            .apply(|node| {
+                if let Some(filter) = node.downcast_ref::<LanceFilterExec>() {
+                    filters.push((filter.expr().to_string(), filter.filter.fetch()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+        let (_, residual) = scan_line.split_once("residual=").unwrap();
+        assert!(
+            filters.contains(&(residual.to_owned(), Some((limit + offset) as usize))),
+            "{filters:?}"
         );
         assert_eq!(
             plan.contains("OrderedFallback: limit="),
@@ -1817,6 +2026,92 @@ mod tests {
         let sorted_plan = sorted.explain_plan(false).await.unwrap();
         assert!(!sorted_plan.contains("OrderedIndexScan"), "{sorted_plan}");
         assert_eq!(ids(&sorted.try_into_batch().await.unwrap()), expected);
+    }
+
+    #[rstest]
+    #[case::filtered_limit(|scanner: &mut Scanner| {
+        scanner.filter("text = 'even'").unwrap().limit(Some(10), None).unwrap();
+    }, &[
+        "ProjectionExec: expr=[id@0 as id, ts@1 as ts]",
+        r#"  LanceRead: uri=data, projection=[id, ts, text], num_fragments=3, range_before=None, range_after=Some(0..10), row_id=true, row_addr=false, full_filter=text = Utf8("even"), refine_filter=text = Utf8("even")"#,
+    ])]
+    #[case::filtered_take_limit(|scanner: &mut Scanner| {
+        scanner
+            .filter("_rowid IN (1, 2, 3, 4) AND text = 'even'")
+            .unwrap()
+            .limit(Some(2), None)
+            .unwrap();
+    }, &[
+        "ProjectionExec: expr=[id@0 as id, ts@1 as ts]",
+        "  GlobalLimitExec: skip=0, fetch=2",
+        "    FilterExec: text@3 = even",
+        "      LanceRead: uri=data, projection=[text], source=stream(_rowaddr)",
+        "        LanceRead: uri=data, projection=[id, ts], num_fragments=3, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
+        "          OneShotStream: columns=[result,discriminant,fragments_covered]",
+    ])]
+    #[case::ordered_read(|scanner: &mut Scanner| {
+        order_by_ts(scanner);
+    }, &[
+        "ProjectionExec: expr=[id@2 as id, ts@0 as ts]",
+        "  LanceRead: uri=data, projection=[id], source=stream(_rowaddr)",
+        "    OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10",
+    ])]
+    #[case::ordered_search(|scanner: &mut Scanner| {
+        order_by_ts(scanner).filter("ts BETWEEN 20 AND 80").unwrap();
+    }, &[
+        "ProjectionExec: expr=[id@2 as id, ts@0 as ts]",
+        "  LanceRead: uri=data, projection=[id], source=stream(_rowaddr)",
+        "    OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10, query=ts >= 20 && ts <= 80",
+    ])]
+    #[tokio::test]
+    async fn test_ordered_residual_absent_keeps_plans(
+        #[case] configure: fn(&mut Scanner),
+        #[case] expected: &[&str],
+    ) {
+        let dataset = dataset(WriteParams::default()).await;
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", "ts"])
+            .unwrap()
+            .target_parallelism(1);
+        configure(&mut scanner);
+        let plan = scanner.explain_plan(false).await.unwrap();
+        assert_eq!(plan.lines().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
+    fn test_ordered_residual_budget_saturates() {
+        assert_eq!(
+            super::residual_budget([usize::MAX, usize::MAX], 1),
+            usize::try_from(u64::MAX / 1024).unwrap_or(usize::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ordered_residual_limits_rows_across_partitions() {
+        let dataset = Rows::Many.dataset().await;
+        let mut scanner = dataset.scan();
+        scanner
+            .project(&["id", "ts"])
+            .unwrap()
+            .filter("text = 'even'")
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::asc_nulls_last("ts".into())]))
+            .unwrap()
+            .limit(Some(2100), None)
+            .unwrap()
+            .batch_size(1024)
+            .target_parallelism(4);
+        let mut sorted = scanner.clone();
+        sorted.use_ordered_index(false);
+        let analyzed = scanner.analyze_plan().await.unwrap();
+        assert!(
+            analyzed.contains("RoundRobinBatch(4)") && analyzed.contains("ordered_fallback=false"),
+            "{analyzed}"
+        );
+        let rows = scanner.try_into_batch().await.unwrap();
+        assert_eq!(rows.num_rows(), 2100);
+        assert_eq!(rows, sorted.try_into_batch().await.unwrap());
     }
 
     #[rstest]
