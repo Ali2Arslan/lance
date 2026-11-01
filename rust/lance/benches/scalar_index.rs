@@ -193,18 +193,32 @@ fn status(id: u64) -> &'static str {
     }
 }
 
-fn with_status(rows: impl RecordBatchReader) -> impl RecordBatchReader {
+fn age(ts: u64) -> &'static str {
+    match ts {
+        ts if ts < u64::MAX / 10_000 => "0-0.01%",
+        ts if ts < u64::MAX / 100 => "0.01-1%",
+        ts if ts < u64::MAX / 2 => "1-50%",
+        _ => "50-100%",
+    }
+}
+
+fn with_mask_columns(rows: impl RecordBatchReader) -> impl RecordBatchReader {
     let mut fields = rows.schema().fields().to_vec();
     fields.push(Arc::new(Field::new("status", DataType::Utf8, false)));
+    fields.push(Arc::new(Field::new("age", DataType::Utf8, false)));
     let schema = Arc::new(Schema::new(fields));
     let batches = rows.map({
         let schema = schema.clone();
         move |batch| {
             let batch = batch?;
             let ids = batch["id"].as_primitive::<UInt64Type>().values();
+            let ts = batch["ts"].as_primitive::<UInt64Type>().values();
             let mut columns = batch.columns().to_vec();
             columns.push(Arc::new(StringArray::from_iter_values(
                 ids.iter().copied().map(status),
+            )));
+            columns.push(Arc::new(StringArray::from_iter_values(
+                ts.iter().copied().map(age),
             )));
             RecordBatch::try_new(schema.clone(), columns)
         }
@@ -221,7 +235,7 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     );
     let batches_per_segment = BATCHES / segments;
     let data = |segment: u32| {
-        with_status(
+        with_mask_columns(
             gen_batch()
                 .with_seed(Seed::from(DEFAULT_SEED.0 + u64::from(segment)))
                 .col("ts", array::rand::<UInt64Type>())
@@ -259,16 +273,18 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
             .await
             .unwrap();
     }
-    dataset
-        .create_index(
-            &["status"],
-            IndexType::Bitmap,
-            Some("status_idx".into()),
-            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
-            false,
-        )
-        .await
-        .unwrap();
+    for column in ["status", "age"] {
+        dataset
+            .create_index(
+                &[column],
+                IndexType::Bitmap,
+                Some(format!("{column}_idx")),
+                &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                false,
+            )
+            .await
+            .unwrap();
+    }
     assert_eq!(
         dataset.load_indices_by_name("ts_idx").await.unwrap().len(),
         segments as usize
@@ -378,6 +394,23 @@ fn bench_ordered_limit(c: &mut Criterion) {
                     b.iter(|| {
                         rt.block_on(ordered_limit(dataset, |scanner| {
                             scanner.filter(&filter).unwrap();
+                        }))
+                    });
+                },
+            );
+        }
+        for (share, filter) in [
+            ("0.01%", "age = '0-0.01%'"),
+            ("1%", "age IN ('0-0.01%', '0.01-1%')"),
+            ("50%", "age IN ('0-0.01%', '0.01-1%', '1-50%')"),
+        ] {
+            group.bench_with_input(
+                BenchmarkId::new(format!("oldest_{share}"), segments),
+                &dataset,
+                |b, dataset| {
+                    b.iter(|| {
+                        rt.block_on(ordered_limit(dataset, |scanner| {
+                            scanner.filter(filter).unwrap();
                         }))
                     });
                 },

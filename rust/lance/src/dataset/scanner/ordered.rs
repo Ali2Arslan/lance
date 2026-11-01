@@ -22,20 +22,15 @@ use crate::index::scalar::{IndexDetails, fetch_index_details};
 use crate::index::scalar_logical::load_named_scalar_segments;
 use crate::io::exec::LanceFilterExec;
 use crate::io::exec::ordered_fallback::OrderedFallbackExec;
-use crate::io::exec::ordered_index_scan::{IndexMask, OrderedIndexScanExec, UnindexedFragments};
+use crate::io::exec::ordered_index_scan::{
+    IndexMask, MaskedRead, OrderedIndexScanExec, UnindexedFragments,
+};
 
 // On 10,000,000 rows with `LIMIT 100`, 1024 was the fastest of 256, 512, 1024, and 2048 that
 // kept the read's p50 at most 0.3 times the sort's with a residual that keeps 50% of rows and
 // at most 1.5 times with one that keeps 0.01%. `rows / 256` took 2.0 times the sort at 0.01%.
 const ROWS_PER_RESIDUAL_CANDIDATE: u64 = 1024;
 const MIN_RESIDUAL_CANDIDATES_PER_ROW: usize = 4;
-
-// A mask that selects `m` of `rows` rows makes the ordered read walk about `fetch * rows / m`
-// index rows, while the sort reads the `m` rows. On 10,000,000 rows with `LIMIT 100`, the sort
-// spent about 0.11 ms on each scattered mask row and the walk 92 ns on each index row, a ratio
-// of about 1,200, so the read walks when `m * m >= fetch * rows / 1024`. A mask with fewer rows
-// than the fetch cannot fill the read.
-const MASK_SORT_COST_RATIO: f64 = 1024.0;
 
 pub(super) struct OrderedRead {
     pub(super) scan: Arc<dyn ExecutionPlan>,
@@ -68,15 +63,6 @@ fn residual_budget(live_rows: impl IntoIterator<Item = usize>, fetch: usize) -> 
     usize::try_from(rows / ROWS_PER_RESIDUAL_CANDIDATE)
         .unwrap_or(usize::MAX)
         .max(fetch.saturating_mul(MIN_RESIDUAL_CANDIDATES_PER_ROW))
-}
-
-fn mask_min_rows(live_rows: impl IntoIterator<Item = usize>, fetch: usize) -> u64 {
-    let rows = live_rows
-        .into_iter()
-        .map(|fragment_rows| fragment_rows as f64)
-        .sum::<f64>();
-    let fetch = fetch as f64;
-    (fetch * rows / MASK_SORT_COST_RATIO).sqrt().max(fetch) as u64
 }
 
 /// Why a scan that orders by a column sorts its rows instead of reading an
@@ -233,11 +219,13 @@ impl Scanner {
     /// `offset + limit` live rows, instead of sorting every row. An exact
     /// search of the same index in the filter limits the keys the read
     /// visits. Any other index search in the filter runs first, and the
-    /// read skips the rows it rules out, unless it selects so few rows that
-    /// sorting them costs less. The read applies the rest of
-    /// the filter to each row it reads, and sorts instead when that keeps too
-    /// few rows within a share of the index. Set this to `false` to always
-    /// sort. Other uses of scalar indices are not affected.
+    /// read skips the rows it rules out. The scan sorts the rows that search
+    /// selects instead when they are too few for the read to pay off, or when
+    /// the read visits a budget of index rows without filling the limit, as
+    /// when the selected rows hold the keys the read reaches last. The read
+    /// applies the rest of the filter to each row it reads, and sorts instead
+    /// when that keeps too few rows within a share of the index. Set this to
+    /// `false` to always sort. Other uses of scalar indices are not affected.
     ///
     /// ```
     /// # use lance::dataset::scanner::ColumnOrdering;
@@ -432,10 +420,13 @@ impl Scanner {
             let (mask, residual) = match (order_search, &expr_filter.index_query) {
                 (Some(_), _) => (None, expr_filter.refine_expr.clone()),
                 (None, Some(index_query)) => {
-                    let min_rows =
-                        (!self.require_ordered_index).then(|| mask_min_rows(live_rows(), fetch));
+                    let read = if self.require_ordered_index {
+                        MaskedRead::AlwaysWalk
+                    } else {
+                        MaskedRead::MaySort
+                    };
                     let (mask, is_exact) = self
-                        .index_mask(index_query, min_rows)
+                        .index_mask(index_query, read)
                         .await
                         .map_err(|source| OrderedIndexDecline::unreadable(column, None, source))?;
                     let residual = if is_exact {
@@ -493,7 +484,7 @@ impl Scanner {
     async fn index_mask(
         &self,
         index_query: &ScalarIndexExpr,
-        min_rows: Option<u64>,
+        read: MaskedRead,
     ) -> Result<(IndexMask, bool), Error> {
         let fragments = self.dataset.fragments();
         let search = self
@@ -513,7 +504,7 @@ impl Scanner {
             (UnindexedFragments::Emit, fragments.iter().all(is_indexed))
         };
         let is_exact = !index_query.needs_recheck() && is_fresh && is_every_fragment_answered;
-        let mask = IndexMask::new(search, stale_rows, unindexed, min_rows);
+        let mask = IndexMask::new(search, stale_rows, unindexed, read);
         Ok((mask, is_exact))
     }
 
@@ -1525,6 +1516,7 @@ mod tests {
 
     const MASK_ROWS: i32 = 10_000;
     const MASK_FRAGMENT_ROWS: usize = 2_500;
+    const OLD_TS: i32 = 400;
 
     fn mask_rows(ids: Range<i32>) -> RecordBatch {
         let status = ids.clone().map(|id| match id {
@@ -1534,24 +1526,31 @@ mod tests {
             id if id % 10 == 5 => None,
             _ => Some("other"),
         });
-        let ts = ids.clone().map(|id| {
-            if id < MASK_ROWS {
-                id * 7919 % MASK_ROWS
-            } else {
-                id
-            }
-        });
+        let ts = ids
+            .clone()
+            .map(|id| {
+                if id < MASK_ROWS {
+                    id * 7919 % MASK_ROWS
+                } else {
+                    id
+                }
+            })
+            .collect::<Vec<_>>();
+        let age = StringArray::from_iter_values(
+            ts.iter().map(|&ts| if ts < OLD_TS { "old" } else { "new" }),
+        );
         RecordBatch::try_from_iter([
             (
                 "id",
                 Arc::new(Int32Array::from_iter_values(ids.clone())) as ArrayRef,
             ),
-            ("ts", Arc::new(Int32Array::from_iter_values(ts))),
+            ("ts", Arc::new(Int32Array::from(ts))),
             (
                 "v",
                 Arc::new(Int64Array::from_iter_values(ids.map(i64::from))),
             ),
             ("status", Arc::new(StringArray::from_iter(status))),
+            ("age", Arc::new(age)),
         ])
         .unwrap()
     }
@@ -1566,6 +1565,7 @@ mod tests {
     enum MaskData {
         Indexed,
         Deleted,
+        MostlyDeleted,
         Segmented,
         UnindexedLastFragment,
         StaleStatus,
@@ -1584,16 +1584,18 @@ mod tests {
             )
             .await
             .unwrap();
-            dataset
-                .create_index(
-                    &["status"],
-                    IndexType::Bitmap,
-                    Some("status_idx".into()),
-                    &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
-                    false,
-                )
-                .await
-                .unwrap();
+            for column in ["status", "age"] {
+                dataset
+                    .create_index(
+                        &[column],
+                        IndexType::Bitmap,
+                        Some(format!("{column}_idx")),
+                        &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+                        false,
+                    )
+                    .await
+                    .unwrap();
+            }
             let zone_map = ScalarIndexParams::for_builtin(BuiltinIndexType::ZoneMap)
                 .with_params(&serde_json::json!({"rows_per_zone": 512}));
             dataset
@@ -1652,6 +1654,12 @@ mod tests {
             match self {
                 Self::Deleted => {
                     dataset.delete("id % 5 = 0").await.unwrap();
+                }
+                Self::MostlyDeleted => {
+                    dataset
+                        .delete("id % 2 = 0 OR (status = 'p1' AND id >= 2000)")
+                        .await
+                        .unwrap();
                 }
                 Self::StaleStatus => {
                     let (now_p50, no_longer_p50) = Self::newest_ids_outside_and_in_p50();
@@ -1732,6 +1740,7 @@ mod tests {
     enum MaskPath {
         Ordered,
         Sorted,
+        SpendsBudget,
         Required,
     }
 
@@ -1750,13 +1759,17 @@ mod tests {
     #[case::deletions(MaskData::Deleted, "status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), (10, 0), false, MaskPath::Ordered, STATUS_MASK)]
     #[case::segments(MaskData::Segmented, "status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), (10, 0), false, MaskPath::Ordered, STATUS_MASK)]
     #[case::unindexed_fragment(MaskData::UnindexedLastFragment, "status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), (10, 0), false, MaskPath::Ordered, r#"mask=[status = p50]@status_idx(Bitmap), residual=status = Utf8("p50")"#)]
-    #[case::unindexed_fragment_fast_search(MaskData::UnindexedLastFragment, "status = 'p50'", |row: &MaskRow| row.fragment < 4 && row.status() == Some("p50"), (10, 0), true, MaskPath::Ordered, STATUS_MASK)]
+    #[case::unindexed_fragment_fast_search(MaskData::UnindexedLastFragment, "status = 'p50'", |row: &MaskRow| row.fragment < 4 && row.status() == Some("p50"), (10, 0), true, MaskPath::SpendsBudget, STATUS_MASK)]
     #[case::stale_overlay(MaskData::StaleStatus, "status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), (10, 0), false, MaskPath::Ordered, r#"mask=[status = p50]@status_idx(Bitmap), residual=status = Utf8("p50")"#)]
     #[case::offset(MaskData::Indexed, "status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), (5, 3), false, MaskPath::Ordered, STATUS_MASK)]
     #[case::limit_1023(MaskData::Indexed, "status = 'p50' AND id % 3 != 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 != 0, (1023, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) != Int64(0)")]
     #[case::limit_1024(MaskData::Indexed, "status = 'p50' AND id % 3 != 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 != 0, (1024, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) != Int64(0)")]
     #[case::limit_1025(MaskData::Indexed, "status = 'p50' AND id % 3 != 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 != 0, (1025, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) != Int64(0)")]
     #[case::limit_2100(MaskData::Indexed, "status = 'p50' AND id % 3 != 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 != 0, (2100, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) != Int64(0)")]
+    #[case::oldest_spends_the_budget(MaskData::Indexed, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::SpendsBudget, "mask=[age = old]@age_idx(Bitmap)")]
+    #[case::oldest_required(MaskData::Indexed, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::Required, "mask=[age = old]@age_idx(Bitmap)")]
+    #[case::oldest_segments_share_the_budget(MaskData::Segmented, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::SpendsBudget, "mask=[age = old]@age_idx(Bitmap)")]
+    #[case::mostly_deleted_sorts(MaskData::MostlyDeleted, "status = 'p1'", |row: &MaskRow| row.status() == Some("p1"), (10, 0), false, MaskPath::Sorted, "mask=[status = p1]@status_idx(Bitmap)")]
     #[tokio::test]
     async fn test_ordered_mask(
         #[case] data: MaskData,
@@ -1815,12 +1828,14 @@ mod tests {
                     .unwrap();
                 let (fallback, walks) = match path {
                     MaskPath::Ordered => ("ordered_fallback=false", true),
-                    _ => ("ordered_fallback=true", false),
+                    MaskPath::SpendsBudget => ("ordered_fallback=true", true),
+                    MaskPath::Sorted | MaskPath::Required => ("ordered_fallback=true", false),
                 };
                 assert!(
                     analyzed.contains(fallback) && scan_metrics.contains("mask_rows="),
                     "{analyzed}"
                 );
+                assert_eq!(scan_metrics.contains("visit_budget="), walks, "{analyzed}");
                 assert_eq!(
                     !scan_metrics.contains("rows_scanned=0"),
                     walks,
@@ -1840,15 +1855,22 @@ mod tests {
     }
 
     #[rstest]
-    #[case::large_mask_walks_the_index("p50", "mask_rows=5.00 K", "ordered_fallback=false")]
-    #[case::small_mask_sorts("p001", "mask_rows=1", "ordered_fallback=true")]
+    #[case::large_mask_walks_the_index(
+        MaskData::Indexed,
+        "p50",
+        "mask_rows=5.00 K",
+        "ordered_fallback=false"
+    )]
+    #[case::small_mask_sorts(MaskData::Indexed, "p001", "mask_rows=1", "ordered_fallback=true")]
+    #[case::live_rows_only(MaskData::MostlyDeleted, "p1", "mask_rows=20", "ordered_fallback=true")]
     #[tokio::test]
     async fn test_ordered_mask_reports_rows_and_path(
+        #[case] data: MaskData,
         #[case] status: &str,
         #[case] mask_rows: &str,
         #[case] fallback: &str,
     ) {
-        let dataset = MaskData::Indexed.dataset().await;
+        let dataset = data.dataset().await;
         let mut scanner = dataset.scan();
         scanner
             .project(&["id"])

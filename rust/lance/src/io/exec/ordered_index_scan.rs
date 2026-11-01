@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -43,7 +44,7 @@ use datafusion::scalar::ScalarValue;
 use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
-use futures::future::try_join_all;
+use futures::future::{self, try_join_all};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
@@ -59,6 +60,20 @@ use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::io::deletion::read_dataset_deletion_file;
 use crate::{Dataset, index::DatasetIndexInternalExt};
+
+// A mask whose live rows spread evenly over the index makes each segment visit about
+// `fetch * index_rows / mask_rows` index rows to fill the fetch on its own. The visit budget
+// allows 4 times that over all segments, so an even mask spends it in under 2% of reads even
+// with `LIMIT 1`, and a mask whose rows the walk reaches last, as old rows under
+// `ORDER BY ts DESC`, stops early. On 10,000,000 rows, a mask of the oldest 1% stopped after
+// 40,000 visits.
+const MASK_VISIT_MARGIN: f64 = 4.0;
+
+// On 10,000,000 rows with `LIMIT 100`, sorting cost about 0.1 ms per scattered mask row and
+// walking about 85 ns per index row, about 1,200 visits per mask row. The read walks only when
+// its visit budget is at most 512 visits per mask row, so a walk that spends its budget and then
+// sorts costs at most about 1.4 times the sort, and masks under about 2,800 rows sort.
+const MASK_SORT_VISITS_PER_ROW: f64 = 512.0;
 
 /// Streams the segments of a B-tree index in key order as two columns: the
 /// key, named after the indexed column, then `_rowaddr`.
@@ -115,7 +130,18 @@ pub(crate) struct IndexMask {
     label: String,
     stale_rows: RowAddrTreeMap,
     unindexed: UnindexedFragments,
-    min_rows: Option<u64>,
+    read: MaskedRead,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MaskedRead {
+    /// Emit nothing when the mask selects too few live rows for a walk to pay
+    /// off, and stop short once the walk needs more index rows than its
+    /// budget, so that the sort runs instead.
+    MaySort,
+    /// Walk until the read fills its fetch, as
+    /// [`crate::dataset::scanner::Scanner::require_ordered_index`] requires.
+    AlwaysWalk,
 }
 
 /// What an [`IndexMask`] does with the rows of fragments its index does not
@@ -130,30 +156,27 @@ pub(crate) enum UnindexedFragments {
 
 impl IndexMask {
     /// `stale_rows` holds rows whose data overlay is newer than the search's
-    /// index, which the search's answer cannot be trusted for. With
-    /// `min_rows`, a mask that lets fewer rows through makes the scan emit
-    /// nothing, so that a sort over the mask's rows can run instead. Without
-    /// it, the scan always reads the index.
+    /// index, which the search's answer cannot be trusted for.
     pub(crate) fn new(
         search: ScalarIndexExec,
         stale_rows: RowAddrTreeMap,
         unindexed: UnindexedFragments,
-        min_rows: Option<u64>,
+        read: MaskedRead,
     ) -> Self {
         Self {
             label: search.expr().to_string(),
             search: Arc::new(search),
             stale_rows,
             unindexed,
-            min_rows,
+            read,
         }
     }
 
-    /// Runs the search and returns the rows it lets through with their
-    /// count over the physical rows of the fragments in `scope`.
+    /// Runs the search and returns the rows it lets through with the number
+    /// of them that are live in the fragments in `scope`.
     async fn evaluate(
         &self,
-        fragments: &[Fragment],
+        dataset: &Dataset,
         scope: &RoaringBitmap,
         partition: usize,
         context: Arc<TaskContext>,
@@ -179,32 +202,89 @@ impl IndexMask {
             UnindexedFragments::Skip => result.upper.also_block(unindexed),
         }
         .also_allow(self.stale_rows.clone());
-        let rows = fragments
+        let fragments = dataset
+            .fragments()
             .iter()
             .filter(|fragment| scope.contains(fragment.id as u32))
-            .map(|fragment| selected_rows(&selected, fragment))
-            .sum();
-        Ok((selected, rows))
+            .map(|fragment| {
+                let rows = selected_offsets(&selected, fragment);
+                (fragment.id, rows, fragment.deletion_file.clone())
+            })
+            .collect::<Vec<_>>();
+        let live_rows = stream::iter(fragments)
+            .map(|(fragment_id, mut rows, deletion_file)| async move {
+                if let Some(deletion_file) = deletion_file
+                    && !rows.is_empty()
+                {
+                    let deleted =
+                        read_dataset_deletion_file(dataset, fragment_id, &deletion_file).await?;
+                    rows -= RoaringBitmap::from(deleted.as_ref());
+                }
+                Result::Ok(rows.len())
+            })
+            .buffer_unordered(dataset.object_store.io_parallelism())
+            .try_fold(0, |total, rows| future::ready(Ok(total + rows)))
+            .await?;
+        Ok((selected, live_rows))
     }
 }
 
-fn selected_rows(mask: &RowAddrMask, fragment: &Fragment) -> u64 {
-    let rows = fragment.physical_rows.unwrap_or_default() as u64;
+fn selected_offsets(mask: &RowAddrMask, fragment: &Fragment) -> RoaringBitmap {
+    let rows = u32::try_from(fragment.physical_rows.unwrap_or_default()).unwrap_or(u32::MAX);
+    let mut offsets = RoaringBitmap::new();
+    offsets.insert_range(..rows);
     let (listed, is_allow_list) = match mask {
         RowAddrMask::AllowList(listed) => (listed, true),
         RowAddrMask::BlockList(listed) => (listed, false),
     };
-    let listed_rows = match listed.get(&(fragment.id as u32)) {
-        None => 0,
-        Some(RowAddrSelection::Full) => rows,
-        Some(RowAddrSelection::Partial(offsets)) => {
-            offsets.range_cardinality(..u32::try_from(rows).unwrap_or(u32::MAX))
+    match (listed.get(&(fragment.id as u32)), is_allow_list) {
+        (None, true) | (Some(RowAddrSelection::Full), false) => RoaringBitmap::new(),
+        (None, false) | (Some(RowAddrSelection::Full), true) => offsets,
+        (Some(RowAddrSelection::Partial(listed)), true) => offsets & listed,
+        (Some(RowAddrSelection::Partial(listed)), false) => offsets - listed,
+    }
+}
+
+/// How many index rows a masked read of `segments` segments may visit before
+/// it stops short, or `None` when the mask's `mask_rows` live rows are too few
+/// for a walk to pay off.
+fn visit_budget(segments: usize, fetch: usize, index_rows: u64, mask_rows: u64) -> Option<usize> {
+    let even_visits = segments as f64 * fetch as f64 * index_rows as f64 / mask_rows as f64;
+    let budget = MASK_VISIT_MARGIN * even_visits;
+    (budget <= MASK_SORT_VISITS_PER_ROW * mask_rows as f64).then(|| budget.ceil() as usize)
+}
+
+struct VisitBudget {
+    remaining: AtomicUsize,
+    is_spent: AtomicBool,
+}
+
+impl VisitBudget {
+    fn new(visits: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(visits),
+            is_spent: AtomicBool::new(false),
         }
-    };
-    if is_allow_list {
-        listed_rows
-    } else {
-        rows - listed_rows
+    }
+
+    fn remaining(&self) -> usize {
+        self.remaining.load(Ordering::Relaxed)
+    }
+
+    fn spend(&self, visits: usize) {
+        let _ = self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(visits))
+            });
+    }
+
+    fn mark_spent(&self) {
+        self.is_spent.store(true, Ordering::Relaxed);
+    }
+
+    fn is_spent(&self) -> bool {
+        self.is_spent.load(Ordering::Relaxed)
     }
 }
 
@@ -436,8 +516,8 @@ impl OrderedIndexScanExec {
         ));
         let metrics = RowMetrics::new(&self.metrics, partition, self.mask.is_some());
         let schema = self.schema();
-        let mask = match &self.mask {
-            None => None,
+        let (mask, budget) = match &self.mask {
+            None => (None, None),
             Some(mask) => {
                 let scope = self
                     .segments
@@ -445,25 +525,43 @@ impl OrderedIndexScanExec {
                     .fold(RoaringBitmap::new(), |scope, segment| {
                         scope | &segment.scope
                     });
-                let (selected, rows) = mask
-                    .evaluate(self.dataset.fragments(), &scope, partition, context.clone())
+                let (selected, mask_rows) = mask
+                    .evaluate(&self.dataset, &scope, partition, context.clone())
                     .await?;
                 self.metrics
                     .new_count("mask_rows", partition)
-                    .add(usize::try_from(rows).unwrap_or(usize::MAX));
-                if mask.min_rows.is_some_and(|min_rows| rows < min_rows) {
-                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                        schema,
-                        stream::empty(),
-                    )));
-                }
-                Some(Arc::new(selected))
+                    .add(usize::try_from(mask_rows).unwrap_or(usize::MAX));
+                let budget = match (mask.read, self.fetch) {
+                    (MaskedRead::MaySort, Some(fetch)) => {
+                        let index_rows = self
+                            .dataset
+                            .fragments()
+                            .iter()
+                            .filter(|fragment| scope.contains(fragment.id as u32))
+                            .map(|fragment| fragment.physical_rows.unwrap_or_default() as u64)
+                            .sum();
+                        let Some(visits) =
+                            visit_budget(self.segments.len(), fetch, index_rows, mask_rows)
+                        else {
+                            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                                schema,
+                                stream::empty(),
+                            )));
+                        };
+                        self.metrics
+                            .new_count("visit_budget", partition)
+                            .add(visits);
+                        Some(Arc::new(VisitBudget::new(visits)))
+                    }
+                    _ => None,
+                };
+                (Some(Arc::new(selected)), budget)
             }
         };
         let mut streams = try_join_all(self.segments.iter().map(|segment| {
             let (plan, schema) = (&self, schema.clone());
             let (pages_loaded, metrics) = (pages_loaded.clone(), metrics.clone());
-            let mask = mask.clone();
+            let (mask, budget) = (mask.clone(), budget.clone());
             async move {
                 let batches = plan.checked_ordered_stream(segment, pages_loaded).await?;
                 let rows = LiveRows {
@@ -472,6 +570,7 @@ impl OrderedIndexScanExec {
                     dataset: plan.dataset.clone(),
                     scope: segment.scope.clone(),
                     mask,
+                    budget,
                     loaded_fragments: RoaringBitmap::new(),
                     deleted: RowAddrTreeMap::new(),
                     remaining: plan.fetch,
@@ -485,15 +584,24 @@ impl OrderedIndexScanExec {
             }
         }))
         .await?;
+        // After a segment stops short, the merge yields the other segments' rows in place of
+        // that segment's unread ones, so nothing it yields after that may leave the scan.
+        let cut = |rows: SendableRecordBatchStream| -> SendableRecordBatchStream {
+            let Some(budget) = budget.clone() else {
+                return rows;
+            };
+            let rows = rows.take_while(move |_| future::ready(!budget.is_spent()));
+            Box::pin(RecordBatchStreamAdapter::new(self.schema(), rows))
+        };
         if streams.len() == 1 {
-            return Ok(streams.remove(0));
+            return Ok(cut(streams.remove(0)));
         }
         let merge_order = LexOrdering::from([
             PhysicalSortExpr::new(Arc::new(Column::new(&self.column, 0)), self.options),
             PhysicalSortExpr::new(Arc::new(Column::new(ROW_ADDR, 1)), SortOptions::default()),
         ]);
         let unreported = ExecutionPlanMetricsSet::new();
-        Ok(StreamingMergeBuilder::new()
+        Ok(cut(StreamingMergeBuilder::new()
             .with_streams(streams)
             .with_schema(schema)
             .with_expressions(&merge_order)
@@ -503,7 +611,7 @@ impl OrderedIndexScanExec {
             .with_reservation(
                 MemoryConsumer::new("OrderedIndexScanExec").register(context.memory_pool()),
             )
-            .build()?)
+            .build()?))
     }
 }
 
@@ -578,6 +686,7 @@ struct LiveRows {
     dataset: Arc<Dataset>,
     scope: RoaringBitmap,
     mask: Option<Arc<RowAddrMask>>,
+    budget: Option<Arc<VisitBudget>>,
     loaded_fragments: RoaringBitmap,
     deleted: RowAddrTreeMap,
     remaining: Option<usize>,
@@ -589,7 +698,9 @@ struct LiveRows {
 impl LiveRows {
     fn into_stream(self) -> impl Stream<Item = Result<RecordBatch>> + Send {
         stream::try_unfold(self, |mut rows| async move {
-            while rows.remaining != Some(0) {
+            while rows.remaining != Some(0)
+                && !rows.budget.as_ref().is_some_and(|budget| budget.is_spent())
+            {
                 let Some(batch) = rows.batches.try_next().await? else {
                     break;
                 };
@@ -655,8 +766,16 @@ impl LiveRows {
         let mut prefix_end = 0;
         let mask = self.mask.clone();
         let is_masked = |addr: u64| mask.as_ref().is_some_and(|mask| !mask.selected(addr));
+        let budget = self.budget.clone();
+        let (mut spent, mut budget_end) = (0, budget.as_ref().map(|budget| budget.remaining()));
         for (row, &addr) in addrs.iter().enumerate() {
             if self.remaining == Some(live.len()) {
+                break;
+            }
+            if let Some(budget) = &budget
+                && budget_end.is_some_and(|budget_end| row >= budget_end)
+            {
+                budget.mark_spent();
                 break;
             }
             if !self.scope.contains(RowAddress::from(addr).fragment_id()) {
@@ -684,7 +803,12 @@ impl LiveRows {
                             .map_or(addrs.len(), |(offset, _)| row + offset + 1)
                     }
                 };
+                if let Some(budget) = &budget {
+                    budget.spend(row - spent);
+                    spent = row;
+                }
                 self.load_deletions(&addrs[row..prefix_end]).await?;
+                budget_end = budget.as_ref().map(|budget| spent + budget.remaining());
             }
             if self.deleted.contains(addr) {
                 num_deleted += 1;
@@ -692,9 +816,11 @@ impl LiveRows {
                 live.push(row as u32);
             }
         }
-        self.metrics
-            .scanned
-            .add(live.len() + num_deleted + num_excluded + num_masked);
+        let visited = live.len() + num_deleted + num_excluded + num_masked;
+        if let Some(budget) = &budget {
+            budget.spend(visited - spent);
+        }
+        self.metrics.scanned.add(visited);
         self.metrics.deleted.add(num_deleted);
         self.metrics.excluded.add(num_excluded);
         self.metrics.masked.add(num_masked);
@@ -1903,6 +2029,7 @@ mod tests {
             dataset: fixture(false, false, None).await,
             scope: RoaringBitmap::from_iter([0]),
             mask: None,
+            budget: None,
             loaded_fragments: RoaringBitmap::from_iter([0]),
             deleted,
             remaining: Some(1),
