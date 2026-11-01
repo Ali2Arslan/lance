@@ -1768,7 +1768,7 @@ mod tests {
     #[case::limit_2100(MaskData::Indexed, "status = 'p50' AND id % 3 != 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 != 0, (2100, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) != Int64(0)")]
     #[case::oldest_spends_the_budget(MaskData::Indexed, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::SpendsBudget, "mask=[age = old]@age_idx(Bitmap)")]
     #[case::oldest_required(MaskData::Indexed, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::Required, "mask=[age = old]@age_idx(Bitmap)")]
-    #[case::oldest_segments_share_the_budget(MaskData::Segmented, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (10, 0), false, MaskPath::SpendsBudget, "mask=[age = old]@age_idx(Bitmap)")]
+    #[case::oldest_segments_share_the_budget(MaskData::Segmented, "age = 'old'", |row: &MaskRow| row.ts < OLD_TS, (20, 0), false, MaskPath::SpendsBudget, "mask=[age = old]@age_idx(Bitmap)")]
     #[case::mostly_deleted_sorts(MaskData::MostlyDeleted, "status = 'p1'", |row: &MaskRow| row.status() == Some("p1"), (10, 0), false, MaskPath::Sorted, "mask=[status = p1]@status_idx(Bitmap)")]
     #[tokio::test]
     async fn test_ordered_mask(

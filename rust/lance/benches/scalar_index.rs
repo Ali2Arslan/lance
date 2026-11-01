@@ -196,7 +196,9 @@ fn status(id: u64) -> &'static str {
 fn age(ts: u64) -> &'static str {
     match ts {
         ts if ts < u64::MAX / 10_000 => "0-0.01%",
-        ts if ts < u64::MAX / 100 => "0.01-1%",
+        ts if ts < u64::MAX / 10_000 * 3 => "0.01-0.03%",
+        ts if ts < u64::MAX / 10_000 * 6 => "0.03-0.06%",
+        ts if ts < u64::MAX / 100 => "0.06-1%",
         ts if ts < u64::MAX / 2 => "1-50%",
         _ => "50-100%",
     }
@@ -401,8 +403,16 @@ fn bench_ordered_limit(c: &mut Criterion) {
         }
         for (share, filter) in [
             ("0.01%", "age = '0-0.01%'"),
-            ("1%", "age IN ('0-0.01%', '0.01-1%')"),
-            ("50%", "age IN ('0-0.01%', '0.01-1%', '1-50%')"),
+            ("0.03%", "age IN ('0-0.01%', '0.01-0.03%')"),
+            ("0.06%", "age IN ('0-0.01%', '0.01-0.03%', '0.03-0.06%')"),
+            (
+                "1%",
+                "age IN ('0-0.01%', '0.01-0.03%', '0.03-0.06%', '0.06-1%')",
+            ),
+            (
+                "50%",
+                "age IN ('0-0.01%', '0.01-0.03%', '0.03-0.06%', '0.06-1%', '1-50%')",
+            ),
         ] {
             group.bench_with_input(
                 BenchmarkId::new(format!("oldest_{share}"), segments),
