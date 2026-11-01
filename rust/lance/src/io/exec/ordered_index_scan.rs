@@ -5,18 +5,20 @@
 //!
 //! [`OrderedIndexScanExec`] streams [`ScalarIndex::search_ordered`] and keeps
 //! only the rows the dataset still serves. Each index row falls in one of
-//! three groups, and only live rows count toward `fetch`:
+//! four groups, and only live rows count toward `fetch`:
 //!
 //! ```text
-//! index row      fragment            offset         result
-//! (key, addr) -> outside the scope                -> rows_excluded
-//!                in the scope, gone               -> rows_deleted
-//!                in the scope     -> deleted      -> rows_deleted
-//!                                 -> not deleted  -> emitted
+//! index row      fragment            offset            result
+//! (key, addr) -> outside the scope                   -> rows_excluded
+//!                in the scope     -> outside the mask -> rows_masked
+//!                in the scope, gone                  -> rows_deleted
+//!                in the scope     -> deleted         -> rows_deleted
+//!                                 -> not deleted     -> emitted
 //! ```
 //!
 //! The scope is the segment's fragment coverage, narrowed by an optional
-//! fragment allow-list.
+//! fragment allow-list. The optional mask holds the rows that an index
+//! search, run before the read, does not rule out.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,11 +49,12 @@ use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAdd
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
 use lance_index::metrics::{MetricsCollector, NoOpMetricsCollector};
 use lance_index::scalar::{AnyQuery, ScalarIndex};
-use lance_select::{RowAddrTreeMap, RowSetOps};
-use lance_table::format::IndexMetadata;
+use lance_select::{IndexExprResult, RowAddrMask, RowAddrSelection, RowAddrTreeMap, RowSetOps};
 use lance_table::format::overlay::staleness::overlay_exclusion_offsets;
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
+use super::scalar_index::ScalarIndexExec;
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 use crate::dataset::overlay::{collect_overlay_stale_rows_for_segment, overlaid_fragments};
 use crate::io::deletion::read_dataset_deletion_file;
@@ -94,8 +97,115 @@ pub struct OrderedIndexScanExec {
     options: SortOptions,
     fetch: Option<usize>,
     residual_label: Option<Expr>,
+    mask: Option<IndexMask>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
+}
+
+/// The rows that an index search, run once per execution as the scan's only
+/// child, lets an ordered read emit. A row passes when the search's upper
+/// bound holds it in a fragment the search's index covers, when that index
+/// does not cover its fragment and `unindexed` is
+/// [`UnindexedFragments::Emit`], or when it is in `stale_rows`. Unless the
+/// search is exact for every row that passes, a filter after the scan must
+/// recheck them.
+#[derive(Clone, Debug)]
+pub(crate) struct IndexMask {
+    search: Arc<dyn ExecutionPlan>,
+    label: String,
+    stale_rows: RowAddrTreeMap,
+    unindexed: UnindexedFragments,
+    min_rows: Option<u64>,
+}
+
+/// What an [`IndexMask`] does with the rows of fragments its index does not
+/// cover.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum UnindexedFragments {
+    /// Let them through, so the filter after the scan decides.
+    Emit,
+    /// Drop them, as [`crate::dataset::scanner::Scanner::fast_search`] does.
+    Skip,
+}
+
+impl IndexMask {
+    /// `stale_rows` holds rows whose data overlay is newer than the search's
+    /// index, which the search's answer cannot be trusted for. With
+    /// `min_rows`, a mask that lets fewer rows through makes the scan emit
+    /// nothing, so that a sort over the mask's rows can run instead. Without
+    /// it, the scan always reads the index.
+    pub(crate) fn new(
+        search: ScalarIndexExec,
+        stale_rows: RowAddrTreeMap,
+        unindexed: UnindexedFragments,
+        min_rows: Option<u64>,
+    ) -> Self {
+        Self {
+            label: search.expr().to_string(),
+            search: Arc::new(search),
+            stale_rows,
+            unindexed,
+            min_rows,
+        }
+    }
+
+    /// Runs the search and returns the rows it lets through with their
+    /// count over the physical rows of the fragments in `scope`.
+    async fn evaluate(
+        &self,
+        fragments: &[Fragment],
+        scope: &RoaringBitmap,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<(RowAddrMask, u64)> {
+        let batch = self
+            .search
+            .execute(partition, context)?
+            .try_next()
+            .await?
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "the index search {} returned no result",
+                    self.label
+                ))
+            })?;
+        let (result, indexed) = IndexExprResult::deserialize(&batch)?;
+        let mut unindexed = RowAddrTreeMap::new();
+        for fragment_id in scope - &indexed {
+            unindexed.insert_fragment(fragment_id);
+        }
+        let selected = match self.unindexed {
+            UnindexedFragments::Emit => result.upper.also_allow(unindexed),
+            UnindexedFragments::Skip => result.upper.also_block(unindexed),
+        }
+        .also_allow(self.stale_rows.clone());
+        let rows = fragments
+            .iter()
+            .filter(|fragment| scope.contains(fragment.id as u32))
+            .map(|fragment| selected_rows(&selected, fragment))
+            .sum();
+        Ok((selected, rows))
+    }
+}
+
+fn selected_rows(mask: &RowAddrMask, fragment: &Fragment) -> u64 {
+    let rows = fragment.physical_rows.unwrap_or_default() as u64;
+    let (listed, is_allow_list) = match mask {
+        RowAddrMask::AllowList(listed) => (listed, true),
+        RowAddrMask::BlockList(listed) => (listed, false),
+    };
+    let listed_rows = match listed.get(&(fragment.id as u32)) {
+        None => 0,
+        Some(RowAddrSelection::Full) => rows,
+        Some(RowAddrSelection::Partial(offsets)) => {
+            offsets.range_cardinality(..u32::try_from(rows).unwrap_or(u32::MAX))
+        }
+    };
+    if is_allow_list {
+        listed_rows
+    } else {
+        rows - listed_rows
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -262,6 +372,7 @@ impl OrderedIndexScanExec {
             options,
             fetch: None,
             residual_label: None,
+            mask: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         };
@@ -278,6 +389,10 @@ impl OrderedIndexScanExec {
             residual_label,
             ..self
         }
+    }
+
+    pub(crate) fn with_mask(self, mask: Option<IndexMask>) -> Self {
+        Self { mask, ..self }
     }
 
     async fn checked_ordered_stream(
@@ -319,11 +434,36 @@ impl OrderedIndexScanExec {
         let pages_loaded: Arc<dyn MetricsCollector> = Arc::new(PagesLoaded(
             self.metrics.new_count("pages_loaded", partition),
         ));
-        let metrics = RowMetrics::new(&self.metrics, partition);
+        let metrics = RowMetrics::new(&self.metrics, partition, self.mask.is_some());
         let schema = self.schema();
+        let mask = match &self.mask {
+            None => None,
+            Some(mask) => {
+                let scope = self
+                    .segments
+                    .iter()
+                    .fold(RoaringBitmap::new(), |scope, segment| {
+                        scope | &segment.scope
+                    });
+                let (selected, rows) = mask
+                    .evaluate(self.dataset.fragments(), &scope, partition, context.clone())
+                    .await?;
+                self.metrics
+                    .new_count("mask_rows", partition)
+                    .add(usize::try_from(rows).unwrap_or(usize::MAX));
+                if mask.min_rows.is_some_and(|min_rows| rows < min_rows) {
+                    return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                        schema,
+                        stream::empty(),
+                    )));
+                }
+                Some(Arc::new(selected))
+            }
+        };
         let mut streams = try_join_all(self.segments.iter().map(|segment| {
             let (plan, schema) = (&self, schema.clone());
             let (pages_loaded, metrics) = (pages_loaded.clone(), metrics.clone());
+            let mask = mask.clone();
             async move {
                 let batches = plan.checked_ordered_stream(segment, pages_loaded).await?;
                 let rows = LiveRows {
@@ -331,6 +471,7 @@ impl OrderedIndexScanExec {
                     batches,
                     dataset: plan.dataset.clone(),
                     scope: segment.scope.clone(),
+                    mask,
                     loaded_fragments: RoaringBitmap::new(),
                     deleted: RowAddrTreeMap::new(),
                     remaining: plan.fetch,
@@ -412,15 +553,21 @@ struct RowMetrics {
     scanned: Count,
     deleted: Count,
     excluded: Count,
+    masked: Count,
     deletion_vectors_loaded: Count,
 }
 
 impl RowMetrics {
-    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize) -> Self {
+    fn new(metrics: &ExecutionPlanMetricsSet, partition: usize, has_mask: bool) -> Self {
         Self {
             scanned: metrics.new_count(ROWS_SCANNED_METRIC, partition),
             deleted: metrics.new_count("rows_deleted", partition),
             excluded: metrics.new_count("rows_excluded", partition),
+            masked: if has_mask {
+                metrics.new_count("rows_masked", partition)
+            } else {
+                Count::new()
+            },
             deletion_vectors_loaded: metrics.new_count("deletion_vectors_loaded", partition),
         }
     }
@@ -430,6 +577,7 @@ struct LiveRows {
     batches: SendableRecordBatchStream,
     dataset: Arc<Dataset>,
     scope: RoaringBitmap,
+    mask: Option<Arc<RowAddrMask>>,
     loaded_fragments: RoaringBitmap,
     deleted: RowAddrTreeMap,
     remaining: Option<usize>,
@@ -503,14 +651,20 @@ impl LiveRows {
         }
         let addrs = addrs.values();
         let mut live = Vec::new();
-        let (mut num_deleted, mut num_excluded) = (0, 0);
+        let (mut num_deleted, mut num_excluded, mut num_masked) = (0, 0, 0);
         let mut prefix_end = 0;
+        let mask = self.mask.clone();
+        let is_masked = |addr: u64| mask.as_ref().is_some_and(|mask| !mask.selected(addr));
         for (row, &addr) in addrs.iter().enumerate() {
             if self.remaining == Some(live.len()) {
                 break;
             }
             if !self.scope.contains(RowAddress::from(addr).fragment_id()) {
                 num_excluded += 1;
+                continue;
+            }
+            if is_masked(addr) {
+                num_masked += 1;
                 continue;
             }
             if row >= prefix_end {
@@ -524,6 +678,7 @@ impl LiveRows {
                             .enumerate()
                             .filter(|&(_, &addr)| {
                                 self.scope.contains(RowAddress::from(addr).fragment_id())
+                                    && !is_masked(addr)
                             })
                             .nth(window - 1)
                             .map_or(addrs.len(), |(offset, _)| row + offset + 1)
@@ -539,9 +694,10 @@ impl LiveRows {
         }
         self.metrics
             .scanned
-            .add(live.len() + num_deleted + num_excluded);
+            .add(live.len() + num_deleted + num_excluded + num_masked);
         self.metrics.deleted.add(num_deleted);
         self.metrics.excluded.add(num_excluded);
+        self.metrics.masked.add(num_masked);
         self.remaining = self.remaining.map(|remaining| remaining - live.len());
         let live = take_record_batch(batch, &UInt32Array::from(live))?;
         Ok(RecordBatch::try_new(
@@ -574,6 +730,9 @@ impl DisplayAs for OrderedIndexScanExec {
         if let Some(query) = &self.query {
             write!(f, "{separator}query={}", query.format(&self.column))?;
         }
+        if let Some(mask) = &self.mask {
+            write!(f, "{separator}mask={}", mask.label)?;
+        }
         if let Some(residual) = &self.residual_label {
             write!(f, "{separator}residual={residual}")?;
         }
@@ -591,7 +750,11 @@ impl ExecutionPlan for OrderedIndexScanExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![]
+        self.mask.iter().map(|mask| &mask.search).collect()
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false; self.children().len()]
     }
 
     fn apply_expressions(
@@ -605,12 +768,23 @@ impl ExecutionPlan for OrderedIndexScanExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Internal(
-                "OrderedIndexScanExec does not have children".to_string(),
-            ))
+        let count = children.len();
+        match (&self.mask, <[_; 1]>::try_from(children)) {
+            (None, _) if count == 0 => Ok(self),
+            (Some(mask), Ok([search])) => {
+                let mask = Some(IndexMask {
+                    search,
+                    ..mask.clone()
+                });
+                Ok(Arc::new(Self {
+                    mask,
+                    ..self.as_ref().clone()
+                }))
+            }
+            (mask, _) => Err(DataFusionError::Internal(format!(
+                "OrderedIndexScanExec takes {} children, but got {count}",
+                usize::from(mask.is_some())
+            ))),
         }
     }
 
@@ -1728,6 +1902,7 @@ mod tests {
             )),
             dataset: fixture(false, false, None).await,
             scope: RoaringBitmap::from_iter([0]),
+            mask: None,
             loaded_fragments: RoaringBitmap::from_iter([0]),
             deleted,
             remaining: Some(1),
@@ -1736,7 +1911,7 @@ mod tests {
                 ROW_ADDR_FIELD.clone(),
             ])),
             index_name: "key_idx".into(),
-            metrics: RowMetrics::new(&ExecutionPlanMetricsSet::new(), 0),
+            metrics: RowMetrics::new(&ExecutionPlanMetricsSet::new(), 0, false),
         };
         let error = rows
             .into_stream()

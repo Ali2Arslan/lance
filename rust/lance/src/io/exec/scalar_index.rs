@@ -211,6 +211,10 @@ impl ScalarIndexExec {
         self
     }
 
+    pub(crate) fn fragment_scope(&self) -> Option<&RoaringBitmap> {
+        self.fragment_scope.as_deref()
+    }
+
     /// Restrict index loading to these physical scalar index segments.
     pub(crate) fn with_segment_uuids(mut self, segment_uuids: Arc<HashSet<uuid::Uuid>>) -> Self {
         self.segment_uuids = Some(segment_uuids);

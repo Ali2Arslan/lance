@@ -4,9 +4,11 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    RecordBatchReader,
+    RecordBatch, RecordBatchIterator, RecordBatchReader, StringArray,
+    cast::AsArray,
     types::{UInt32Type, UInt64Type},
 };
+use arrow_schema::{DataType, Field, Schema};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
@@ -182,6 +184,34 @@ async fn warm_indexed_isin_search(index: &dyn ScalarIndex) {
     assert_eq!(row_ids.true_rows().len(), Some(3));
 }
 
+fn status(id: u64) -> &'static str {
+    match id {
+        id if id % 2 == 0 => "50%",
+        id if id % 100 == 1 => "1%",
+        id if id % 10_000 == 3 => "0.01%",
+        _ => "other",
+    }
+}
+
+fn with_status(rows: impl RecordBatchReader) -> impl RecordBatchReader {
+    let mut fields = rows.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("status", DataType::Utf8, false)));
+    let schema = Arc::new(Schema::new(fields));
+    let batches = rows.map({
+        let schema = schema.clone();
+        move |batch| {
+            let batch = batch?;
+            let ids = batch["id"].as_primitive::<UInt64Type>().values();
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(StringArray::from_iter_values(
+                ids.iter().copied().map(status),
+            )));
+            RecordBatch::try_new(schema.clone(), columns)
+        }
+    });
+    RecordBatchIterator::new(batches, schema)
+}
+
 async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     const BATCHES: u32 = 100;
     assert_eq!(
@@ -191,14 +221,16 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     );
     let batches_per_segment = BATCHES / segments;
     let data = |segment: u32| {
-        gen_batch()
-            .with_seed(Seed::from(DEFAULT_SEED.0 + u64::from(segment)))
-            .col("ts", array::rand::<UInt64Type>())
-            .col("id", array::step::<UInt64Type>())
-            .into_reader_rows(
-                RowCount::from(100_000),
-                BatchCount::from(batches_per_segment),
-            )
+        with_status(
+            gen_batch()
+                .with_seed(Seed::from(DEFAULT_SEED.0 + u64::from(segment)))
+                .col("ts", array::rand::<UInt64Type>())
+                .col("id", array::step::<UInt64Type>())
+                .into_reader_rows(
+                    RowCount::from(100_000),
+                    BatchCount::from(batches_per_segment),
+                ),
+        )
     };
     let params = WriteParams {
         max_rows_per_file: 1_000_000,
@@ -227,6 +259,16 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
             .await
             .unwrap();
     }
+    dataset
+        .create_index(
+            &["status"],
+            IndexType::Bitmap,
+            Some("status_idx".into()),
+            &ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap),
+            false,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         dataset.load_indices_by_name("ts_idx").await.unwrap().len(),
         segments as usize
@@ -322,6 +364,20 @@ fn bench_ordered_limit(c: &mut Criterion) {
                     b.iter(|| {
                         rt.block_on(ordered_limit(dataset, |scanner| {
                             scanner.filter(residual).unwrap();
+                        }))
+                    });
+                },
+            );
+        }
+        for selectivity in ["50%", "1%", "0.01%"] {
+            let filter = format!("status = '{selectivity}'");
+            group.bench_with_input(
+                BenchmarkId::new(format!("mask_{selectivity}"), segments),
+                &dataset,
+                |b, dataset| {
+                    b.iter(|| {
+                        rt.block_on(ordered_limit(dataset, |scanner| {
+                            scanner.filter(&filter).unwrap();
                         }))
                     });
                 },
