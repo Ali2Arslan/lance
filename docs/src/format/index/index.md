@@ -181,6 +181,24 @@ bit is set, including manifests with no covering entries and manifests that drop
 covering index. The two bits are retained together until an atomic reverse conversion
 clears them together.
 
+### Covering fields in transaction files
+
+A transaction file records no covering-field contract. Every `IndexMetadata` that it
+holds, such as the `new_indices` and `removed_indices` of `CreateIndex`, uses the legacy
+contract, whatever the feature flags of any manifest. This holds for every index type. In
+such an entry, `fields` lists the keys in key order, then the entries of `covering_fields`
+in order, so a column that the index is keyed on and carries appears twice. A reader takes
+the keys of such an entry as `fields[..len(fields) - len(covering_fields)]`. An entry is
+invalid when its `covering_fields` is not empty and is not a trailing slice of `fields`
+that leaves at least one key. A reader never picks a contract from the lengths or the
+contents of the lists.
+
+A writer converts each entry to the contract of the manifest that it builds, every time it
+builds one. That includes a commit that retries against a manifest whose flags differ from
+those of the manifest it first read. Under the independent contract the writer stores the
+key prefix as `fields`, as an activation normalizes an entry. Under the legacy contract it
+stores the entry unchanged.
+
 ### Serving carried columns
 
 `IndexMetadata.covering_fields` records the columns an index segment *declares* it

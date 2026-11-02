@@ -20,9 +20,9 @@ the index can store 256K leaves of size 4K each, requiring only a few MiB of mem
 Index version 2 is a superset of version 1. A version 2 segment without
 `key_layout` has exactly the version 1 layout and meaning. A segment sets
 `key_layout` when its pages store encoded keys instead of raw values. See
-[Key Layout](#key-layout). A segment at any index version may also store the
-values of the columns it declares in `covering_fields`. See
-[Carried Columns](#carried-columns).
+[Key Layout](#key-layout). Under the independent covering-field contract, a
+segment at any index version may also store the values of the columns it
+declares in `covering_fields`. See [Carried Columns](#carried-columns).
 
 ## Storage Layout
 
@@ -61,10 +61,17 @@ A segment that carries columns stores them after `ids`. See
 An ordinary BTree may index the logical `_rowid` column of a table, given the following rules:
 
 * Stable Row IDs **must** be enabled on the table.
-* `IndexMetadata.fields` **must** be a single field ID `-3`.
+* The [key fields](#key-fields) **must** be the single field ID `-3`. A
+  segment that declares no covering fields therefore has `fields` equal to
+  `[-3]`.
 * `_rowid` **must** be represented as a non-nullable `UInt64` field.
 * The index **must** use the address-domain format and be at least version 1.
 * The index **must not** set `key_layout`.
+
+The segment may carry columns as [Carried Columns](#carried-columns) describes.
+`covering_fields` never names `-3`, because every covering field is a
+top-level field of the dataset schema (see
+[Loading an index](../index.md#loading-an-index)).
 
 The logical field need not appear in the user schema. Its inline and spilled
 representations are defined in
@@ -117,10 +124,9 @@ A segment with `key_layout` sets these `IndexMetadata` fields:
   twice among them.
 - `index_details` is a `BTreeIndexDetails` whose `key_layout` describes the keys.
 
-The key fields are the first entries of `fields` under either
-[covering-field contract](../index.md#covering-field-contracts). Under the
-legacy contract the carried columns follow them, so the same field may appear
-again after the keys (see [Carried Columns](#carried-columns)).
+Under either
+[covering-field contract](../index.md#covering-field-contracts), the key fields
+are the first entries of `fields` (see [Key Fields](#key-fields)).
 
 `key_layout.keys[i]` gives the direction and the null placement of the key
 column `fields[i]`. The dataset schema gives the type of each key column, so
@@ -435,8 +441,9 @@ declares in `covering_fields`, so that a query that projects only those
 columns can read them from the index instead of taking them from the table.
 Any BTree segment may carry columns, at any index version. That includes a
 single-column segment without a `key_layout`, and a single-column or composite
-segment with one. These rules apply
-[Covering-field contracts](../index.md#covering-field-contracts) and
+segment with one. Only the independent
+[covering-field contract](../index.md#covering-field-contracts) supports
+carried columns. These rules apply
 [Serving carried columns](../index.md#serving-carried-columns) to the BTree.
 For a BTree segment, the schema of `page_data.lance` is the storage schema that
 those rules call authoritative.
@@ -444,22 +451,31 @@ those rules call authoritative.
 ### Key Fields
 
 The manifest's covering-field contract decides which entries of `fields` are
-the keys of a segment:
+the keys of a segment, as
+[Covering-field contracts](../index.md#covering-field-contracts) defines it:
 
 - Under the independent contract, every entry of `fields` is a key.
 - Under the legacy contract, the keys are
-  `fields[..len(fields) - len(covering_fields)]`, and the remaining entries
-  equal `covering_fields`, in the same order.
+  `fields[..len(fields) - len(covering_fields)]`.
 
-The keys come first in `fields` and are in key order. A segment without a
-`key_layout` has exactly one key. A segment with a `key_layout` has one key for
-each entry of `key_layout.keys`. A segment may carry a column that it is keyed
-on. Under the legacy contract, that column then appears twice in `fields`.
+The keys are in key order. A segment without a `key_layout` has exactly one
+key. A segment with a `key_layout` has one key for each entry of
+`key_layout.keys`.
 
 ### Carried Page Layout
 
+A writer stores carried columns in a BTree segment only when the manifest that
+it commits the segment to sets `FLAG_COVERED_INDEX_METADATA` and
+`FLAG_INDEPENDENT_COVERING_FIELDS` in its reader and writer feature flags. If a
+commit retries against a manifest that lacks them, the writer either
+activates the independent contract in the manifest that it builds, as
+[Activating independent declarations](../index.md#activating-independent-declarations)
+describes, or does not commit the segment. It stores carried columns only in
+`page_data.lance`, never in `part_*_page_data.lance` page files.
+
 A segment that carries columns adds one column for each carried field to
-`page_data.lance`, after `values` and `ids`:
+`page_data.lance`, after `values` and `ids`. Without a `key_layout`, the schema
+is:
 
 ```python
 pa.schema(
@@ -472,29 +488,79 @@ pa.schema(
 )
 ```
 
-`values` and `ids` are as in the page layout of the segment without carried
-columns, either [raw](#page-data-file-schema-sub-indices) or
-[encoded](#encoded-page-layout). The page lookup file does not change, and
-neither do the order of the rows or the rows of each page.
+With a `key_layout`, the schema is:
 
-- Each carried field is a top-level field of the dataset schema. The writer
-  names it and gives it the Arrow type that the field has in the dataset
-  schema when the writer writes the file. A struct field is one carried
-  column that holds all its children.
+```python
+pa.schema(
+    [
+        pa.field("values", pa.binary(), nullable=False),
+        pa.field("ids", pa.uint64(), nullable=False),
+        *carried_fields,
+    ],
+    metadata={"covering_field_ids": "<field id>,<field id>,..."},
+)
+```
+
+`values` and `ids` are as in the [raw](#page-data-file-schema-sub-indices) or
+the [encoded](#encoded-page-layout) page layout, and `value_type` is the
+`{DataType}` of the raw layout. Carried columns change neither
+`page_lookup.lance` nor the rows of `page_data.lance`, their order, or the
+pages that they form. Each page that `page_lookup.lance` references holds 1 to
+`batch_size` rows. An empty index has no rows in either file. Its
+`page_data.lance` may still have carried columns, and `covering_field_ids` then
+lists them as in any other file.
+
+- Each carried column holds a field that `covering_fields` declares, which is
+  a top-level field as [Loading an index](../index.md#loading-an-index)
+  requires. The writer names the column and gives it the Arrow type that the
+  field has in the dataset schema when the writer writes the file.
 - Row `i` of a carried column holds the field's value for the row that
   `ids[i]` identifies. A null value is a null in the table. A writer never
   writes a null for a value that it does not have.
-- A segment stores a carried field that it is keyed on as a carried column too.
-  A reader never serves a carried value from `values`.
-- A writer does not store a field named `values` or `ids`. The field stays
-  declared, and a reader takes its values from the table.
-- `covering_field_ids` lists the dataset field id of each carried column, as
-  decimal integers separated by commas, in the order of the columns in the
-  schema. It is present exactly when the file has at least one carried column.
+- A writer does not store a [blob](../../table/schema.md#blob-type) field, or a
+  field that contains one, as a carried column. The data files of a blob
+  field hold descriptors instead of its values (see
+  [Blob v2](../../table/blob.md)).
+- A writer does not store a field named `values` or `ids` as a carried column.
+- `covering_field_ids` lists the field id of each carried column in the order
+  of the columns in the schema, separated by single commas. Each id is a
+  signed 32-bit integer in canonical decimal form: `0`, or a digit from `1` to
+  `9` followed by any digits, with a leading `-` for a negative id. It has no
+  `+`, no leading zero, and no whitespace. The key is present exactly when the
+  file has at least one carried column.
 
-The file may carry fewer fields than `covering_fields` declares. A declared
-field without a carried column is a legal state, and a reader takes its values
-from the table.
+The file may hold fewer carried columns than `covering_fields` declares. A
+declared field without a carried column is a legal state, and a reader takes its
+values from the table.
+
+### Carried Keys
+
+`values` holds every key of a segment for every row, in the segment's layout:
+the raw value without a `key_layout`, and the encoded tuple with one. A key that
+`covering_fields` also declares may have its own carried column too. That copy
+is optional. Both hold the key's value for each row, so a reader may serve the
+key from either one, whichever costs less, and gets the same result. A segment
+that omits or withdraws the copy, or that cannot store it because the key is
+named `values` or `ids`, still serves the key from `values`.
+
+A reader serves a key from `values` as follows:
+
+- Without a `key_layout`, row `i` of `values` holds the key's value for the row
+  that `ids[i]` identifies, nulls included. The reader serves it only when the
+  [storage type](#carried-column-reader-rules) of `values` equals the storage
+  type of the field in the dataset schema.
+- With a `key_layout`, the reader splits the encoded tuple of row `i` into its
+  keys from left to right, then undoes the steps of
+  [Encoding `arrow_row` Version 1](#encoding-arrow_row-version-1) for the key's
+  type, `descending`, and `nulls_first`. The null sentinel gives a null. A
+  fixed-width value gives back its W bytes, and each step on them is a
+  one-to-one map, so every bit pattern survives, including NaN payloads and
+  `-0.0`. A Timestamp gives back its stored value, with the unit and the time
+  zone of the field in the dataset schema. A string or binary value gives back
+  its bytes, stored in the field's type, such as Utf8 or LargeUtf8. Every type
+  that the encoding admits decodes this way without loss.
+
+A reader serves a key from `values` only when `covering_fields` declares it.
 
 ### Carried Column Reader Rules
 
@@ -507,30 +573,58 @@ is true:
   that leaves at least one key.
 - The segment has no `key_layout` and does not have exactly one key.
 
-A reader finds the carried columns of `page_data.lance` by exclusion: every
-column other than `values` and `ids` is a carried column. The reader binds the
-carried column at position `i` among the carried columns to the field id at
-position `i` of `covering_field_ids`. A usable segment serves no carried
-column when any of these is true:
+Under the legacy contract, a reader takes the [key fields](#key-fields) from
+the suffix rule and applies the key-count rules above: one key without a
+`key_layout`, and `len(key_layout.keys)` keys with one. It serves no carried
+value from the segment, neither from a carried column nor from `values`, and
+takes every projected column from the table. The segment still answers key
+queries. This holds whatever `page_data.lance` stores, for example after a
+writer converts the manifest back to the legacy contract.
 
+Under the independent contract, a reader finds the carried columns of
+`page_data.lance` by exclusion: every column other than `values` and `ids` is a
+carried column. It binds the carried column at position `i` among them to the
+field id at position `i` of `covering_field_ids`. This physical order binds the
+columns, and the order of `covering_fields` does not. Binding ignores the
+column name. The reader serves a carried column only when its storage type
+equals the storage type of the bound field in the dataset schema. It serves the
+values under the current dataset field, with that field's current name,
+metadata, and extension type.
+
+Two fields have the same storage type when their Arrow data types are equal.
+The comparison covers the type and its parameters, such as bit widths, units,
+time zones, list sizes, and decimal precision and scale. For a nested type it
+also covers each child's name, storage type, and nullability, in order. For a
+dictionary it covers the key type and the value type. Field metadata at any
+level, the name and the nullability of the top-level field, and the
+dictionary's `ordered` flag are not part of the storage type. A metadata or
+nullability change keeps the field id and rewrites no data (see
+[Schema Evolution](../../table/schema.md#schema-evolution)), so the stored
+values still equal what a take returns. A type change creates a replacement
+field with a new id, so a carried column of the old field never binds to it.
+
+A usable segment serves no carried value, neither from a carried column nor
+from `values`, when any of these is true:
+
+- Its pages are in `part_*_page_data.lance` files instead of
+  `page_data.lance`.
 - `covering_fields` names a field twice, or names a field that is not a
   top-level field of the dataset schema.
 - A column name appears more than once in `page_data.lance`.
 - The file has carried columns and no `covering_field_ids`, or has
   `covering_field_ids` and no carried columns.
-- `covering_field_ids` is not a list of decimal integers separated by commas,
-  names an id twice, or has a different number of ids than the file has
-  carried columns.
+- `covering_field_ids` does not follow the form above, names an id twice, or
+  has a different number of ids than the file has carried columns.
 - A bound id is not in `covering_fields`, or is not a top-level field of the
-  dataset schema, or the column's Arrow type differs from the type of that
-  field in the dataset schema.
+  dataset schema, or the column's storage type differs from the field's.
+- A field that `covering_fields` declares is a blob field, or contains one, in
+  the dataset schema.
 
 Such a segment still answers key queries, and the reader takes every projected
-column from the table. A reader serves a carried value only for a row that it
-returns from the segment. Such a row is in a fragment of `fragment_bitmap`, and
-it is neither deleted nor invalidated (see
-[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)).
-The reader checks each segment on its own, as
+column from the table. A reader serves carried values only for the rows that
+the segment returns once
+[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)
+has filtered them, and it checks each segment on its own, as
 [Serving carried columns](../index.md#serving-carried-columns) requires.
 
 ### Maintaining Carried Columns
@@ -540,49 +634,35 @@ belongs to, or withdraws the column. It never keeps a carried column whose
 values it has not moved with their rows.
 
 - Index optimization takes the carried value of each row that it keeps from
-  the source segment's column bound to the same field id, and the value of
+  the source segment's column that binds to the same field, and the value of
   each new row from the table version that it indexes. It writes a carried
   column only if it has a value for every row of the new page data file.
 - Remapping changes `ids` and leaves each carried value in its row. A row that
   remapping removes takes its carried values with it.
-- A writer never fills one carried column from source columns that are bound to
+- A writer never fills one carried column from source columns that bind to
   different field ids, even when their names and types match.
 - A writer that withdraws a column writes the new page data file without it
   and without its id in `covering_field_ids`. The field may stay in
   `covering_fields`. A file without carried columns has no
   `covering_field_ids` key.
 
-An update of a carried column needs no rule of its own. An update that
-rewrites rows deletes the old rows. An update in place removes the fragments
-that it changes from the segment's `fragment_bitmap`, because carried columns
-are in the union of `fields` and `covering_fields` (see
-[Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)).
+Updates, deletions, and overlay files need no BTree rule of their own. The
+rules in
+[Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)
+and [Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)
+already count every column in the union of `fields` and `covering_fields`.
 
 ### Carried Column Compatibility
 
 Carried columns add no index version and no feature flag. A segment keeps the
-index version and the page layout that it has without them, and the manifest
-sets the covering-field flags as
-[Covering-field contracts](../index.md#covering-field-contracts) requires.
-Released versions v10.0.0 through v15.0.0-beta.8 handle a BTree segment with
-carried columns safely:
-
-- v10.0.0 does not know `FLAG_COVERED_INDEX_METADATA` (`2^7`), so it refuses
-  to read or write a table whose indices declare covering fields.
-- No release supports `FLAG_INDEPENDENT_COVERING_FIELDS` (`2^13`), so every
-  release refuses a table under the independent contract.
-- Under the legacy contract, v11.0.0 and later releases read `values` and
-  `ids` and ignore the carried columns. A release that supports the segment's
-  index version uses the segment for key queries, and the queries return the
-  same rows as a full scan.
-- These releases never write a page data file for a segment that declares
-  covering fields. Their index optimization skips the segment, and their
-  compaction stops the segment from covering the fragments that it rewrites.
-  An update by v11.0.0 drops a segment whose index version it does not
-  support.
-
-The index version still keeps each release away from a page layout that it
-cannot read, and `FLAG_BTREE_KEY_LAYOUT` (`2^20`) still fences writers from a
-segment with a `key_layout`. After every update, index optimization, and
-compaction by these releases, each carried value that these rules let a reader
-serve equals the value in the table.
+index version and the page layout that it has without them. A writer stores
+carried columns only under the independent contract.
+`FLAG_INDEPENDENT_COVERING_FIELDS` (`2^13`) in the reader and the writer
+feature flags fences that contract, because an implementation that does not
+support it rejects the table (see
+[Current Feature Flags](../../table/versioning.md#current-feature-flags)).
+Under the legacy contract a reader serves no carried value, so a BTree segment
+that a legacy manifest holds answers the same key queries whether or not its
+page file has carried columns. The index version still keeps a reader away
+from a page layout that it cannot read, and `FLAG_BTREE_KEY_LAYOUT` (`2^20`)
+still fences writers from a segment with a `key_layout`.
