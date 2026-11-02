@@ -119,10 +119,11 @@ or `covering_fields` include that column. This marks those fragments as needing 
 without invalidating the entire segment and prevents invalid data from being read from the
 index.
 
-This rule and the overlay exclusion in
-[Handling deleted and invalidated rows](#handling-deleted-and-invalidated-rows) count a change
-to a field nested in a field of `fields` or `covering_fields`, such as `s.a` for a segment that
-carries `s`, as a change to that field.
+The update rule above and the overlay exclusion in
+[Handling deleted and invalidated rows](#handling-deleted-and-invalidated-rows) treat a changed
+field as affecting an index dependency when the two fields are the same or either is nested in
+the other. Thus changing `s.a` affects a segment that depends on `s`, and changing `s` affects a
+segment that depends on `s.a`.
 
 ### Removed and replaced fields
 
@@ -138,12 +139,10 @@ depends on. The rule does not apply to the system indices, the
 [Fragment Reuse Index](system/frag_reuse.md) and the [MemWAL Index](system/mem_wal.md),
 which hold table state instead of field values.
 
-Without `max_allocated_field_id`, a writer may give the id of a removed field to a new field
-(see [Field ID Assignment](../table/schema.md#field-id-assignment)). A segment that survived
-the removal would then serve the old field's values for the new field. A struct keeps its id
-when a child is removed or added. If a segment that depends on struct `s` survived the removal
-of `s.b`, a new child with the same name and type at the same position would give `s` its old
-type again. The segment would then serve the old values of `s.b` for the new child.
+The removal keeps a segment from serving old values for a reused id, either the id of a removed
+field that a writer gives to a new field (see
+[Field ID Assignment](../table/schema.md#field-id-assignment)) or the id of a struct after a new
+child replaces a removed one.
 
 ## Index Compatibility
 

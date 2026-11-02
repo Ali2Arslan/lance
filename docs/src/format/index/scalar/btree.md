@@ -581,25 +581,15 @@ A reader serves a key from `values` as follows:
   the storage type of the key field in the dataset schema, and otherwise takes
   the key from the table.
 - With a `key_layout`, the reader splits the encoded tuple of row `i` into its
-  keys from left to right, then undoes the steps of
+  keys from left to right, then inverts
   [Encoding `arrow_row` Version 1](#encoding-arrow_row-version-1) for the key's
-  type, `descending`, and `nulls_first`. The null sentinel gives a null. A
-  fixed-width value gives back its W bytes, and each step on them is a
-  one-to-one map, so every bit pattern survives, including NaN payloads and
-  `-0.0`. A Timestamp gives back its stored value, with the unit and the time
-  zone of the field in the dataset schema. A string or binary value gives back
-  its bytes, stored in the field's type, such as Utf8 or LargeUtf8. Every type
-  that the encoding admits decodes this way without loss.
+  type, `descending`, and `nulls_first`. The inverse gives back each null and
+  the original bits of each value, NaN payloads and `-0.0` included, in the
+  type that the key field has in the dataset schema.
 
 A key served from `values` covers the same rows that a carried column of the
-segment would, under the same rules. The reader serves it only for the rows
-that the segment returns once
-[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)
-has filtered them. That filter drops deleted rows, rows of fragments that an
-update removed from `fragment_bitmap` (see
-[Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)),
-and rows that a newer overlay file changes in a column of `fields` or
-`covering_fields`.
+segment would, the rows that remain after
+[Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows).
 
 ### Carried Column Reader Rules
 
@@ -641,12 +631,9 @@ nullability change keeps the field id and rewrites no data (see
 [Schema Evolution](../../table/schema.md#schema-evolution)), so the stored
 values still equal what a take returns. A type change creates a replacement
 field with a new id, so a carried column of the old field never binds to it.
-A manifest that removes or replaces a field also removes every segment that
-depends on that field or on a field that it is nested in (see
-[Removed and replaced fields](../index.md#removed-and-replaced-fields)).
-Neither a carried column nor `values` then binds to a later field that reuses
-the removed id, and a carried struct never binds again after a new child takes
-the place of a removed one.
+Neither a carried column nor `values` binds to a reused id, because
+[Removed and replaced fields](../index.md#removed-and-replaced-fields) removes
+the segment in the manifest that removes the field.
 
 A usable segment serves no value, neither a key nor a carried column, when its
 pages are in `part_*_page_data.lance` files instead of `page_data.lance`, or
@@ -693,25 +680,12 @@ values it has not moved with their rows.
   `covering_fields`. A file without carried columns has no
   `covering_field_ids` key.
 
-Updates, deletions, and overlay files need no BTree rule of their own. The
-rules in
-[Creating and Updating Index Segments](../index.md#creating-and-updating-index-segments)
-and [Handling deleted and invalidated rows](../index.md#handling-deleted-and-invalidated-rows)
-already count every column in the union of `fields` and `covering_fields`.
-
 ### Carried Column Compatibility
 
-Carried columns add no index version and no feature flag. A segment keeps the
-index version and the page layout that it has without them. A writer stores
-carried columns only under the independent contract.
+Carried columns add no index version and no feature flag.
 `FLAG_INDEPENDENT_COVERING_FIELDS` (`2^13`) in the reader and the writer
-feature flags fences that contract, because an implementation that does not
-support it rejects the table (see
+feature flags fences them. A writer stores carried columns only under the
+independent contract, and an implementation that does not support that
+contract rejects the table (see
 [Current Feature Flags](../../table/versioning.md#current-feature-flags)).
-Under the legacy contract a reader serves no carried column, so a BTree segment
-that a legacy manifest holds answers the same key queries and serves the same
-keys whether or not its page file has carried columns. Serving keys from
-`values` changes no file, so it needs no index version or feature flag either.
-The index version still keeps a reader away
-from a page layout that it cannot read, and `FLAG_BTREE_KEY_LAYOUT` (`2^20`)
-still fences writers from a segment with a `key_layout`.
+Serving keys from `values` changes no file.
