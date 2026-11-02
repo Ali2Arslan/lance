@@ -119,21 +119,31 @@ or `covering_fields` include that column. This marks those fragments as needing 
 without invalidating the entire segment and prevents invalid data from being read from the
 index.
 
+This rule and the overlay exclusion in
+[Handling deleted and invalidated rows](#handling-deleted-and-invalidated-rows) count a change
+to a field nested in a field of `fields` or `covering_fields`, such as `s.a` for a segment that
+carries `s`, as a change to that field.
+
 ### Removed and replaced fields
 
 A manifest that removes a field from the schema also removes every index segment whose
-dependency set, the union of `fields` and `covering_fields`, contains the id of that field.
-The removal happens in the same manifest as the schema change. Dropping a field removes its
-nested fields too. A type replacement removes the old field and adds one with a new id (see
-[Schema Evolution](../table/schema.md#schema-evolution)), so it removes the segments that
-depend on the old field. A writer may instead refuse the schema change, for example a cast
-of a column that an index depends on. The rule does not apply to the system indices, the
+dependency set, the union of `fields` and `covering_fields`, contains the id of the removed
+field or of any field that the removed field is nested in. The removal happens in the same
+manifest as the schema change. Dropping a field removes its nested fields too. Removing `s.b`
+leaves a segment keyed on `s.a` in place, because neither field is nested in the other. A type
+replacement removes the old field and adds one with a new id (see
+[Schema Evolution](../table/schema.md#schema-evolution)), so the rule applies to the old field.
+A writer may instead refuse the schema change, for example a cast of a column that an index
+depends on. The rule does not apply to the system indices, the
 [Fragment Reuse Index](system/frag_reuse.md) and the [MemWAL Index](system/mem_wal.md),
 which hold table state instead of field values.
 
 Without `max_allocated_field_id`, a writer may give the id of a removed field to a new field
 (see [Field ID Assignment](../table/schema.md#field-id-assignment)). A segment that survived
-the removal would then serve the old field's values for the new field.
+the removal would then serve the old field's values for the new field. A struct keeps its id
+when a child is removed or added. If a segment that depends on struct `s` survived the removal
+of `s.b`, a new child with the same name and type at the same position would give `s` its old
+type again. The segment would then serve the old values of `s.b` for the new child.
 
 ## Index Compatibility
 

@@ -642,10 +642,11 @@ nullability change keeps the field id and rewrites no data (see
 values still equal what a take returns. A type change creates a replacement
 field with a new id, so a carried column of the old field never binds to it.
 A manifest that removes or replaces a field also removes every segment that
-depends on it (see
-[Removed and replaced fields](../index.md#removed-and-replaced-fields)), so
-neither a carried column nor `values` binds to a later field that reuses the
-removed id.
+depends on that field or on a field that it is nested in (see
+[Removed and replaced fields](../index.md#removed-and-replaced-fields)).
+Neither a carried column nor `values` then binds to a later field that reuses
+the removed id, and a carried struct never binds again after a new child takes
+the place of a removed one.
 
 A usable segment serves no value, neither a key nor a carried column, when its
 pages are in `part_*_page_data.lance` files instead of `page_data.lance`, or
