@@ -119,6 +119,22 @@ or `covering_fields` include that column. This marks those fragments as needing 
 without invalidating the entire segment and prevents invalid data from being read from the
 index.
 
+### Removed and replaced fields
+
+A manifest that removes a field from the schema also removes every index segment whose
+dependency set, the union of `fields` and `covering_fields`, contains the id of that field.
+The removal happens in the same manifest as the schema change. Dropping a field removes its
+nested fields too. A type replacement removes the old field and adds one with a new id (see
+[Schema Evolution](../table/schema.md#schema-evolution)), so it removes the segments that
+depend on the old field. A writer may instead refuse the schema change, for example a cast
+of a column that an index depends on. The rule does not apply to the system indices, the
+[Fragment Reuse Index](system/frag_reuse.md) and the [MemWAL Index](system/mem_wal.md),
+which hold table state instead of field values.
+
+Without `max_allocated_field_id`, a writer may give the id of a removed field to a new field
+(see [Field ID Assignment](../table/schema.md#field-id-assignment)). A segment that survived
+the removal would then serve the old field's values for the new field.
+
 ## Index Compatibility
 
 Before using an index segment, engines must verify they support it:
@@ -181,11 +197,15 @@ bit is set, including manifests with no covering entries and manifests that drop
 covering index. The two bits are retained together until an atomic reverse conversion
 clears them together.
 
-### Covering fields in transaction files
+### Covering fields in transactions
 
-A transaction file records no covering-field contract. Every `IndexMetadata` that it
-holds, such as the `new_indices` and `removed_indices` of `CreateIndex`, uses the legacy
-contract, whatever the feature flags of any manifest. This holds for every index type. In
+A serialized `Transaction` records no covering-field contract, whether a transaction file
+stores it or a manifest embeds it in its inline transaction section (see
+[Transaction Files](../table/transaction.md#transaction-files) and
+[Inline Transaction Sections](../table/transaction.md#inline-transaction-sections)). Every
+`IndexMetadata` that it holds, such as the `new_indices` and `removed_indices` of
+`CreateIndex`, uses the legacy contract, whatever the feature flags of any manifest,
+including the manifest that embeds it. This holds for every index type. In
 such an entry, `fields` lists the keys in key order, then the entries of `covering_fields`
 in order, so a column that the index is keyed on and carries appears twice. A reader takes
 the keys of such an entry as `fields[..len(fields) - len(covering_fields)]`. An entry is
