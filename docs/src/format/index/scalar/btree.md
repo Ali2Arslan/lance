@@ -688,4 +688,5 @@ feature flags fences them. A writer stores carried columns only under the
 independent contract, and an implementation that does not support that
 contract rejects the table (see
 [Current Feature Flags](../../table/versioning.md#current-feature-flags)).
-Serving keys from `values` changes no file.
+Serving keys from `values` changes no file, so it adds no index version and no
+feature flag.
