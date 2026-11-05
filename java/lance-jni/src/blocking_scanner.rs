@@ -306,6 +306,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub late_materialization_obj: JObject<'a>,
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
+    pub ignored_scalar_indices_obj: JObject<'a>,
     pub use_ordered_index: jboolean,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
@@ -442,6 +443,11 @@ pub(crate) fn build_scanner_with_options<'a>(
     }
 
     scanner.use_scalar_index(options.use_scalar_index == JNI_TRUE);
+    if let Some(ignored_scalar_indices) =
+        env.get_strings_opt(&options.ignored_scalar_indices_obj)?
+    {
+        scanner.with_ignored_scalar_indices(ignored_scalar_indices);
+    }
     scanner.use_ordered_index(options.use_ordered_index == JNI_TRUE);
 
     env.get_optional(&options.query_obj, |env, java_obj| {
@@ -525,6 +531,12 @@ pub(crate) fn build_scanner_with_options<'a>(
             env.get_optional_u32_from_method(&java_obj, "getRefineFactor")?
         {
             scanner.refine(refine_factor);
+        }
+
+        if let Some(factor) =
+            env.get_optional_u32_from_method(&java_obj, "getQuantizedRefineFactor")?
+        {
+            scanner.quantized_refine(factor);
         }
 
         if let Some(distance_type_str) =
@@ -668,6 +680,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     late_materialization_obj: JObject<'local>, // Optional<MaterializationStyle>
     column_orderings: JObject<'local>,    // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,           // boolean
+    ignored_scalar_indices_obj: JObject<'local>, // Optional<List<String>>
     use_ordered_index: jboolean,          // boolean
     fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
@@ -703,6 +716,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             late_materialization_obj,
             column_orderings,
             use_scalar_index,
+            ignored_scalar_indices_obj,
             use_ordered_index,
             fast_search,
             substrait_aggregate_obj,
@@ -740,6 +754,7 @@ fn inner_create_scanner<'local>(
     late_materialization_obj: JObject<'local>,
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
+    ignored_scalar_indices_obj: JObject<'local>,
     use_ordered_index: jboolean,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
@@ -776,6 +791,7 @@ fn inner_create_scanner<'local>(
         late_materialization_obj,
         column_orderings,
         use_scalar_index,
+        ignored_scalar_indices_obj,
         use_ordered_index,
         fast_search,
         substrait_aggregate_obj,

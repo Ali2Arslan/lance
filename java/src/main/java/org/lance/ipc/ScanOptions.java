@@ -17,6 +17,8 @@ import com.google.common.base.MoreObjects;
 import org.apache.arrow.util.Preconditions;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -45,6 +47,7 @@ public class ScanOptions {
   private final Optional<MaterializationStyle> lateMaterialization;
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
+  private final Optional<List<String>> ignoredScalarIndices;
   private final boolean useOrderedIndex;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
@@ -245,6 +248,7 @@ public class ScanOptions {
         Optional.empty(),
         columnOrderings,
         useScalarIndex,
+        Optional.empty(),
         true,
         substraitAggregate,
         collectStats,
@@ -277,6 +281,7 @@ public class ScanOptions {
       Optional<MaterializationStyle> lateMaterialization,
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
+      Optional<List<String>> ignoredScalarIndices,
       boolean useOrderedIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
@@ -326,6 +331,16 @@ public class ScanOptions {
     this.lateMaterialization = lateMaterialization;
     this.columnOrderings = columnOrderings;
     this.useScalarIndex = useScalarIndex;
+    ignoredScalarIndices.ifPresent(
+        names -> {
+          for (String name : names) {
+            Preconditions.checkArgument(
+                name != null && !name.isEmpty(),
+                "ignoredScalarIndices cannot contain null or empty names");
+          }
+        });
+    this.ignoredScalarIndices =
+        ignoredScalarIndices.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
     this.useOrderedIndex = useOrderedIndex;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
@@ -532,6 +547,15 @@ public class ScanOptions {
   }
 
   /**
+   * Get scalar index names ignored during expression-filter planning.
+   *
+   * @return ignored scalar index names, or empty when no names are configured.
+   */
+  public Optional<List<String>> getIgnoredScalarIndices() {
+    return ignoredScalarIndices;
+  }
+
+  /**
    * Get whether a B-tree index may be read in key order to serve the column orderings.
    *
    * @return true if an ordered index read may replace the sort, false otherwise.
@@ -616,6 +640,7 @@ public class ScanOptions {
         .add("lateMaterialization", lateMaterialization.orElse(null))
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
+        .add("ignoredScalarIndices", ignoredScalarIndices.orElse(null))
         .add("useOrderedIndex", useOrderedIndex)
         .add("fastSearch", fastSearch)
         .add(
@@ -652,6 +677,7 @@ public class ScanOptions {
     private Optional<MaterializationStyle> lateMaterialization = Optional.empty();
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
+    private Optional<List<String>> ignoredScalarIndices = Optional.empty();
     private boolean useOrderedIndex = true;
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
@@ -690,6 +716,7 @@ public class ScanOptions {
       this.lateMaterialization = options.getLateMaterialization();
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
+      this.ignoredScalarIndices = options.getIgnoredScalarIndices();
       this.useOrderedIndex = options.isUseOrderedIndex();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
@@ -972,6 +999,36 @@ public class ScanOptions {
     }
 
     /**
+     * Ignore named scalar indices from expression-filter planning.
+     *
+     * <p>Other scalar indices remain eligible, and the original filter is still evaluated for rows
+     * selected by the remaining scan plan. Names that do not identify an available scalar index
+     * have no effect. This option is ignored when {@link #useScalarIndex(boolean)} is false.
+     * Inverted index names are also honored for expression filters such as {@code contains_tokens},
+     * which fall back to evaluating the function without that index. This does not control vector
+     * index segments or explicit full-text search queries.
+     *
+     * <p>With {@link #fastSearch(boolean)}, only a filter plan that still uses an index skips
+     * unindexed fragments. If ignoring indices removes every index query, the scan falls back to
+     * evaluating the filter over all selected fragments, potentially returning more matching rows.
+     * Explicit fragment selections still apply; use them to preserve a caller-defined scan scope.
+     *
+     * <pre>{@code
+     * ScanOptions options = new ScanOptions.Builder()
+     *     .filter("id = 42")
+     *     .ignoredScalarIndices(Collections.singletonList("id_zonemap"))
+     *     .build();
+     * }</pre>
+     *
+     * @param indexNames logical scalar index names to ignore.
+     * @return Builder instance for method chaining.
+     */
+    public Builder ignoredScalarIndices(List<String> indexNames) {
+      this.ignoredScalarIndices = Optional.of(indexNames);
+      return this;
+    }
+
+    /**
      * Set whether a B-tree index may be read in key order to serve the column orderings.
      *
      * <p>By default, a scan with a limit that orders by one column with a B-tree index reads that
@@ -993,6 +1050,10 @@ public class ScanOptions {
      * <p>This is a weak-consistency mode for vector search, full text search, and scalar-indexed
      * filters. It can reduce latency by skipping recently appended fragments that are not covered
      * by the relevant index.
+     *
+     * <p>For scalar expression filters, this applies only when the filter plan uses an index. If no
+     * index query remains, including after {@link #ignoredScalarIndices(List)}, the scan falls back
+     * to all selected fragments while retaining the original filter.
      *
      * @param fastSearch true to skip unindexed fragments, false otherwise. Default is false.
      * @return Builder instance for method chaining.
@@ -1089,6 +1150,7 @@ public class ScanOptions {
           lateMaterialization,
           columnOrderings,
           useScalarIndex,
+          ignoredScalarIndices,
           useOrderedIndex,
           substraitAggregate,
           collectStats,
