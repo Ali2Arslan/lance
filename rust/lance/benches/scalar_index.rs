@@ -292,12 +292,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
+    targets = bench_ordered_limit, bench_baseline, bench_warm_indexed);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
+    targets = bench_ordered_limit, bench_baseline, bench_warm_indexed);
 
 criterion_main!(benches);
