@@ -22,6 +22,7 @@ pub mod test_dataset;
 mod vector;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
+pub use ordered::OrderedIndexMode;
 pub use source::TakeOperation;
 
 use std::collections::HashSet;
@@ -584,7 +585,7 @@ pub struct Scanner {
     /// Scalar indices that must not participate in expression-filter planning.
     ignored_scalar_index_names: HashSet<String>,
 
-    use_ordered_index: bool,
+    ordered_index: OrderedIndexMode,
 
     /// Whether to use statistics to optimize the scan (default: true)
     ///

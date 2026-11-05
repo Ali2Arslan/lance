@@ -48,7 +48,7 @@ use crate::{Error, Result};
 use super::aggregate::AggregateExpr;
 use super::{
     BATCH_SIZE_FALLBACK, ColumnOrdering, ExprFilter, LanceFilter, MaterializationStyle,
-    QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
+    OrderedIndexMode, QueryFilter, ScalarIndexSelection, Scanner, get_default_batch_size,
 };
 
 impl Scanner {
@@ -88,7 +88,7 @@ impl Scanner {
             fast_search: false,
             use_scalar_index: true,
             ignored_scalar_index_names: HashSet::new(),
-            use_ordered_index: true,
+            ordered_index: OrderedIndexMode::default(),
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,

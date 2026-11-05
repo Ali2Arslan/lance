@@ -1323,8 +1323,8 @@ public class ScannerTest {
   }
 
   @Test
-  void testUseOrderedIndex(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scanner_use_ordered_index").toString();
+  void testOrderedIndex(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_ordered_index").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -1344,7 +1344,7 @@ public class ScannerTest {
         ordering.setColumnName("id");
         ordering.setAscending(false);
         ordering.setNullFirst(false);
-        for (boolean useOrderedIndex : new boolean[] {true, false}) {
+        for (ScanOptions.OrderedIndexMode orderedIndex : ScanOptions.OrderedIndexMode.values()) {
           List<Integer> ids = new ArrayList<>();
           try (LanceScanner scanner =
               dataset.newScan(
@@ -1352,7 +1352,7 @@ public class ScannerTest {
                       .columns(Collections.singletonList("id"))
                       .setColumnOrderings(Collections.singletonList(ordering.build()))
                       .limit(10)
-                      .useOrderedIndex(useOrderedIndex)
+                      .orderedIndex(orderedIndex)
                       .collectStats(true)
                       .build())) {
             try (ArrowReader reader = scanner.scanBatches()) {
@@ -1364,15 +1364,14 @@ public class ScannerTest {
               }
             }
             assertEquals(
-                useOrderedIndex,
+                orderedIndex == ScanOptions.OrderedIndexMode.AUTO,
                 scanner.getStats().get().getAllCounts().containsKey("pages_loaded"),
-                "only the ordered index read records pages_loaded, useOrderedIndex="
-                    + useOrderedIndex);
+                "only the ordered index read records pages_loaded, orderedIndex=" + orderedIndex);
           }
           assertEquals(
               Arrays.asList(55, 54, 53, 52, 50, 49, 48, 47, 46, 45),
               ids,
-              "useOrderedIndex=" + useOrderedIndex);
+              "orderedIndex=" + orderedIndex);
         }
       }
     }

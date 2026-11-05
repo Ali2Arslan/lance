@@ -11,7 +11,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::dataset::WriteParams;
-use lance::dataset::scanner::{ColumnOrdering, Scanner};
+use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode, Scanner};
 use lance::index::DatasetIndexExt;
 use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
@@ -267,13 +267,13 @@ fn bench_ordered_limit(c: &mut Criterion) {
     let tempdir = TempStrDir::default();
     let dataset = rt.block_on(ordered_limit_dataset(&tempdir));
     let mut group = c.benchmark_group("ordered_limit");
-    group.bench_function("ordered_index", |b| {
+    group.bench_function("ordered_index_auto", |b| {
         b.iter(|| rt.block_on(ordered_limit(&dataset, |_| {})));
     });
-    group.bench_function("use_ordered_index_false", |b| {
+    group.bench_function("ordered_index_off", |b| {
         b.iter(|| {
             rt.block_on(ordered_limit(&dataset, |scanner| {
-                scanner.use_ordered_index(false);
+                scanner.ordered_index(OrderedIndexMode::Off);
             }))
         });
     });

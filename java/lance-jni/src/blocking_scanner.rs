@@ -15,7 +15,7 @@ use jni::sys::{JNI_TRUE, jboolean, jint};
 use jni::{JNIEnv, sys::jlong};
 use lance::dataset::scanner::{
     AggregateExpr, ColumnOrdering, DatasetRecordBatchStream, ExecutionStatsCallback,
-    ExecutionSummaryCounts, FragmentSlice, MaterializationStyle, Scanner,
+    ExecutionSummaryCounts, FragmentSlice, MaterializationStyle, OrderedIndexMode, Scanner,
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_index::scalar::inverted::{
@@ -307,7 +307,7 @@ pub(crate) struct ScannerOptions<'a> {
     pub column_orderings: JObject<'a>,
     pub use_scalar_index: jboolean,
     pub ignored_scalar_indices_obj: JObject<'a>,
-    pub use_ordered_index: jboolean,
+    pub ordered_index: JString<'a>,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
     pub include_deleted_rows: jboolean,
@@ -348,6 +348,11 @@ fn parse_fragment_slices(
             })?,
         })
     })
+}
+
+pub(crate) fn get_ordered_index_mode(env: &mut JNIEnv, name: &JString) -> Result<OrderedIndexMode> {
+    let name: String = env.get_string(name)?.into();
+    Ok(name.parse()?)
 }
 
 /// Build a scanner with options applied - shared by blocking and async scanners
@@ -448,7 +453,7 @@ pub(crate) fn build_scanner_with_options<'a>(
     {
         scanner.with_ignored_scalar_indices(ignored_scalar_indices);
     }
-    scanner.use_ordered_index(options.use_ordered_index == JNI_TRUE);
+    scanner.ordered_index(get_ordered_index_mode(env, &options.ordered_index)?);
 
     env.get_optional(&options.query_obj, |env, java_obj| {
         // Set column and key for nearest search
@@ -681,7 +686,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     column_orderings: JObject<'local>,    // Optional<List<ColumnOrdering>>
     use_scalar_index: jboolean,           // boolean
     ignored_scalar_indices_obj: JObject<'local>, // Optional<List<String>>
-    use_ordered_index: jboolean,          // boolean
+    ordered_index: JString<'local>,       // String
     fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,              // boolean
@@ -717,7 +722,7 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             column_orderings,
             use_scalar_index,
             ignored_scalar_indices_obj,
-            use_ordered_index,
+            ordered_index,
             fast_search,
             substrait_aggregate_obj,
             collect_stats,
@@ -755,7 +760,7 @@ fn inner_create_scanner<'local>(
     column_orderings: JObject<'local>,
     use_scalar_index: jboolean,
     ignored_scalar_indices_obj: JObject<'local>,
-    use_ordered_index: jboolean,
+    ordered_index: JString<'local>,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
@@ -792,7 +797,7 @@ fn inner_create_scanner<'local>(
         column_orderings,
         use_scalar_index,
         ignored_scalar_indices_obj,
-        use_ordered_index,
+        ordered_index,
         fast_search,
         substrait_aggregate_obj,
         include_deleted_rows,

@@ -7234,8 +7234,8 @@ def test_row_address_index_maintenance(tmp_path, index_type):
 
 @pytest.mark.parametrize(
     "options",
-    [{}, {"use_ordered_index": False}, {"use_scalar_index": False}],
-    ids=["ordered_index", "use_ordered_index_false", "use_scalar_index_false"],
+    [{}, {"ordered_index": "off"}, {"use_scalar_index": False}],
+    ids=["default", "ordered_index_off", "use_scalar_index_false"],
 )
 def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
     ts = [None if i % 10 == 3 else i * 7 % 60 for i in range(60)]
@@ -7264,3 +7264,10 @@ def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
     assert scanner.to_table() == newest
     to_table = dataset.to_table(columns=["v"], order_by=order_by, limit=10, **options)
     assert to_table == newest
+
+
+def test_ordered_index_rejects_unknown_mode(tmp_path):
+    dataset = lance.write_dataset(pa.table({"ts": pa.array([2, 1])}), tmp_path)
+    expected = "unknown ordered_index mode 'sorted', expected one of: off, auto"
+    with pytest.raises(ValueError, match=expected):
+        dataset.scanner(order_by=["ts"], limit=1, ordered_index="sorted")

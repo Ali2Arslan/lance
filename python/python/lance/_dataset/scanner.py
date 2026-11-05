@@ -687,7 +687,7 @@ class ScannerBuilder:
         self._full_text_query = None
         self._use_scalar_index = None
         self._ignored_scalar_indices = None
-        self._use_ordered_index = None
+        self._ordered_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -958,17 +958,19 @@ class ScannerBuilder:
         self._ignored_scalar_indices = index_names
         return self
 
-    def use_ordered_index(self, use_ordered_index: bool = True) -> ScannerBuilder:
+    def ordered_index(self, mode: str) -> ScannerBuilder:
         """
         Set whether a B-tree index may be read in key order to serve ``order_by``
 
-        By default, a scan with a limit that orders by one column with a B-tree index
-        reads that index in key order and stops after ``offset + limit`` live rows,
-        instead of sorting every row.  This applies when the scan has no filter or a
-        filter that the same index answers exactly.  Set this to False to always sort.
-        Other uses of scalar indices are not affected.
+        With ``"auto"``, the default, a scan with a limit that orders by one column
+        with a B-tree index reads that index in key order and stops after
+        ``offset + limit`` live rows, instead of sorting every row.  This applies
+        when the scan has no filter or a filter that the same index answers
+        exactly.  ``"off"`` always sorts.  Names are case-insensitive, and the
+        scanner rejects any other name with a ``ValueError``.  Other uses of
+        scalar indices are not affected.
         """
-        self._use_ordered_index = use_ordered_index
+        self._ordered_index = mode
         return self
 
     def with_fragments(
@@ -1303,7 +1305,7 @@ class ScannerBuilder:
             self._row_addr_allowlist,
             self._row_addr_blocklist,
             self._minhash_query,
-            self._use_ordered_index,
+            self._ordered_index,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

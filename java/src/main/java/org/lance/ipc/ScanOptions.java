@@ -25,6 +25,25 @@ import java.util.UUID;
 
 /** Lance scan options. */
 public class ScanOptions {
+  /** Whether a scan may read a B-tree index in key order to serve the column orderings. */
+  public enum OrderedIndexMode {
+    /** Always sort. */
+    OFF("off"),
+    /** Read the index in key order when it can serve the orderings, and sort otherwise. */
+    AUTO("auto");
+
+    private final String rustValue;
+
+    OrderedIndexMode(String rustValue) {
+      this.rustValue = rustValue;
+    }
+
+    /** Returns the name the Rust binding parses. */
+    public String toRustString() {
+      return rustValue;
+    }
+  }
+
   private final Optional<List<Integer>> fragmentIds;
   private final Optional<List<FragmentSlice>> fragmentSlices;
   private final Optional<List<UUID>> indexSegments;
@@ -48,7 +67,7 @@ public class ScanOptions {
   private final Optional<List<ColumnOrdering>> columnOrderings;
   private final boolean useScalarIndex;
   private final Optional<List<String>> ignoredScalarIndices;
-  private final boolean useOrderedIndex;
+  private final OrderedIndexMode orderedIndex;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -249,7 +268,7 @@ public class ScanOptions {
         columnOrderings,
         useScalarIndex,
         Optional.empty(),
-        true,
+        OrderedIndexMode.AUTO,
         substraitAggregate,
         collectStats,
         fastSearch,
@@ -282,7 +301,7 @@ public class ScanOptions {
       Optional<List<ColumnOrdering>> columnOrderings,
       boolean useScalarIndex,
       Optional<List<String>> ignoredScalarIndices,
-      boolean useOrderedIndex,
+      OrderedIndexMode orderedIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -341,7 +360,7 @@ public class ScanOptions {
         });
     this.ignoredScalarIndices =
         ignoredScalarIndices.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
-    this.useOrderedIndex = useOrderedIndex;
+    this.orderedIndex = orderedIndex;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -558,10 +577,10 @@ public class ScanOptions {
   /**
    * Get whether a B-tree index may be read in key order to serve the column orderings.
    *
-   * @return true if an ordered index read may replace the sort, false otherwise.
+   * @return the ordered index mode.
    */
-  public boolean isUseOrderedIndex() {
-    return useOrderedIndex;
+  public OrderedIndexMode getOrderedIndex() {
+    return orderedIndex;
   }
 
   /**
@@ -641,7 +660,7 @@ public class ScanOptions {
         .add("columnOrdering", columnOrderings)
         .add("useScalarIndex", useScalarIndex)
         .add("ignoredScalarIndices", ignoredScalarIndices.orElse(null))
-        .add("useOrderedIndex", useOrderedIndex)
+        .add("orderedIndex", orderedIndex)
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -678,7 +697,7 @@ public class ScanOptions {
     private Optional<List<ColumnOrdering>> columnOrderings = Optional.empty();
     private boolean useScalarIndex = true;
     private Optional<List<String>> ignoredScalarIndices = Optional.empty();
-    private boolean useOrderedIndex = true;
+    private OrderedIndexMode orderedIndex = OrderedIndexMode.AUTO;
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -717,7 +736,7 @@ public class ScanOptions {
       this.columnOrderings = options.getColumnOrderings();
       this.useScalarIndex = options.isUseScalarIndex();
       this.ignoredScalarIndices = options.getIgnoredScalarIndices();
-      this.useOrderedIndex = options.isUseOrderedIndex();
+      this.orderedIndex = options.getOrderedIndex();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -1031,16 +1050,17 @@ public class ScanOptions {
     /**
      * Set whether a B-tree index may be read in key order to serve the column orderings.
      *
-     * <p>By default, a scan with a limit that orders by one column with a B-tree index reads that
-     * index in key order and stops after {@code offset + limit} live rows, instead of sorting every
-     * row. This applies when the scan has no filter or a filter that the same index answers
-     * exactly. Set this to false to always sort. Other uses of scalar indices are not affected.
+     * <p>With {@link OrderedIndexMode#AUTO}, the default, a scan with a limit that orders by one
+     * column with a B-tree index reads that index in key order and stops after {@code offset +
+     * limit} live rows, instead of sorting every row. This applies when the scan has no filter or a
+     * filter that the same index answers exactly. {@link OrderedIndexMode#OFF} always sorts. Other
+     * uses of scalar indices are not affected.
      *
-     * @param useOrderedIndex true to allow an ordered index read, false otherwise. Default is true.
+     * @param orderedIndex the ordered index mode. Default is {@link OrderedIndexMode#AUTO}.
      * @return Builder instance for method chaining.
      */
-    public Builder useOrderedIndex(boolean useOrderedIndex) {
-      this.useOrderedIndex = useOrderedIndex;
+    public Builder orderedIndex(OrderedIndexMode orderedIndex) {
+      this.orderedIndex = Preconditions.checkNotNull(orderedIndex, "orderedIndex cannot be null");
       return this;
     }
 
@@ -1151,7 +1171,7 @@ public class ScanOptions {
           columnOrderings,
           useScalarIndex,
           ignoredScalarIndices,
-          useOrderedIndex,
+          orderedIndex,
           substraitAggregate,
           collectStats,
           fastSearch,
