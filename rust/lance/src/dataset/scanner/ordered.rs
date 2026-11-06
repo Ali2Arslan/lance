@@ -569,18 +569,24 @@ mod tests {
         assert_ordered_read(&dataset, configure, Expect::Sort).await;
     }
 
+    const ONE_SEGMENT: &[&[u32]] = &[&[0, 1, 2]];
+    const SEGMENT_PER_FRAGMENT: &[&[u32]] = &[&[0], &[1], &[2]];
+
     #[rstest]
-    #[case::order_column_index(INDEX, Expect::Sort)]
+    #[case::order_column_index(INDEX, ONE_SEGMENT, Expect::Sort)]
+    #[case::order_column_index_in_three_segments(INDEX, SEGMENT_PER_FRAGMENT, Expect::Sort)]
     #[case::unrelated_index(
         "id_idx",
+        ONE_SEGMENT,
         Expect::OrderedScan("OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10")
     )]
     #[tokio::test]
     async fn test_ordered_read_skips_ignored_indices(
         #[case] ignored: &str,
+        #[case] segment_fragments: &[&[u32]],
         #[case] expect: Expect<'static>,
     ) {
-        let mut dataset = dataset(WriteParams::default()).await;
+        let mut dataset = segmented_dataset(segment_fragments).await;
         dataset
             .create_index(
                 &["id"],
