@@ -1364,7 +1364,7 @@ public class ScannerTest {
               }
             }
             assertEquals(
-                orderedIndex == ScanOptions.OrderedIndexMode.AUTO,
+                orderedIndex != ScanOptions.OrderedIndexMode.OFF,
                 scanner.getStats().get().getAllCounts().containsKey("pages_loaded"),
                 "only the ordered index read records pages_loaded, orderedIndex=" + orderedIndex);
           }
