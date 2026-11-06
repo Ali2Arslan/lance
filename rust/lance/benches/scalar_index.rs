@@ -11,7 +11,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
 use lance::dataset::WriteParams;
-use lance::dataset::scanner::{ColumnOrdering, Scanner};
+use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode, Scanner};
 use lance::index::DatasetIndexExt;
 use lance::{Dataset, io::ObjectStore};
 use lance_core::cache::LanceCache;
@@ -297,19 +297,19 @@ fn bench_ordered_limit(c: &mut Criterion) {
         let tempdir = TempStrDir::default();
         let dataset = rt.block_on(ordered_limit_dataset(&tempdir, segments));
         group.bench_with_input(
-            BenchmarkId::new("ordered_index", segments),
+            BenchmarkId::new("ordered_index_auto", segments),
             &dataset,
             |b, dataset| {
                 b.iter(|| rt.block_on(ordered_limit(dataset, |_| {})));
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("use_ordered_index_false", segments),
+            BenchmarkId::new("ordered_index_off", segments),
             &dataset,
             |b, dataset| {
                 b.iter(|| {
                     rt.block_on(ordered_limit(dataset, |scanner| {
-                        scanner.use_ordered_index(false);
+                        scanner.ordered_index(OrderedIndexMode::Off);
                     }))
                 });
             },
@@ -334,12 +334,12 @@ criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
+    targets = bench_ordered_limit, bench_baseline, bench_warm_indexed);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_baseline, bench_warm_indexed, bench_ordered_limit);
+    targets = bench_ordered_limit, bench_baseline, bench_warm_indexed);
 
 criterion_main!(benches);

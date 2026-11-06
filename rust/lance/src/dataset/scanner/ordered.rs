@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::collections::HashSet;
+use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_schema::SortOptions;
@@ -19,30 +21,89 @@ use crate::index::scalar_logical::load_named_scalar_segments;
 use crate::io::exec::ordered_index_scan::OrderedIndexScanExec;
 use crate::{Error, Result};
 
+/// Whether a scan may read a B-tree index in key order to serve `order_by`.
+///
+/// Parse a mode from its name with [`str::parse`], ignoring ASCII case.
+///
+/// ```
+/// # use lance::dataset::scanner::OrderedIndexMode;
+/// # use lance::Result;
+/// # fn test() -> Result<()> {
+/// assert_eq!("off".parse::<OrderedIndexMode>()?, OrderedIndexMode::Off);
+/// assert_eq!(OrderedIndexMode::default(), OrderedIndexMode::Auto);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OrderedIndexMode {
+    /// Always sort.
+    Off,
+    /// Read the index in key order when it can serve the ordering, and sort
+    /// otherwise.
+    #[default]
+    Auto,
+}
+
+impl OrderedIndexMode {
+    const ALL: [Self; 2] = [Self::Off, Self::Auto];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl fmt::Display for OrderedIndexMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for OrderedIndexMode {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                let accepted = Self::ALL.map(Self::name).join(", ");
+                Error::invalid_input(format!(
+                    "unknown ordered_index mode '{name}', expected one of: {accepted}"
+                ))
+            })
+    }
+}
+
 impl Scanner {
     /// Set whether to read a B-tree index in key order to serve `order_by`.
     ///
-    /// By default, a scan with a limit that orders by one column with a
-    /// B-tree index reads that index in key order and stops after
-    /// `offset + limit` live rows, instead of sorting every row. This applies
-    /// when the scan has no filter or a filter that the same index answers
-    /// exactly. Set this to `false` to always sort. Other uses of scalar
-    /// indices are not affected.
+    /// With [`OrderedIndexMode::Auto`], the default, a scan with a limit that
+    /// orders by one column with a B-tree index reads that index in key order
+    /// and stops after `offset + limit` live rows, instead of sorting every
+    /// row. This applies when the scan has no filter or a filter that the same
+    /// index answers exactly. An index named in
+    /// [`Self::with_ignored_scalar_indices`] never serves the read.
+    /// [`OrderedIndexMode::Off`] always sorts. Other uses of scalar indices are
+    /// not affected.
     ///
     /// ```
-    /// # use lance::dataset::scanner::ColumnOrdering;
+    /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};
     /// # use lance::{Dataset, Result};
     /// # async fn test(dataset: &Dataset) -> Result<()> {
     /// let mut scan = dataset.scan();
     /// scan.order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".to_string())]))?
     ///     .limit(Some(10), None)?
-    ///     .use_ordered_index(false);
+    ///     .ordered_index(OrderedIndexMode::Off);
     /// let newest_ten = scan.try_into_batch().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn use_ordered_index(&mut self, use_ordered_index: bool) -> &mut Self {
-        self.use_ordered_index = use_ordered_index;
+    pub fn ordered_index(&mut self, mode: OrderedIndexMode) -> &mut Self {
+        self.ordered_index = mode;
         self
     }
 
@@ -69,7 +130,7 @@ impl Scanner {
         // fragment bitmap without indexing its rows (issue 10351), so the bitmap
         // cannot prove that the index covers every fragment.
         let has_stable_row_ids = self.dataset.manifest().uses_stable_row_ids();
-        if !self.use_ordered_index
+        if self.ordered_index == OrderedIndexMode::Off
             || !self.use_scalar_index
             || self.external_row_mask.is_some()
             || self.physical_row_addr_prefilter.is_some()
@@ -139,6 +200,7 @@ impl Scanner {
         for index in indices.iter() {
             if index.fields != [field_id]
                 || index_name.is_some_and(|name| name != index.name)
+                || self.ignored_scalar_index_names.contains(&index.name)
                 || !checked.insert(index.name.as_str())
             {
                 continue;
@@ -202,10 +264,11 @@ mod tests {
     use rstest::rstest;
 
     use super::super::{ColumnOrdering, RowAddrMask, RowAddrTreeMap, Scanner};
-    use crate::Dataset;
+    use super::OrderedIndexMode;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::{Dataset, Error};
 
     const ROWS: i32 = 300;
     const FRAGMENT_ROWS: usize = 100;
@@ -303,11 +366,11 @@ mod tests {
     async fn scan(
         dataset: &Dataset,
         configure: &impl Fn(&mut Scanner),
-        use_ordered_index: bool,
+        mode: OrderedIndexMode,
     ) -> (String, RecordBatch) {
         let mut scanner = dataset.scan();
         configure(&mut scanner);
-        scanner.use_ordered_index(use_ordered_index);
+        scanner.ordered_index(mode);
         let plan = scanner.explain_plan(false).await.unwrap();
         (plan, scanner.try_into_batch().await.unwrap())
     }
@@ -322,8 +385,8 @@ mod tests {
         configure: impl Fn(&mut Scanner),
         expect: Expect<'_>,
     ) -> RecordBatch {
-        let (plan, rows) = scan(dataset, &configure, true).await;
-        let (sorted_plan, sorted_rows) = scan(dataset, &configure, false).await;
+        let (plan, rows) = scan(dataset, &configure, OrderedIndexMode::Auto).await;
+        let (sorted_plan, sorted_rows) = scan(dataset, &configure, OrderedIndexMode::Off).await;
         assert!(!sorted_plan.contains("OrderedIndexScan"), "{sorted_plan}");
         match expect {
             Expect::OrderedScan(node) => {
@@ -333,6 +396,27 @@ mod tests {
         }
         assert_eq!(rows, sorted_rows);
         rows
+    }
+
+    #[rstest]
+    #[case::off("off", OrderedIndexMode::Off)]
+    #[case::auto("auto", OrderedIndexMode::Auto)]
+    #[case::upper_case("AUTO", OrderedIndexMode::Auto)]
+    #[case::mixed_case("Off", OrderedIndexMode::Off)]
+    fn test_ordered_index_mode_parses_names(#[case] name: &str, #[case] mode: OrderedIndexMode) {
+        assert_eq!(name.parse::<OrderedIndexMode>().unwrap(), mode);
+        assert_eq!(mode.to_string().parse::<OrderedIndexMode>().unwrap(), mode);
+    }
+
+    #[rstest]
+    #[case::unknown("sorted")]
+    #[case::empty("")]
+    #[case::padded(" auto")]
+    fn test_ordered_index_mode_rejects_unknown_names(#[case] name: &str) {
+        let error = name.parse::<OrderedIndexMode>().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let expected = format!("unknown ordered_index mode '{name}', expected one of: off, auto");
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     fn order_by_ts(scanner: &mut Scanner) -> &mut Scanner {
@@ -483,6 +567,34 @@ mod tests {
             decline(order_by_ts(scanner));
         };
         assert_ordered_read(&dataset, configure, Expect::Sort).await;
+    }
+
+    #[rstest]
+    #[case::order_column_index(INDEX, Expect::Sort)]
+    #[case::unrelated_index(
+        "id_idx",
+        Expect::OrderedScan("OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10")
+    )]
+    #[tokio::test]
+    async fn test_ordered_read_skips_ignored_indices(
+        #[case] ignored: &str,
+        #[case] expect: Expect<'static>,
+    ) {
+        let mut dataset = dataset(WriteParams::default()).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner).with_ignored_scalar_indices([ignored]);
+        };
+        assert_ordered_read(&dataset, configure, expect).await;
     }
 
     async fn overlay_key(dataset: Dataset, old_key: i32, new_key: i32) -> Dataset {
