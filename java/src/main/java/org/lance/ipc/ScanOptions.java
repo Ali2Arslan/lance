@@ -1018,7 +1018,7 @@ public class ScanOptions {
     }
 
     /**
-     * Ignore named scalar indices from expression-filter planning.
+     * Ignore named scalar indices from expression-filter planning and ordered reads.
      *
      * <p>Other scalar indices remain eligible, and the original filter is still evaluated for rows
      * selected by the remaining scan plan. Names that do not identify an available scalar index
@@ -1026,6 +1026,9 @@ public class ScanOptions {
      * Inverted index names are also honored for expression filters such as {@code contains_tokens},
      * which fall back to evaluating the function without that index. This does not control vector
      * index segments or explicit full-text search queries.
+     *
+     * <p>An ignored index never serves an ordered read for {@link #setColumnOrderings(List)}. See
+     * {@link #orderedIndex(OrderedIndexMode)}.
      *
      * <p>With {@link #fastSearch(boolean)}, only a filter plan that still uses an index skips
      * unindexed fragments. If ignoring indices removes every index query, the scan falls back to
@@ -1053,8 +1056,9 @@ public class ScanOptions {
      * <p>With {@link OrderedIndexMode#AUTO}, the default, a scan with a limit that orders by one
      * column with a B-tree index reads that index in key order and stops after {@code offset +
      * limit} live rows, instead of sorting every row. This applies when the scan has no filter or a
-     * filter that the same index answers exactly. {@link OrderedIndexMode#OFF} always sorts. Other
-     * uses of scalar indices are not affected.
+     * filter that the same index answers exactly. An index named in {@link
+     * #ignoredScalarIndices(List)} never serves the read. {@link OrderedIndexMode#OFF} always
+     * sorts. Other uses of scalar indices are not affected.
      *
      * @param orderedIndex the ordered index mode. Default is {@link OrderedIndexMode#AUTO}.
      * @return Builder instance for method chaining.

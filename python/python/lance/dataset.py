@@ -699,7 +699,8 @@ class LanceDataset(pa.dataset.Dataset):
             corner cases this can make query performance worse and this parameter can
             be used to disable scalar indices in these cases.
         ignored_scalar_indices: iterable of str, default None
-            Logical scalar index names to ignore during expression-filter planning.
+            Logical scalar index names to ignore during expression-filter planning
+            and ordered reads.
             Other scalar indices remain eligible, and the original filter is still
             evaluated. Inverted indices used by ``contains_tokens`` filters are
             included; vector index segments and explicit full-text search queries
@@ -709,7 +710,8 @@ class LanceDataset(pa.dataset.Dataset):
         ordered_index: str, default None
             Whether a scan with ``order_by`` and a limit may read a B-tree index in
             key order instead of sorting.  ``"auto"``, the default, reads the index
-            when it can serve the ordering, and ``"off"`` always sorts.  See
+            when it can serve the ordering, and ``"off"`` always sorts.  An index
+            named in ``ignored_scalar_indices`` never serves the read.  See
             ``ScannerBuilder.ordered_index`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
@@ -1062,8 +1064,9 @@ class LanceDataset(pa.dataset.Dataset):
             Allows custom control over scalar index usage.  See
             ``ScannerBuilder.use_scalar_index`` for more information.
         ignored_scalar_indices: iterable of str, default None
-            Scalar index names to ignore during expression-filter planning. See
-            ``ScannerBuilder.ignored_scalar_indices`` for more information.
+            Scalar index names to ignore during expression-filter planning and
+            ordered reads. See ``ScannerBuilder.ignored_scalar_indices`` for more
+            information.
         ordered_index: str, default None
             ``"auto"`` or ``"off"``.  See ``ScannerBuilder.ordered_index`` for more
             information.

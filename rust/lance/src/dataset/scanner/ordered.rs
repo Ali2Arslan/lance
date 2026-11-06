@@ -85,8 +85,10 @@ impl Scanner {
     /// orders by one column with a B-tree index reads that index in key order
     /// and stops after `offset + limit` live rows, instead of sorting every
     /// row. This applies when the scan has no filter or a filter that the same
-    /// index answers exactly. [`OrderedIndexMode::Off`] always sorts. Other
-    /// uses of scalar indices are not affected.
+    /// index answers exactly. An index named in
+    /// [`Self::with_ignored_scalar_indices`] never serves the read.
+    /// [`OrderedIndexMode::Off`] always sorts. Other uses of scalar indices are
+    /// not affected.
     ///
     /// ```
     /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};
@@ -198,6 +200,7 @@ impl Scanner {
         for index in indices.iter() {
             if index.fields != [field_id]
                 || index_name.is_some_and(|name| name != index.name)
+                || self.ignored_scalar_index_names.contains(&index.name)
                 || !checked.insert(index.name.as_str())
             {
                 continue;
@@ -560,6 +563,34 @@ mod tests {
             decline(order_by_ts(scanner));
         };
         assert_ordered_read(&dataset, configure, Expect::Sort).await;
+    }
+
+    #[rstest]
+    #[case::order_column_index(INDEX, Expect::Sort)]
+    #[case::unrelated_index(
+        "id_idx",
+        Expect::OrderedScan("OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10")
+    )]
+    #[tokio::test]
+    async fn test_ordered_read_skips_ignored_indices(
+        #[case] ignored: &str,
+        #[case] expect: Expect<'static>,
+    ) {
+        let mut dataset = dataset(WriteParams::default()).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner).with_ignored_scalar_indices([ignored]);
+        };
+        assert_ordered_read(&dataset, configure, expect).await;
     }
 
     async fn overlay_key(dataset: Dataset, old_key: i32, new_key: i32) -> Dataset {

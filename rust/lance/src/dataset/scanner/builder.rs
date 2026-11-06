@@ -704,12 +704,16 @@ impl Scanner {
         self
     }
 
-    /// Ignore named scalar indices from expression-filter planning.
+    /// Ignore named scalar indices from expression-filter planning and ordered
+    /// reads.
     ///
     /// Other scalar indices remain eligible, and the original filter is still
     /// evaluated for rows selected by the remaining scan plan. Names that do
     /// not identify an available scalar index have no effect. This option is
     /// ignored when scalar indices are disabled with [`Self::use_scalar_index`].
+    ///
+    /// An ignored index never serves an ordered read for [`Self::order_by`].
+    /// See [`Self::ordered_index`].
     ///
     /// Inverted index names are also honored for expression filters such as
     /// `contains_tokens`, which fall back to evaluating the function without that

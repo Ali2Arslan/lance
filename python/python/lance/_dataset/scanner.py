@@ -934,12 +934,16 @@ class ScannerBuilder:
         return self
 
     def ignored_scalar_indices(self, index_names: Iterable[str]) -> ScannerBuilder:
-        """Ignore named scalar indices from expression-filter planning.
+        """Ignore named scalar indices from expression-filter planning and ordered
+        reads.
 
         Other scalar indices remain eligible, and the original filter is still
         evaluated. Names that do not identify an available scalar index have no
         effect. This option is ignored when scalar indices are disabled with
         :meth:`use_scalar_index`.
+
+        An ignored index never serves an ordered read for :meth:`order_by`. See
+        :meth:`ordered_index`.
 
         Inverted index names are also honored for expression filters such as
         ``contains_tokens``, which fall back to evaluating the function without
@@ -966,7 +970,8 @@ class ScannerBuilder:
         with a B-tree index reads that index in key order and stops after
         ``offset + limit`` live rows, instead of sorting every row.  This applies
         when the scan has no filter or a filter that the same index answers
-        exactly.  ``"off"`` always sorts.  Names are case-insensitive, and the
+        exactly.  An index named in :meth:`ignored_scalar_indices` never serves
+        the read.  ``"off"`` always sorts.  Names are case-insensitive, and the
         scanner rejects any other name with a ``ValueError``.  Other uses of
         scalar indices are not affected.
         """
