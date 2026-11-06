@@ -688,7 +688,6 @@ class ScannerBuilder:
         self._use_scalar_index = None
         self._ignored_scalar_indices = None
         self._ordered_index = None
-        self._require_ordered_index = None
         self._include_deleted_rows = None
         self._scan_stats_callback: Optional[Callable[[ScanStatistics], None]] = None
         self._strict_batch_size = False
@@ -972,27 +971,15 @@ class ScannerBuilder:
         ``offset + limit`` live rows, instead of sorting every row.  This applies
         when the scan has no filter or a filter that the same index answers
         exactly.  An index named in :meth:`ignored_scalar_indices` never serves
-        the read.  ``"off"`` always sorts.  Names are case-insensitive, and the
-        scanner rejects any other name with a ``ValueError``.  Other uses of
-        scalar indices are not affected.
+        the read.  ``"off"`` always sorts.  ``"required"`` plans as ``"auto"``
+        does, but when the scan cannot serve ``order_by`` from an index, it raises
+        ``ValueError`` instead of sorting.  The message says why, for example that
+        the scan has no limit, and ``explain_plan(verbose=True)`` prints the same
+        reason under any mode.  A scan without ``order_by`` is not affected.
+        Names are case-insensitive, and the scanner rejects any other name with a
+        ``ValueError``.  Other uses of scalar indices are not affected.
         """
         self._ordered_index = mode
-        return self
-
-    def require_ordered_index(
-        self, require_ordered_index: bool = True
-    ) -> ScannerBuilder:
-        """
-        Set whether a scan with ``order_by`` must read an index in key order
-
-        When True and the scan cannot serve ``order_by`` from an index, as
-        :meth:`ordered_index` describes, the scan raises ``ValueError`` instead of
-        sorting.  The message says why, for example that the scan has no limit.
-        ``explain_plan(verbose=True)`` prints the same reason without this option.
-        With ``ordered_index("off")``, the scan raises ``ValueError`` even without
-        ``order_by``.  Otherwise a scan without ``order_by`` is not affected.
-        """
-        self._require_ordered_index = require_ordered_index
         return self
 
     def with_fragments(
@@ -1328,7 +1315,6 @@ class ScannerBuilder:
             self._row_addr_blocklist,
             self._minhash_query,
             self._ordered_index,
-            self._require_ordered_index,
         )
         return LanceScanner(scanner, self.ds, _snapshot_scanner_builder(self))
 

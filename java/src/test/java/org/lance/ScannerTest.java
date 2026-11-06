@@ -1378,8 +1378,8 @@ public class ScannerTest {
   }
 
   @Test
-  void testRequireOrderedIndex(@TempDir Path tempDir) throws Exception {
-    String datasetPath = tempDir.resolve("dataset_scanner_require_ordered_index").toString();
+  void testOrderedIndexRequired(@TempDir Path tempDir) throws Exception {
+    String datasetPath = tempDir.resolve("dataset_scanner_ordered_index_required").toString();
     try (BufferAllocator allocator = new RootAllocator()) {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
@@ -1402,16 +1402,12 @@ public class ScannerTest {
             new ScanOptions.Builder()
                 .columns(Collections.singletonList("id"))
                 .setColumnOrderings(Collections.singletonList(ordering.build()))
-                .requireOrderedIndex(true);
+                .orderedIndex(ScanOptions.OrderedIndexMode.REQUIRED);
         assertScanFails(
             dataset,
             required.build(),
             "OrderedIndexScan declined: the scan has no limit, so an ordered index read of "
                 + "column 'id' could not stop early");
-        assertScanFails(
-            dataset,
-            required.limit(10).orderedIndex(ScanOptions.OrderedIndexMode.OFF).build(),
-            "require_ordered_index=true and ordered_index=off are mutually exclusive");
       }
     }
   }

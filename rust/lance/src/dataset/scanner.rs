@@ -587,8 +587,6 @@ pub struct Scanner {
 
     ordered_index: OrderedIndexMode,
 
-    require_ordered_index: bool,
-
     /// Whether to use statistics to optimize the scan (default: true)
     ///
     /// This is used for debugging or benchmarking purposes.

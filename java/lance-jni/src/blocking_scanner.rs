@@ -308,7 +308,6 @@ pub(crate) struct ScannerOptions<'a> {
     pub use_scalar_index: jboolean,
     pub ignored_scalar_indices_obj: JObject<'a>,
     pub ordered_index: JString<'a>,
-    pub require_ordered_index: jboolean,
     pub fast_search: jboolean,
     pub substrait_aggregate_obj: JObject<'a>,
     pub include_deleted_rows: jboolean,
@@ -455,7 +454,6 @@ pub(crate) fn build_scanner_with_options<'a>(
         scanner.with_ignored_scalar_indices(ignored_scalar_indices);
     }
     scanner.ordered_index(get_ordered_index_mode(env, &options.ordered_index)?);
-    scanner.require_ordered_index(options.require_ordered_index == JNI_TRUE);
 
     env.get_optional(&options.query_obj, |env, java_obj| {
         // Set column and key for nearest search
@@ -689,7 +687,6 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
     use_scalar_index: jboolean,           // boolean
     ignored_scalar_indices_obj: JObject<'local>, // Optional<List<String>>
     ordered_index: JString<'local>,       // String
-    require_ordered_index: jboolean,      // boolean
     fast_search: jboolean,                // boolean
     substrait_aggregate_obj: JObject<'local>, // Optional<ByteBuffer>
     collect_stats: jboolean,              // boolean
@@ -726,7 +723,6 @@ pub extern "system" fn Java_org_lance_ipc_LanceScanner_createScanner<'local>(
             use_scalar_index,
             ignored_scalar_indices_obj,
             ordered_index,
-            require_ordered_index,
             fast_search,
             substrait_aggregate_obj,
             collect_stats,
@@ -765,7 +761,6 @@ fn inner_create_scanner<'local>(
     use_scalar_index: jboolean,
     ignored_scalar_indices_obj: JObject<'local>,
     ordered_index: JString<'local>,
-    require_ordered_index: jboolean,
     fast_search: jboolean,
     substrait_aggregate_obj: JObject<'local>,
     collect_stats: jboolean,
@@ -803,7 +798,6 @@ fn inner_create_scanner<'local>(
         use_scalar_index,
         ignored_scalar_indices_obj,
         ordered_index,
-        require_ordered_index,
         fast_search,
         substrait_aggregate_obj,
         include_deleted_rows,

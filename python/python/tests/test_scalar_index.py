@@ -7268,7 +7268,9 @@ def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
 
 def test_ordered_index_rejects_unknown_mode(tmp_path):
     dataset = lance.write_dataset(pa.table({"ts": pa.array([2, 1])}), tmp_path)
-    expected = "unknown ordered_index mode 'sorted', expected one of: off, auto"
+    expected = (
+        "unknown ordered_index mode 'sorted', expected one of: off, auto, required"
+    )
     with pytest.raises(ValueError, match=expected):
         dataset.scanner(order_by=["ts"], limit=1, ordered_index="sorted")
 
@@ -7281,31 +7283,20 @@ def ts_index_dataset(tmp_path):
     return dataset
 
 
-def test_require_ordered_index_without_limit(ts_index_dataset):
+def test_ordered_index_required_without_limit(ts_index_dataset):
     reason = (
         "OrderedIndexScan declined: the scan has no limit, so an ordered index read "
         "of column 'ts' could not stop early"
     )
     with pytest.raises(ValueError, match=re.escape(reason)):
-        ts_index_dataset.to_table(order_by=["ts"], require_ordered_index=True)
+        ts_index_dataset.to_table(order_by=["ts"], ordered_index="required")
     plan = ts_index_dataset.scanner(order_by=["ts"]).explain_plan(verbose=True)
     assert plan.endswith(reason + "\n") and "SortExec" in plan, plan
 
 
-def test_require_ordered_index_with_ordered_index_off(ts_index_dataset):
-    error = "require_ordered_index=true and ordered_index=off are mutually exclusive"
-    with pytest.raises(ValueError, match=re.escape(error)):
-        ts_index_dataset.to_table(
-            order_by=["ts"],
-            limit=10,
-            require_ordered_index=True,
-            ordered_index="off",
-        )
-
-
-def test_require_ordered_index_reads_the_index(ts_index_dataset):
+def test_ordered_index_required_reads_the_index(ts_index_dataset):
     scanner = ts_index_dataset.scanner(
-        order_by=["ts"], limit=10, require_ordered_index=True
+        order_by=["ts"], limit=10, ordered_index="required"
     )
     plan = scanner.explain_plan(verbose=True)
     assert "OrderedIndexScan: index=ts_idx" in plan and "declined" not in plan, plan

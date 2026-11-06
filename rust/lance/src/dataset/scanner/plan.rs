@@ -535,12 +535,6 @@ impl Scanner {
             }
         }
 
-        if self.require_ordered_index && self.ordered_index == OrderedIndexMode::Off {
-            return Err(Error::invalid_input(
-                "require_ordered_index=true and ordered_index=off are mutually exclusive",
-            ));
-        }
-
         Ok(())
     }
 
@@ -853,7 +847,7 @@ impl Scanner {
         let (ordered_read, ordered_index_decline) = match self.ordering.as_deref() {
             Some(ordering) => match self.try_ordered_read(ordering, &mut filter_plan).await {
                 Ok(ordered_read) => (Some(ordered_read), None),
-                Err(decline) if self.require_ordered_index => {
+                Err(decline) if self.ordered_index == OrderedIndexMode::Required => {
                     return Err(Error::invalid_input_source(decline.into()));
                 }
                 Err(decline) => (None, Some(decline)),

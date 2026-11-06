@@ -89,7 +89,6 @@ impl Scanner {
             use_scalar_index: true,
             ignored_scalar_index_names: HashSet::new(),
             ordered_index: OrderedIndexMode::default(),
-            require_ordered_index: false,
             include_deleted_rows: false,
             scan_stats_callback: None,
             strict_batch_size: false,

@@ -30,7 +30,12 @@ public class ScanOptions {
     /** Always sort. */
     OFF("off"),
     /** Read the index in key order when it can serve the orderings, and sort otherwise. */
-    AUTO("auto");
+    AUTO("auto"),
+    /**
+     * Read the index in key order as {@link #AUTO} does, and throw {@link IllegalArgumentException}
+     * when the scan cannot.
+     */
+    REQUIRED("required");
 
     private final String rustValue;
 
@@ -68,7 +73,6 @@ public class ScanOptions {
   private final boolean useScalarIndex;
   private final Optional<List<String>> ignoredScalarIndices;
   private final OrderedIndexMode orderedIndex;
-  private final boolean requireOrderedIndex;
   private final Optional<ByteBuffer> substraitAggregate;
   private final boolean collectStats;
   private final boolean fastSearch;
@@ -270,7 +274,6 @@ public class ScanOptions {
         useScalarIndex,
         Optional.empty(),
         OrderedIndexMode.AUTO,
-        false,
         substraitAggregate,
         collectStats,
         fastSearch,
@@ -304,7 +307,6 @@ public class ScanOptions {
       boolean useScalarIndex,
       Optional<List<String>> ignoredScalarIndices,
       OrderedIndexMode orderedIndex,
-      boolean requireOrderedIndex,
       Optional<ByteBuffer> substraitAggregate,
       boolean collectStats,
       boolean fastSearch,
@@ -364,7 +366,6 @@ public class ScanOptions {
     this.ignoredScalarIndices =
         ignoredScalarIndices.map(names -> Collections.unmodifiableList(new ArrayList<>(names)));
     this.orderedIndex = orderedIndex;
-    this.requireOrderedIndex = requireOrderedIndex;
     this.substraitAggregate = substraitAggregate;
     this.collectStats = collectStats;
     this.fastSearch = fastSearch;
@@ -588,15 +589,6 @@ public class ScanOptions {
   }
 
   /**
-   * Get whether a scan with column orderings must read an index in key order.
-   *
-   * @return true if the scan must read an index in key order, false otherwise.
-   */
-  public boolean isRequireOrderedIndex() {
-    return requireOrderedIndex;
-  }
-
-  /**
    * Get whether to only search indexed fragments.
    *
    * @return true if unindexed fragments should be skipped, false otherwise.
@@ -674,7 +666,6 @@ public class ScanOptions {
         .add("useScalarIndex", useScalarIndex)
         .add("ignoredScalarIndices", ignoredScalarIndices.orElse(null))
         .add("orderedIndex", orderedIndex)
-        .add("requireOrderedIndex", requireOrderedIndex)
         .add("fastSearch", fastSearch)
         .add(
             "substraitAggregate",
@@ -712,7 +703,6 @@ public class ScanOptions {
     private boolean useScalarIndex = true;
     private Optional<List<String>> ignoredScalarIndices = Optional.empty();
     private OrderedIndexMode orderedIndex = OrderedIndexMode.AUTO;
-    private boolean requireOrderedIndex = false;
     private boolean fastSearch = false;
     private Optional<ByteBuffer> substraitAggregate = Optional.empty();
     private boolean collectStats = false;
@@ -752,7 +742,6 @@ public class ScanOptions {
       this.useScalarIndex = options.isUseScalarIndex();
       this.ignoredScalarIndices = options.getIgnoredScalarIndices();
       this.orderedIndex = options.getOrderedIndex();
-      this.requireOrderedIndex = options.isRequireOrderedIndex();
       this.fastSearch = options.isFastSearch();
       this.substraitAggregate = options.getSubstraitAggregate();
       this.collectStats = options.isCollectStats();
@@ -1074,31 +1063,16 @@ public class ScanOptions {
      * limit} live rows, instead of sorting every row. This applies when the scan has no filter or a
      * filter that the same index answers exactly. An index named in {@link
      * #ignoredScalarIndices(List)} never serves the read. {@link OrderedIndexMode#OFF} always
-     * sorts. Other uses of scalar indices are not affected.
+     * sorts. {@link OrderedIndexMode#REQUIRED} plans as {@code AUTO} does, but when the scan cannot
+     * serve the column orderings from an index, it throws {@link IllegalArgumentException} instead
+     * of sorting. The message says why, for example that the scan has no limit. A scan without
+     * column orderings is not affected. Other uses of scalar indices are not affected.
      *
      * @param orderedIndex the ordered index mode. Default is {@link OrderedIndexMode#AUTO}.
      * @return Builder instance for method chaining.
      */
     public Builder orderedIndex(OrderedIndexMode orderedIndex) {
       this.orderedIndex = Preconditions.checkNotNull(orderedIndex, "orderedIndex cannot be null");
-      return this;
-    }
-
-    /**
-     * Set whether a scan with column orderings must read an index in key order.
-     *
-     * <p>When true and the scan cannot serve the column orderings from an index, as {@link
-     * #orderedIndex(OrderedIndexMode)} describes, the scan throws {@link IllegalArgumentException}
-     * instead of sorting. The message says why, for example that the scan has no limit. With {@link
-     * OrderedIndexMode#OFF}, the scan throws {@link IllegalArgumentException} even without column
-     * orderings. Otherwise a scan without column orderings is not affected.
-     *
-     * @param requireOrderedIndex true to fail instead of sorting, false otherwise. Default is
-     *     false.
-     * @return Builder instance for method chaining.
-     */
-    public Builder requireOrderedIndex(boolean requireOrderedIndex) {
-      this.requireOrderedIndex = requireOrderedIndex;
       return this;
     }
 
@@ -1210,7 +1184,6 @@ public class ScanOptions {
           useScalarIndex,
           ignoredScalarIndices,
           orderedIndex,
-          requireOrderedIndex,
           substraitAggregate,
           collectStats,
           fastSearch,
