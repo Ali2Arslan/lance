@@ -4,6 +4,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_schema::SortOptions;
@@ -12,7 +13,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::registry::IndexOrderingCapability;
-use lance_table::format::Fragment;
+use lance_table::format::{Fragment, IndexMetadata};
 use roaring::RoaringBitmap;
 
 use super::{ColumnOrdering, ExprFilterPlan, FilterPlan, Scanner, TakeOperation};
@@ -65,7 +66,7 @@ fn residual_budget(live_rows: impl IntoIterator<Item = usize>, fetch: usize) -> 
 /// Why a scan that orders by a column sorts its rows instead of reading an
 /// index on that column in key order.
 ///
-/// With [`Scanner::require_ordered_index`] set, planning fails with an
+/// With [`OrderedIndexMode::Required`], planning fails with an
 /// [`Error::InvalidInput`] whose source is this value.
 /// [`Scanner::explain_plan`] with `verbose` prints it after the plan.
 #[derive(Debug)]
@@ -73,8 +74,8 @@ fn residual_budget(live_rows: impl IntoIterator<Item = usize>, fetch: usize) -> 
 pub enum OrderedIndexDecline {
     /// The scan orders by more than one column.
     MultipleOrderKeys { columns: Vec<String> },
-    /// The scan option named by `option`, `use_ordered_index` or
-    /// `use_scalar_index`, is `false`.
+    /// The scan setting in `option`, `ordered_index=off` or
+    /// `use_scalar_index=false`, turns off ordered index reads.
     Disabled {
         column: String,
         option: &'static str,
@@ -89,6 +90,12 @@ pub enum OrderedIndexDecline {
     /// No index on the column can be read in key order. When the filter is an
     /// exact search of one index on the column, only that index counts.
     NoIndex { column: String },
+    /// Every index on the column that could serve the read is named in
+    /// [`Scanner::with_ignored_scalar_indices`]. `indices` lists them.
+    IgnoredIndices {
+        column: String,
+        indices: Vec<String>,
+    },
     /// The scan has no limit.
     NoLimit { column: String },
     /// The dataset or the scan has a property, described by `reason`, that
@@ -100,9 +107,9 @@ pub enum OrderedIndexDecline {
     /// The filter's index query `search` is not an exact search of an index
     /// on the column, so the ordered read cannot use it. The sort reads only
     /// the rows that query selects, which can cost far less than reading the
-    /// column in key order. With [`Scanner::require_ordered_index`] and
-    /// without [`Scanner::fast_search`], the ordered read applies the whole
-    /// filter to the rows it reads instead.
+    /// column in key order. With [`OrderedIndexMode::Required`] and without
+    /// [`Scanner::fast_search`], the ordered read applies the whole filter to
+    /// the rows it reads instead.
     IndexSearch { column: String, search: String },
     /// The index covers `indexed_fragments` of the dataset's `fragments`
     /// fragments. `indexed_fragments` is `None` when a segment of the index
@@ -150,7 +157,7 @@ impl fmt::Display for OrderedIndexDecline {
             ),
             Self::Disabled { column, option } => write!(
                 f,
-                "{option}=false turns off ordered index reads for column '{column}'"
+                "{option} turns off ordered index reads for column '{column}'"
             ),
             Self::NotPlainColumn { column } => {
                 write!(f, "order column '{column}' is not a top-level field")
@@ -163,6 +170,11 @@ impl fmt::Display for OrderedIndexDecline {
             Self::NoIndex { column } => write!(
                 f,
                 "column '{column}' has no ordered index that this scan can read"
+            ),
+            Self::IgnoredIndices { column, indices } => write!(
+                f,
+                "every ordered index on column '{column}' is ignored by the scan: '{}'",
+                indices.join("', '")
             ),
             Self::NoLimit { column } => write!(
                 f,
@@ -222,65 +234,107 @@ impl fmt::Display for OrderedIndexDecline {
 
 impl std::error::Error for OrderedIndexDecline {}
 
+/// Whether a scan may read a B-tree index in key order to serve `order_by`.
+///
+/// Parse a mode from its name with [`str::parse`], ignoring ASCII case.
+///
+/// ```
+/// # use lance::dataset::scanner::OrderedIndexMode;
+/// # use lance::Result;
+/// # fn test() -> Result<()> {
+/// assert_eq!("off".parse::<OrderedIndexMode>()?, OrderedIndexMode::Off);
+/// assert_eq!(OrderedIndexMode::default(), OrderedIndexMode::Auto);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum OrderedIndexMode {
+    /// Always sort.
+    Off,
+    /// Read the index in key order when it can serve the ordering, and sort
+    /// otherwise.
+    #[default]
+    Auto,
+    /// Read the index in key order as [`Self::Auto`] does, and fail planning
+    /// with [`Error::InvalidInput`] when the scan cannot.
+    Required,
+}
+
+impl OrderedIndexMode {
+    const ALL: [Self; 3] = [Self::Off, Self::Auto, Self::Required];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Auto => "auto",
+            Self::Required => "required",
+        }
+    }
+}
+
+impl fmt::Display for OrderedIndexMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl FromStr for OrderedIndexMode {
+    type Err = Error;
+
+    fn from_str(name: &str) -> Result<Self, Error> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                let accepted = Self::ALL.map(Self::name).join(", ");
+                Error::invalid_input(format!(
+                    "unknown ordered_index mode '{name}', expected one of: {accepted}"
+                ))
+            })
+    }
+}
+
 impl Scanner {
     /// Set whether to read a B-tree index in key order to serve `order_by`.
     ///
-    /// By default, a scan with a limit that orders by one column with a
-    /// B-tree index reads that index in key order and stops after
-    /// `offset + limit` live rows, instead of sorting every row. This applies
-    /// when the scan has no filter, or a filter that searches no index except
-    /// with one exact search of the same index. The read applies the rest of
-    /// the filter to each row it reads, and sorts instead when that keeps too
-    /// few rows within a share of the index. Set this to `false` to always
-    /// sort. Other uses of scalar indices are not affected.
+    /// With [`OrderedIndexMode::Auto`], the default, a scan with a limit that
+    /// orders by one column with a B-tree index reads that index in key order
+    /// and stops after `offset + limit` live rows, instead of sorting every
+    /// row. This applies when the scan has no filter, or a filter that
+    /// searches no index except with one exact search of the same index. The
+    /// read applies the rest of the filter to each row it reads, and sorts
+    /// instead when that keeps too few rows within a share of the index. An
+    /// index named in [`Self::with_ignored_scalar_indices`] never serves the
+    /// read or answers its filter. [`OrderedIndexMode::Off`] always sorts.
+    ///
+    /// [`OrderedIndexMode::Required`] never sorts instead. When the scan
+    /// cannot serve `order_by` from an index, planning fails with
+    /// [`Error::InvalidInput`]. The error's source is the
+    /// [`OrderedIndexDecline`] that says why, and [`Self::explain_plan`] with
+    /// `verbose` prints the same reason under any mode. A required read
+    /// applies the part of the filter the index does not answer, including a
+    /// search of another index, to each row it reads, so a selective filter
+    /// can make it read the whole index. With [`Self::fast_search`], planning
+    /// fails instead when the read would apply an index search this way,
+    /// because `fast_search` skips the fragments that search's index does not
+    /// cover. A scan without `order_by` is not affected. Other uses of scalar
+    /// indices are not affected.
     ///
     /// ```
-    /// # use lance::dataset::scanner::ColumnOrdering;
+    /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};
     /// # use lance::{Dataset, Result};
     /// # async fn test(dataset: &Dataset) -> Result<()> {
     /// let mut scan = dataset.scan();
     /// scan.order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".to_string())]))?
     ///     .limit(Some(10), None)?
-    ///     .use_ordered_index(false);
+    ///     .ordered_index(OrderedIndexMode::Required);
     /// let newest_ten = scan.try_into_batch().await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn use_ordered_index(&mut self, use_ordered_index: bool) -> &mut Self {
-        self.use_ordered_index = use_ordered_index;
-        self
-    }
-
-    /// Set whether a scan that orders by a column must read an index in key
-    /// order.
-    ///
-    /// When this is `true` and the scan cannot serve `order_by` from an index,
-    /// as [`Self::use_ordered_index`] describes, planning fails with
-    /// [`Error::InvalidInput`] instead of sorting. The error's source is the
-    /// [`OrderedIndexDecline`] that says why. A required read applies the part
-    /// of the filter the index does not answer, including a search of another
-    /// index, to each row it reads and never sorts instead, so a selective
-    /// filter can make it read the whole index. With [`Self::fast_search`],
-    /// planning fails instead when the read would apply an index search this
-    /// way, because `fast_search` skips the fragments that search's index does
-    /// not cover. With `use_ordered_index(false)`, planning fails with
-    /// [`Error::InvalidInput`] even without `order_by`.
-    /// Otherwise a scan without `order_by` is not affected.
-    ///
-    /// ```
-    /// # use lance::dataset::scanner::ColumnOrdering;
-    /// # use lance::{Dataset, Result};
-    /// # async fn test(dataset: &Dataset) -> Result<()> {
-    /// let mut scan = dataset.scan();
-    /// scan.order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".to_string())]))?
-    ///     .limit(Some(10), None)?
-    ///     .require_ordered_index(true);
-    /// let newest_ten = scan.try_into_batch().await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn require_ordered_index(&mut self, require_ordered_index: bool) -> &mut Self {
-        self.require_ordered_index = require_ordered_index;
+    pub fn ordered_index(&mut self, mode: OrderedIndexMode) -> &mut Self {
+        self.ordered_index = mode;
         self
     }
 
@@ -298,10 +352,10 @@ impl Scanner {
             });
         };
         let column = &ordering.column_name;
-        let disabled_by = if !self.use_ordered_index {
-            Some("use_ordered_index")
+        let disabled_by = if self.ordered_index == OrderedIndexMode::Off {
+            Some("ordered_index=off")
         } else if !self.use_scalar_index {
-            Some("use_scalar_index")
+            Some("use_scalar_index=false")
         } else {
             None
         };
@@ -354,7 +408,7 @@ impl Scanner {
         }
         let allow_in_residual = |index_query: &ScalarIndexExpr| {
             let search = index_query.to_string();
-            if !self.require_ordered_index {
+            if self.ordered_index != OrderedIndexMode::Required {
                 Err(OrderedIndexDecline::IndexSearch {
                     column: column.clone(),
                     search,
@@ -409,7 +463,7 @@ impl Scanner {
         let residual_read = residual.as_ref().map(|_| ResidualRead {
             fetch,
             limit: fetch - self.offset.unwrap_or(0) as usize,
-            budget: (!self.require_ordered_index).then(|| {
+            budget: (self.ordered_index != OrderedIndexMode::Required).then(|| {
                 let live_rows = self
                     .dataset
                     .fragments()
@@ -431,6 +485,7 @@ impl Scanner {
             column: column.clone(),
         };
         let mut checked = HashSet::new();
+        let mut ignored = Vec::new();
         for index in indices.iter() {
             if index.fields != [field.id]
                 || index_name.as_ref().is_some_and(|name| *name != index.name)
@@ -438,19 +493,16 @@ impl Scanner {
             {
                 continue;
             }
+            if self.ignored_scalar_index_names.contains(&index.name) {
+                ignored.push(index);
+                continue;
+            }
             let unreadable =
                 |source| OrderedIndexDecline::unreadable(column, Some(&index.name), source);
-            let details = IndexDetails(
-                fetch_index_details(&self.dataset, column, index)
-                    .await
-                    .map_err(unreadable)?,
-            );
-            if details.is_vector()
-                || details
-                    .get_plugin()
-                    .map_err(unreadable)?
-                    .ordering_capability(&details.0)
-                    != IndexOrderingCapability::Bidirectional
+            if !self
+                .is_ordered_index(column, index)
+                .await
+                .map_err(unreadable)?
             {
                 continue;
             }
@@ -503,6 +555,22 @@ impl Scanner {
                 residual: residual_read,
             });
         }
+        if matches!(decline, OrderedIndexDecline::NoIndex { .. }) {
+            let mut ignored_indices = Vec::new();
+            for index in ignored {
+                // The scan never reads an ignored index, so an error loading one
+                // only leaves it out of the reason.
+                if self.is_ordered_index(column, index).await.unwrap_or(false) {
+                    ignored_indices.push(index.name.clone());
+                }
+            }
+            if !ignored_indices.is_empty() {
+                return Err(OrderedIndexDecline::IgnoredIndices {
+                    column: column.clone(),
+                    indices: ignored_indices,
+                });
+            }
+        }
         Err(decline)
     }
 
@@ -516,7 +584,7 @@ impl Scanner {
             return Ok(ordered);
         }
         let mut sorted = self.clone();
-        sorted.use_ordered_index(false);
+        sorted.ordered_index(OrderedIndexMode::Off);
         let sorted = match session {
             Some(session) => sorted.create_plan_with_session(session).await?,
             None => sorted.create_plan().await?,
@@ -526,6 +594,13 @@ impl Scanner {
             sorted,
             residual.limit,
         )?))
+    }
+
+    async fn is_ordered_index(&self, column: &str, index: &IndexMetadata) -> crate::Result<bool> {
+        let details = IndexDetails(fetch_index_details(&self.dataset, column, index).await?);
+        Ok(!details.is_vector()
+            && details.get_plugin()?.ordering_capability(&details.0)
+                == IndexOrderingCapability::Bidirectional)
     }
 
     /// Returns `offset + limit` when the dataset and the scan's options let an
@@ -643,6 +718,7 @@ mod tests {
     use rstest::rstest;
 
     use super::super::{ColumnOrdering, RowAddrMask, RowAddrTreeMap, Scanner};
+    use super::OrderedIndexMode;
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{NewColumnTransform, UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
@@ -745,11 +821,11 @@ mod tests {
     async fn scan(
         dataset: &Dataset,
         configure: &impl Fn(&mut Scanner),
-        use_ordered_index: bool,
+        mode: OrderedIndexMode,
     ) -> (String, RecordBatch) {
         let mut scanner = dataset.scan();
         configure(&mut scanner);
-        scanner.use_ordered_index(use_ordered_index);
+        scanner.ordered_index(mode);
         let plan = scanner.explain_plan(false).await.unwrap();
         (plan, scanner.try_into_batch().await.unwrap())
     }
@@ -765,14 +841,14 @@ mod tests {
         configure: impl Fn(&mut Scanner),
         expect: Expect<'_>,
     ) -> RecordBatch {
-        let (plan, rows) = scan(dataset, &configure, true).await;
-        let (sorted_plan, sorted_rows) = scan(dataset, &configure, false).await;
+        let (plan, rows) = scan(dataset, &configure, OrderedIndexMode::Auto).await;
+        let (sorted_plan, sorted_rows) = scan(dataset, &configure, OrderedIndexMode::Off).await;
         assert!(!sorted_plan.contains("OrderedIndexScan"), "{sorted_plan}");
         let mut scanner = dataset.scan();
         configure(&mut scanner);
         let verbose_plan = scanner.explain_plan(true).await.unwrap();
         let required_plan = scanner
-            .require_ordered_index(true)
+            .ordered_index(OrderedIndexMode::Required)
             .explain_plan(false)
             .await;
         match expect {
@@ -806,7 +882,7 @@ mod tests {
                     let mut required = dataset.scan();
                     configure(&mut required);
                     let required_rows = required
-                        .require_ordered_index(true)
+                        .ordered_index(OrderedIndexMode::Required)
                         .try_into_batch()
                         .await
                         .unwrap();
@@ -816,6 +892,30 @@ mod tests {
         }
         assert_eq!(rows, sorted_rows);
         rows
+    }
+
+    #[rstest]
+    #[case::off("off", OrderedIndexMode::Off)]
+    #[case::auto("auto", OrderedIndexMode::Auto)]
+    #[case::upper_case("AUTO", OrderedIndexMode::Auto)]
+    #[case::mixed_case("Off", OrderedIndexMode::Off)]
+    #[case::required("required", OrderedIndexMode::Required)]
+    #[case::upper_case_required("REQUIRED", OrderedIndexMode::Required)]
+    fn test_ordered_index_mode_parses_names(#[case] name: &str, #[case] mode: OrderedIndexMode) {
+        assert_eq!(name.parse::<OrderedIndexMode>().unwrap(), mode);
+        assert_eq!(mode.to_string().parse::<OrderedIndexMode>().unwrap(), mode);
+    }
+
+    #[rstest]
+    #[case::unknown("sorted")]
+    #[case::empty("")]
+    #[case::padded(" auto")]
+    fn test_ordered_index_mode_rejects_unknown_names(#[case] name: &str) {
+        let error = name.parse::<OrderedIndexMode>().unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let expected =
+            format!("unknown ordered_index mode '{name}', expected one of: off, auto, required");
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 
     fn order_by_ts(scanner: &mut Scanner) -> &mut Scanner {
@@ -943,12 +1043,6 @@ mod tests {
     #[case::physical_row_prefilter(|scanner: &mut Scanner| {
         scanner.with_physical_row_addr_prefilter(RowAddrTreeMap::from_iter(0..50));
     }, "column 'ts' cannot be read in key order from an index because the scan has a physical row address prefilter, which the read cannot apply before the limit")]
-    #[case::row_version_projection(|scanner: &mut Scanner| {
-        scanner.project(&["id", "_row_last_updated_at_version"]).unwrap();
-    }, "column 'ts' cannot be read in key order from an index because the scan reads a row version column, which the read cannot take")]
-    #[case::row_version_filter(|scanner: &mut Scanner| {
-        scanner.filter("_row_created_at_version = 1").unwrap();
-    }, "column 'ts' cannot be read in key order from an index because the filter reads a row version column, which the read cannot take")]
     #[case::deleted_rows_included(|scanner: &mut Scanner| {
         scanner.with_row_id().include_deleted_rows();
     }, "column 'ts' cannot be read in key order from an index because the scan includes deleted rows")]
@@ -978,35 +1072,69 @@ mod tests {
     }
 
     #[rstest]
-    #[case::required_first(true)]
-    #[case::disabled_first(false)]
+    #[case::projection(|scanner: &mut Scanner| {
+        scanner.project(&["id", "_row_last_updated_at_version"]).unwrap();
+    }, "the scan reads a row version column, which the read cannot take")]
+    #[case::filter(|scanner: &mut Scanner| {
+        scanner.filter("_row_created_at_version = 1").unwrap();
+    }, "the filter reads a row version column, which the read cannot take")]
     #[tokio::test]
-    async fn test_ordered_decline_with_use_ordered_index_false(#[case] required_first: bool) {
+    async fn test_ordered_decline_row_version_columns(
+        #[case] decline: fn(&mut Scanner),
+        #[case] reason: &str,
+    ) {
         let dataset = dataset(WriteParams::default()).await;
-        let mut scanner = dataset.scan();
-        order_by_ts(&mut scanner);
-        if required_first {
-            scanner.require_ordered_index(true).use_ordered_index(false);
-        } else {
-            scanner.use_ordered_index(false).require_ordered_index(true);
+        let configure = |scanner: &mut Scanner| {
+            decline(order_by_ts(scanner));
+        };
+        let mut plans = Vec::new();
+        for mode in [OrderedIndexMode::Auto, OrderedIndexMode::Off] {
+            let mut scanner = dataset.scan();
+            configure(&mut scanner);
+            scanner.ordered_index(mode);
+            plans.push(scanner.explain_plan(false).await.unwrap());
+            // Reading a row version column needs stable row ids, which make the
+            // ordered read decline before it checks the columns.
+            let error = scanner.try_into_batch().await.unwrap_err();
+            assert!(
+                matches!(error, Error::InvalidInput { .. })
+                    && error.to_string().contains("requires stable row ids"),
+                "{error}"
+            );
         }
-        let error = scanner.explain_plan(false).await.unwrap_err();
-        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert_eq!(plans[0], plans[1]);
+        let declined = format!(
+            "OrderedIndexScan declined: column 'ts' cannot be read in key order from an index \
+             because {reason}"
+        );
+        let mut scanner = dataset.scan();
+        configure(&mut scanner);
+        let verbose_plan = scanner.explain_plan(true).await.unwrap();
         assert!(
-            error.to_string().contains(
-                "require_ordered_index=true and use_ordered_index=false are mutually exclusive"
-            ),
+            verbose_plan.lines().last().unwrap().starts_with(&declined),
+            "{verbose_plan}"
+        );
+        let error = scanner
+            .ordered_index(OrderedIndexMode::Required)
+            .explain_plan(false)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidInput { .. }) && error.to_string().contains(&declined),
             "{error}"
         );
-        let plan = scanner
-            .require_ordered_index(false)
-            .explain_plan(true)
-            .await
-            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ordered_decline_with_ordered_index_off() {
+        let dataset = dataset(WriteParams::default()).await;
+        let mut scanner = dataset.scan();
+        order_by_ts(&mut scanner).ordered_index(OrderedIndexMode::Off);
+        let plan = scanner.explain_plan(true).await.unwrap();
         assert!(
             plan.ends_with(
-                "OrderedIndexScan declined: use_ordered_index=false turns off ordered index \
-                 reads for column 'ts'\n"
+                "OrderedIndexScan declined: ordered_index=off turns off ordered index reads \
+                 for column 'ts'\n"
             ),
             "{plan}"
         );
@@ -1027,7 +1155,7 @@ mod tests {
             "{source_error}"
         );
         let error = scanner
-            .require_ordered_index(true)
+            .ordered_index(OrderedIndexMode::Required)
             .explain_plan(false)
             .await
             .unwrap_err();
@@ -1039,6 +1167,76 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    const ONE_SEGMENT: &[&[u32]] = &[&[0, 1, 2]];
+    const SEGMENT_PER_FRAGMENT: &[&[u32]] = &[&[0], &[1], &[2]];
+    const IGNORED_TS_INDEX: &str =
+        "every ordered index on column 'ts' is ignored by the scan: 'ts_idx'";
+
+    #[rstest]
+    #[case::order_column_index(
+        INDEX,
+        ONE_SEGMENT,
+        Expect::Sort { reason_prefix: IGNORED_TS_INDEX }
+    )]
+    #[case::order_column_index_in_three_segments(
+        INDEX,
+        SEGMENT_PER_FRAGMENT,
+        Expect::Sort { reason_prefix: IGNORED_TS_INDEX }
+    )]
+    #[case::unrelated_index(
+        "id_idx",
+        ONE_SEGMENT,
+        Expect::OrderedScan("OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10")
+    )]
+    #[tokio::test]
+    async fn test_ordered_read_skips_ignored_indices(
+        #[case] ignored: &str,
+        #[case] segment_fragments: &[&[u32]],
+        #[case] expect: Expect<'static>,
+    ) {
+        let mut dataset = segmented_dataset("memory://", segment_fragments).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner).with_ignored_scalar_indices([ignored]);
+        };
+        assert_ordered_read(&dataset, configure, expect).await;
+    }
+
+    #[rstest]
+    #[case::first_ignored(INDEX, "ts_idx_2")]
+    #[case::second_ignored("ts_idx_2", INDEX)]
+    #[tokio::test]
+    async fn test_ordered_read_serves_a_kept_index_beside_an_ignored_one(
+        #[case] ignored: &str,
+        #[case] kept: &str,
+    ) {
+        let mut dataset = dataset(WriteParams::default()).await;
+        dataset
+            .create_index(
+                &["ts"],
+                IndexType::BTree,
+                Some("ts_idx_2".into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner).with_ignored_scalar_indices([ignored]);
+        };
+        let node = format!("OrderedIndexScan: index={kept}, order=[ts ASC NULLS LAST], fetch=10");
+        assert_ordered_read(&dataset, configure, Expect::OrderedScan(&node)).await;
     }
 
     async fn overlay_key(dataset: Dataset, old_key: i32, new_key: i32) -> Dataset {
@@ -1620,7 +1818,7 @@ mod tests {
         let mut required = dataset.scan();
         configure(&mut required);
         let error = required
-            .require_ordered_index(true)
+            .ordered_index(OrderedIndexMode::Required)
             .explain_plan(false)
             .await
             .unwrap_err();
@@ -1638,7 +1836,7 @@ mod tests {
         let mut scanner = dataset.scan();
         configure(&mut scanner);
         let mut sorted = scanner.clone();
-        sorted.use_ordered_index(false);
+        sorted.ordered_index(OrderedIndexMode::Off);
         let rows = scanner.try_into_batch().await.unwrap();
         assert_eq!(ids(&rows), [99, 98, 97, 96, 95]);
         assert_eq!(rows, sorted.try_into_batch().await.unwrap());
@@ -1952,7 +2150,10 @@ mod tests {
                 .unwrap()
                 .limit(Some(limit), Some(offset))
                 .unwrap()
-                .require_ordered_index(read == Read::Required);
+                .ordered_index(match read {
+                    Read::Required => OrderedIndexMode::Required,
+                    Read::Ordered | Read::FallsBack => OrderedIndexMode::Auto,
+                });
         };
         let mut scanner = dataset.scan();
         configure(&mut scanner);
@@ -2022,7 +2223,7 @@ mod tests {
 
         let mut sorted = dataset.scan();
         configure(&mut sorted);
-        sorted.require_ordered_index(false).use_ordered_index(false);
+        sorted.ordered_index(OrderedIndexMode::Off);
         let sorted_plan = sorted.explain_plan(false).await.unwrap();
         assert!(!sorted_plan.contains("OrderedIndexScan"), "{sorted_plan}");
         assert_eq!(ids(&sorted.try_into_batch().await.unwrap()), expected);
@@ -2047,7 +2248,7 @@ mod tests {
         "    FilterExec: text@3 = even",
         "      LanceRead: uri=data, projection=[text], source=stream(_rowaddr)",
         "        LanceRead: uri=data, projection=[id, ts], num_fragments=3, range_before=None, range_after=None, row_id=false, row_addr=true, full_filter=--, refine_filter=--",
-        "          OneShotStream: columns=[result,discriminant,fragments_covered]",
+        "          RecordBatchExec: rows=2, columns=3",
     ])]
     #[case::ordered_read(|scanner: &mut Scanner| {
         order_by_ts(scanner);
@@ -2103,7 +2304,7 @@ mod tests {
             .batch_size(1024)
             .target_parallelism(4);
         let mut sorted = scanner.clone();
-        sorted.use_ordered_index(false);
+        sorted.ordered_index(OrderedIndexMode::Off);
         let analyzed = scanner.analyze_plan().await.unwrap();
         assert!(
             analyzed.contains("RoundRobinBatch(4)") && analyzed.contains("ordered_fallback=false"),
@@ -2166,7 +2367,7 @@ mod tests {
         let mut sorted = dataset.scan();
         configure(&mut sorted);
         let expected = sorted
-            .use_ordered_index(false)
+            .ordered_index(OrderedIndexMode::Off)
             .try_into_batch()
             .await
             .unwrap();
@@ -2262,7 +2463,9 @@ mod tests {
             .limit(limit, Some(2))
             .unwrap();
         let mut expected = scan.clone();
-        expected.use_scalar_index(false).use_ordered_index(false);
+        expected
+            .use_scalar_index(false)
+            .ordered_index(OrderedIndexMode::Off);
         let ordered = limit.is_some() && shape == DatasetShape::Indexed;
         let plan = scan.explain_plan(false).await.unwrap();
         assert_eq!(plan.contains("OrderedIndexScan"), ordered, "{plan}");
@@ -2323,7 +2526,9 @@ mod tests {
             scan.filter(filter).unwrap();
         }
         let mut expected = scan.clone();
-        expected.use_scalar_index(false).use_ordered_index(false);
+        expected
+            .use_scalar_index(false)
+            .ordered_index(OrderedIndexMode::Off);
         let plan = scan.explain_plan(false).await.unwrap();
         assert_eq!(plan.contains("OrderedIndexScan"), !stable_row_ids, "{plan}");
         if filter.is_some() && !stable_row_ids {

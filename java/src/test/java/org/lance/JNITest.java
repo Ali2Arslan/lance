@@ -19,10 +19,13 @@ import org.lance.index.vector.HnswBuildParams;
 import org.lance.index.vector.IvfBuildParams;
 import org.lance.index.vector.PQBuildParams;
 import org.lance.index.vector.RQBuildParams;
+import org.lance.index.vector.RQModel;
+import org.lance.index.vector.RQRotationType;
 import org.lance.index.vector.SQBuildParams;
 import org.lance.index.vector.VectorIndexParams;
 import org.lance.ipc.ApproxMode;
 import org.lance.ipc.Query;
+import org.lance.ipc.ScanOptions;
 import org.lance.test.JniTestHelper;
 
 import org.junit.jupiter.api.Test;
@@ -32,8 +35,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.Arrays;
 import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class JNITest {
   @Test
@@ -60,6 +66,7 @@ public class JNITest {
     assertEquals(Optional.empty(), defaultQuery.getUpperBound());
     assertEquals(0.5, defaultQuery.getSearchEffort());
     assertEquals(Optional.empty(), defaultQuery.getSearchEffortOption());
+    assertFalse(defaultQuery.getQuantizedRefineFactor().isPresent());
 
     Query nprobesQuery =
         new Query.Builder()
@@ -80,6 +87,7 @@ public class JNITest {
             .setNprobes(20)
             .setEf(30)
             .setRefineFactor(40)
+            .setQuantizedRefineFactor(4)
             .setDistanceType(DistanceType.L2)
             .setUseIndex(true)
             .setQueryParallelism(-1)
@@ -88,6 +96,16 @@ public class JNITest {
     assertEquals(Optional.of(1.5f), query.getLowerBound());
     assertEquals(Optional.of(2.5f), query.getUpperBound());
     JniTestHelper.parseQuery(Optional.of(query));
+    assertEquals(Optional.of(4), query.getQuantizedRefineFactor());
+
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new Query.Builder()
+                .setColumn("column")
+                .setKey(new float[] {1.0f})
+                .setQuantizedRefineFactor(0)
+                .build());
   }
 
   @ParameterizedTest
@@ -150,8 +168,34 @@ public class JNITest {
   }
 
   @Test
+  public void testParseOrderedIndexMode() {
+    for (ScanOptions.OrderedIndexMode mode : ScanOptions.OrderedIndexMode.values()) {
+      JniTestHelper.parseOrderedIndexMode(mode.toRustString());
+    }
+    IllegalArgumentException error =
+        assertThrows(
+            IllegalArgumentException.class, () -> JniTestHelper.parseOrderedIndexMode("sorted"));
+    String expected = "unknown ordered_index mode 'sorted', expected one of: off, auto, required";
+    assertTrue(error.getMessage().contains(expected), error.getMessage());
+  }
+
+  @Test
   public void testRqBuildParamsDefaultNumBits() {
     assertEquals((byte) 5, new RQBuildParams.Builder().build().getNumBits());
+  }
+
+  @Test
+  public void testRqModelSerializationAndValidation() {
+    RQModel model = RQModel.build(32, (byte) 3);
+    RQModel restored = RQModel.fromBytes(model.toBytes());
+    assertArrayEquals(model.toBytes(), restored.toBytes());
+    assertEquals(32, restored.getDimension());
+    assertEquals((byte) 3, restored.getNumBits());
+    assertEquals(RQRotationType.FAST, restored.getRotationType());
+
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(31, (byte) 3));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.build(32, (byte) 0));
+    assertThrows(IllegalArgumentException.class, () -> RQModel.fromBytes(new byte[] {1, 2, 3}));
   }
 
   @Test
@@ -220,6 +264,25 @@ public class JNITest {
         IndexParams.builder()
             .setVectorIndexParams(
                 VectorIndexParams.withIvfHnswSqParams(DistanceType.Dot, ivf, hnsw, sq))
+            .build());
+  }
+
+  @Test
+  public void testIvfHnswRqIndexParams() {
+    IvfBuildParams ivf = new IvfBuildParams.Builder().setNumPartitions(15).build();
+    HnswBuildParams hnsw =
+        new HnswBuildParams.Builder()
+            .setMaxLevel((short) 10)
+            .setM(30)
+            .setEfConstruction(200)
+            .setPrefetchDistance(3)
+            .build();
+    RQBuildParams rq = new RQBuildParams.Builder().setNumBits((byte) 2).build();
+
+    JniTestHelper.parseIndexParams(
+        IndexParams.builder()
+            .setVectorIndexParams(
+                VectorIndexParams.withIvfHnswRqParams(DistanceType.L2, ivf, hnsw, rq))
             .build());
   }
 
