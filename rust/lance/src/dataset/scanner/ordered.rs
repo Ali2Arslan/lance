@@ -256,8 +256,13 @@ pub enum OrderedIndexMode {
     /// otherwise.
     #[default]
     Auto,
-    /// Read the index in key order as [`Self::Auto`] does, and fail planning
-    /// with [`Error::InvalidInput`] when the scan cannot.
+    /// Read the index in key order, and fail planning with
+    /// [`Error::InvalidInput`] when the scan cannot. Unlike [`Self::Auto`],
+    /// the read never sorts instead, so a selective filter can make it read
+    /// the whole index. It also applies a search of another index in the
+    /// filter to each row it reads, where `Auto` sorts. With
+    /// [`Scanner::fast_search`], planning fails when the read would apply
+    /// such a search.
     Required,
 }
 
