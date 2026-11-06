@@ -175,7 +175,7 @@ public class JNITest {
     IllegalArgumentException error =
         assertThrows(
             IllegalArgumentException.class, () -> JniTestHelper.parseOrderedIndexMode("sorted"));
-    String expected = "unknown ordered_index mode 'sorted', expected one of: off, auto";
+    String expected = "unknown ordered_index mode 'sorted', expected one of: off, auto, required";
     assertTrue(error.getMessage().contains(expected), error.getMessage());
   }
 

@@ -30,7 +30,12 @@ public class ScanOptions {
     /** Always sort. */
     OFF("off"),
     /** Read the index in key order when it can serve the orderings, and sort otherwise. */
-    AUTO("auto");
+    AUTO("auto"),
+    /**
+     * Read the index in key order as {@link #AUTO} does, and throw {@link IllegalArgumentException}
+     * when the scan cannot.
+     */
+    REQUIRED("required");
 
     private final String rustValue;
 
@@ -1058,7 +1063,10 @@ public class ScanOptions {
      * limit} live rows, instead of sorting every row. This applies when the scan has no filter or a
      * filter that the same index answers exactly. An index named in {@link
      * #ignoredScalarIndices(List)} never serves the read. {@link OrderedIndexMode#OFF} always
-     * sorts. Other uses of scalar indices are not affected.
+     * sorts. {@link OrderedIndexMode#REQUIRED} plans as {@code AUTO} does, but when the scan cannot
+     * serve the column orderings from an index, it throws {@link IllegalArgumentException} instead
+     * of sorting. The message says why, for example that the scan has no limit. A scan without
+     * column orderings is not affected. Other uses of scalar indices are not affected.
      *
      * @param orderedIndex the ordered index mode. Default is {@link OrderedIndexMode#AUTO}.
      * @return Builder instance for method chaining.

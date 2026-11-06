@@ -31,7 +31,7 @@ use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{Distribution, LexOrdering, PhysicalExpr};
 use futures::future::BoxFuture;
 use futures::stream::StreamExt;
-use futures::{FutureExt, TryStreamExt};
+use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use lance_arrow::DataTypeExt;
 use lance_core::datatypes::{Field, OnMissing, Projection};
 use lance_core::utils::tokio::get_num_compute_intensive_cpus;
@@ -58,9 +58,12 @@ use crate::{Error, Result};
 use super::aggregate::AggregateExpr;
 use super::source::TakeOperation;
 use super::{
-    ColumnOrdering, DatasetRecordBatchStream, FilterPlan, MaterializationStyle, QueryFilter,
-    ScanRangePlan, Scanner, validate_batch_size,
+    ColumnOrdering, DatasetRecordBatchStream, FilterPlan, MaterializationStyle,
+    OrderedIndexDecline, OrderedIndexMode, QueryFilter, ScanRangePlan, Scanner,
+    validate_batch_size,
 };
+
+type PlanWithDecline = (Arc<dyn ExecutionPlan>, Option<OrderedIndexDecline>);
 
 impl Scanner {
     /// The Arrow schema of the output, including projections and vector / _distance
@@ -791,21 +794,28 @@ impl Scanner {
     /// 4. Limit / Offset
     /// 5. Take remaining columns / Projection
     pub fn create_plan(&self) -> BoxFuture<'_, Result<Arc<dyn ExecutionPlan>>> {
-        Box::pin(self.create_plan_impl(None))
+        Box::pin(self.create_plan_impl(None).map_ok(|(plan, _)| plan))
     }
 
     pub(crate) fn create_plan_with_session<'a>(
         &'a self,
         session: &'a dyn Session,
     ) -> BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
-        Box::pin(self.create_plan_impl(Some(session)))
+        Box::pin(
+            self.create_plan_impl(Some(session))
+                .map_ok(|(plan, _)| plan),
+        )
+    }
+
+    // A boxed `dyn Future`: awaiting the `create_plan_impl` future inline in
+    // `explain_plan` exceeds rustc's depth limit, and its `Send` check overflows
+    // the trait solver in downstream crates (E0275).
+    fn create_plan_with_decline(&self) -> BoxFuture<'_, Result<PlanWithDecline>> {
+        Box::pin(self.create_plan_impl(None))
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn create_plan_impl(
-        &self,
-        session: Option<&dyn Session>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
+    async fn create_plan_impl(&self, session: Option<&dyn Session>) -> Result<PlanWithDecline> {
         log::trace!("creating scanner plan");
         self.validate_options()?;
         if let Some(rows) = &self.physical_row_addr_prefilter {
@@ -834,6 +844,16 @@ impl Scanner {
             .create_filter_plan(use_scalar_index, query_filter, fts_document_granularity)
             .await?;
 
+        let (ordered_read, ordered_index_decline) = match self.ordering.as_deref() {
+            Some(ordering) => match self.try_ordered_read(ordering, &mut filter_plan).await {
+                Ok(ordered_read) => (Some(ordered_read), None),
+                Err(decline) if self.ordered_index == OrderedIndexMode::Required => {
+                    return Err(Error::invalid_input_source(decline.into()));
+                }
+                Err(decline) => (None, Some(decline)),
+            },
+            None => (None, None),
+        };
         let mut use_limit_node = true;
         let mut is_index_ordered = false;
         // Source: either a (K|A)NN search, full text search, or a (full|indexed) scan
@@ -877,7 +897,7 @@ impl Scanner {
                         .map(ExprFilterPlan::new_refine_only)
                         .unwrap_or(ExprFilterPlan::default());
                     self.take_source(take_op).await?
-                } else if let Some(ordered_read) = self.try_ordered_read(&mut filter_plan).await {
+                } else if let Some(ordered_read) = ordered_read {
                     is_index_ordered = true;
                     ordered_read
                 } else {
@@ -958,7 +978,7 @@ impl Scanner {
                 plan = rule.optimize(plan, &options)?;
             }
 
-            return Ok(plan);
+            return Ok((plan, ordered_index_decline));
         }
 
         // Sort
@@ -1068,7 +1088,7 @@ impl Scanner {
             plan = rule.optimize(plan, &options)?;
         }
 
-        Ok(plan)
+        Ok((plan, ordered_index_decline))
     }
 
     /// Replaces the Lance read nodes in `plan` with ones that know the widths
@@ -1158,15 +1178,14 @@ impl Scanner {
 
     #[instrument(level = "info", skip(self))]
     pub async fn explain_plan(&self, verbose: bool) -> Result<String> {
-        // Box the plan-building future at the call site: `create_plan`'s inlined async
-        // layout otherwise exceeds rustc's depth limit here. It has to be boxed at the
-        // call site rather than inside `create_plan` — boxing internally turns the
-        // future's `Send` check into a `Box<Future>: Send` trait obligation that
-        // overflows the solver through the cache types (E0275 in downstream crates).
-        let plan = Box::pin(self.create_plan()).await?;
-        let display = DisplayableExecutionPlan::new(plan.as_ref());
-
-        Ok(format!("{}", display.indent(verbose)))
+        let (plan, ordered_index_decline) = self.create_plan_with_decline().await?;
+        let explained = DisplayableExecutionPlan::new(plan.as_ref())
+            .indent(verbose)
+            .to_string();
+        Ok(match ordered_index_decline {
+            Some(decline) if verbose => format!("{explained}{decline}\n"),
+            _ => explained,
+        })
     }
 
     /// Run [`Self::count_rows`]'s underlying plan and return it formatted with

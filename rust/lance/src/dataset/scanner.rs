@@ -22,7 +22,7 @@ pub mod test_dataset;
 mod vector;
 
 pub use aggregate::{AggregateExpr, AggregateExprBuilder};
-pub use ordered::OrderedIndexMode;
+pub use ordered::{OrderedIndexDecline, OrderedIndexMode};
 pub use source::TakeOperation;
 
 use std::collections::HashSet;
