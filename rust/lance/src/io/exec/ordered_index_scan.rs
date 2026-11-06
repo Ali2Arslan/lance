@@ -28,6 +28,7 @@ use arrow_select::take::take_record_batch;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{TaskContext, memory_pool::MemoryConsumer};
+use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
@@ -93,6 +94,7 @@ pub struct OrderedIndexScanExec {
     query: Option<Arc<dyn AnyQuery>>,
     options: SortOptions,
     fetch: Option<usize>,
+    residual_label: Option<Expr>,
     properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
@@ -260,6 +262,7 @@ impl OrderedIndexScanExec {
             query,
             options,
             fetch: None,
+            residual_label: None,
             properties,
             metrics: ExecutionPlanMetricsSet::new(),
         };
@@ -269,6 +272,13 @@ impl OrderedIndexScanExec {
             .map(|segment| plan.checked_ordered_stream(segment, Arc::new(NoOpMetricsCollector)));
         try_join_all(preflights).await?;
         Ok(plan)
+    }
+
+    pub(crate) fn with_residual_label(self, residual_label: Option<Expr>) -> Self {
+        Self {
+            residual_label,
+            ..self
+        }
     }
 
     async fn checked_ordered_stream(
@@ -571,6 +581,9 @@ impl DisplayAs for OrderedIndexScanExec {
         }
         if let Some(query) = &self.query {
             write!(f, "{separator}query={}", query.format(&self.column))?;
+        }
+        if let Some(residual) = &self.residual_label {
+            write!(f, "{separator}residual={residual}")?;
         }
         Ok(())
     }

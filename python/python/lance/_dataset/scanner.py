@@ -969,13 +969,23 @@ class ScannerBuilder:
         With ``"auto"``, the default, a scan with a limit that orders by one column
         with a B-tree index reads that index in key order and stops after
         ``offset + limit`` live rows, instead of sorting every row.  This applies
-        when the scan has no filter or a filter that the same index answers
-        exactly.  An index named in :meth:`ignored_scalar_indices` never serves
-        the read.  ``"off"`` always sorts.  ``"required"`` plans as ``"auto"``
-        does, but when the scan cannot serve ``order_by`` from an index, it raises
-        ``ValueError`` instead of sorting.  The message says why, for example that
-        the scan has no limit, and ``explain_plan(verbose=True)`` prints the same
-        reason under any mode.  A scan without ``order_by`` is not affected.
+        when the scan has no filter, or a filter that searches no index except
+        with one exact search of the same index.  The read applies the rest of
+        the filter to each row it reads, and sorts instead when that keeps too
+        few rows within a share of the index.  An index named in
+        :meth:`ignored_scalar_indices` never serves the read.  ``"off"`` always
+        sorts.
+
+        ``"required"`` never sorts instead.  When the scan cannot serve
+        ``order_by`` from an index, it raises ``ValueError``.  The message says
+        why, for example that the scan has no limit, and
+        ``explain_plan(verbose=True)`` prints the same reason under any mode.  A
+        required read applies the part of the filter the index does not answer,
+        including a search of another index, to each row it reads, so a
+        selective filter can make it read the whole index.  With
+        :meth:`fast_search`, it raises instead when the read would apply an index
+        search this way, because ``fast_search`` skips the fragments that
+        search's index does not cover.  A scan without ``order_by`` is not affected.
         Names are case-insensitive, and the scanner rejects any other name with a
         ``ValueError``.  Other uses of scalar indices are not affected.
         """
