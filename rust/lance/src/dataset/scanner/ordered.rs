@@ -2375,6 +2375,64 @@ mod tests {
         assert_eq!(scanner.try_into_batch().await.unwrap(), expected);
     }
 
+    #[tokio::test]
+    async fn test_ordered_residual_with_ignored_indices() {
+        let mut dataset = dataset(WriteParams::default()).await;
+        dataset
+            .create_index(
+                &["id"],
+                IndexType::BTree,
+                Some("id_idx".into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner)
+                .filter("id < 100")
+                .unwrap()
+                .with_ignored_scalar_indices(["id_idx"]);
+        };
+        let (plan, rows) = scan(&dataset, &configure, OrderedIndexMode::Auto).await;
+        let (sorted_plan, sorted_rows) = scan(&dataset, &configure, OrderedIndexMode::Off).await;
+        let fallback = sorted_plan
+            .lines()
+            .map(|line| format!("  {line}\n"))
+            .collect::<String>();
+        assert!(
+            plan.starts_with("OrderedFallback: limit=10\n")
+                && plan.contains(
+                    "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=40, \
+                     residual=id < Int32(100)"
+                )
+                && plan.ends_with(&fallback),
+            "{plan}"
+        );
+        let (required_plan, required_rows) =
+            scan(&dataset, &configure, OrderedIndexMode::Required).await;
+        assert!(
+            required_plan.contains(
+                "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], \
+                 residual=id < Int32(100)"
+            ) && !required_plan.contains("OrderedFallback"),
+            "{required_plan}"
+        );
+        assert_eq!(rows, sorted_rows);
+        assert_eq!(required_rows, sorted_rows);
+
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner)
+                .filter("ts > 5")
+                .unwrap()
+                .with_ignored_scalar_indices([INDEX]);
+        };
+        let expect = Expect::Sort {
+            reason_prefix: IGNORED_TS_INDEX,
+        };
+        assert_ordered_read(&dataset, configure, expect).await;
+    }
+
     async fn scored_dataset(stable_row_ids: bool, appended: bool) -> Dataset {
         let rows = 0..128;
         let nullable = |row: i32| (row % 11 != 0).then_some(row);
