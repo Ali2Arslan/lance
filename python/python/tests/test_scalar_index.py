@@ -21,7 +21,7 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from conftest import ProgressRecorder, progress_event_tags, stage_progress_values
-from lance.dataset import ColumnOrdering, ScannerBuilder
+from lance._dataset.scanner import ColumnOrdering, ScannerBuilder
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -277,7 +277,7 @@ def test_list_indices_index_without_details(tmp_path):
     """An index whose manifest entry has no index details (e.g. committed by an
     older writer) is still reported on a best-effort basis: describe_indices()
     does not error, and the type is reported as "Unknown"."""
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -313,7 +313,7 @@ def test_list_indices_legacy_vector_index_without_details(tmp_path):
     """A legacy vector index predates VectorIndexDetails: it has no index
     details but stores a monolithic index file. Its type is recognized as
     "Vector" from the index file rather than reported as "Unknown"."""
-    from lance.dataset import Index, IndexFile
+    from lance._dataset.index import Index, IndexFile
 
     data = pa.table({"id": range(100), "val": range(100)})
     ds = lance.write_dataset(data, tmp_path)
@@ -823,6 +823,17 @@ def test_index_take_batch_size(tmp_path):
     ).to_batches()
     batches = list(batches)
     assert len(batches) == 21
+
+
+def test_btree_rejects_zero_zone_size(tmp_path):
+    """A zero-sized BTree zone must be rejected."""
+    dataset = lance.write_dataset(pa.table({"value": [1, 2, 3]}), tmp_path)
+
+    with pytest.raises(ValueError, match="zone_size"):
+        dataset.create_scalar_index(
+            "value",
+            index_type=IndexConfig("btree", {"zone_size": 0}),
+        )
 
 
 def test_all_null_chunk(tmp_path):
@@ -4474,7 +4485,7 @@ def build_distributed_fts_index(
     """
     import uuid
 
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Generate unique index ID for distributed indexing
     index_id = str(uuid.uuid4())
@@ -5443,7 +5454,7 @@ def test_distribute_fts_index_build(tmp_path):
     ds.merge_index_metadata(index_id, index_type="INVERTED")
 
     # Create an Index object using the new dataclass format
-    from lance.dataset import Index
+    from lance._dataset.index import Index
 
     # Get the schema field for the indexed column
     # Only use for non nested struct schema
@@ -6876,7 +6887,9 @@ def test_describe_indices(tmp_path, format_version, expected_format_version):
         "{}",
         "{}",
         "{}",
-        '{"path":"x","target_details":{}}',
+        # `$.x` is absent from every document, so the target type was inferred
+        # as utf8, the fallback for an all-null path.
+        '{"path":"x","target_data_type":"utf8","target_details":{}}',
         "{}",
         "{}",
     ]
@@ -7158,10 +7171,71 @@ def test_large_string_scalar_index(tmp_path, index_type):
     assert set(result.column("id").to_pylist()) == {1, 3}
 
 
+def _assert_row_address_query(dataset, value, filter_expression):
+    table = dataset.to_table(filter=filter_expression)
+    assert table.num_rows == 1
+    assert table.column("idx").to_pylist() == [value]
+
+    plan = dataset.scanner(filter=filter_expression).explain_plan()
+    assert "ScalarIndexQuery" in plan or "MaterializeIndex" in plan
+
+
+def _assert_row_address_case(index_type, dataset, value):
+    if index_type == "LABEL_LIST":
+        filter_expression = f"array_has_any(label_list, ['label{value}'])"
+    else:
+        filter_expression = f"{index_type.lower()} == {value}"
+    _assert_row_address_query(dataset, value, filter_expression)
+
+
+@pytest.mark.parametrize("index_type", ["BTREE", "BITMAP", "LABEL_LIST"])
+def test_row_address_index_maintenance(tmp_path, index_type):
+    column = "label_list" if index_type == "LABEL_LIST" else index_type.lower()
+    data = pa.table(
+        {
+            "idx": range(16),
+            column: (
+                [[f"label{i}"] for i in range(16)]
+                if index_type == "LABEL_LIST"
+                else range(16)
+            ),
+        }
+    )
+    dataset = lance.write_dataset(
+        data,
+        tmp_path,
+        max_rows_per_file=8,
+        data_storage_version="2.1",
+        enable_stable_row_ids=True,
+    )
+    dataset.create_scalar_index(column, index_type)
+    _assert_row_address_case(index_type, dataset, 7)
+
+    dataset.insert(
+        pa.table(
+            {
+                "idx": [16],
+                column: [["label16"]] if index_type == "LABEL_LIST" else [16],
+            }
+        )
+    )
+    dataset.optimize.optimize_indices()
+    dataset.optimize.compact_files()
+
+    dataset = lance.dataset(tmp_path)
+    _assert_row_address_case(index_type, dataset, 7)
+    _assert_row_address_case(index_type, dataset, 16)
+
+    # Compaction can leave coverage addressed by stable row ids. Rebuild it so
+    # both rows remain available through physical-address coverage as well.
+    dataset.optimize.optimize_indices()
+    _assert_row_address_case(index_type, dataset, 16)
+
+
 @pytest.mark.parametrize(
     "options",
-    [{}, {"use_ordered_index": False}, {"use_scalar_index": False}],
-    ids=["ordered_index", "use_ordered_index_false", "use_scalar_index_false"],
+    [{}, {"ordered_index": "off"}, {"use_scalar_index": False}],
+    ids=["default", "ordered_index_off", "use_scalar_index_false"],
 )
 def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
     ts = [None if i % 10 == 3 else i * 7 % 60 for i in range(60)]
@@ -7192,6 +7266,13 @@ def test_ordered_index_read_serves_order_by_limit(tmp_path, options):
     assert to_table == newest
 
 
+def test_ordered_index_rejects_unknown_mode(tmp_path):
+    dataset = lance.write_dataset(pa.table({"ts": pa.array([2, 1])}), tmp_path)
+    expected = "unknown ordered_index mode 'sorted', expected one of: off, auto"
+    with pytest.raises(ValueError, match=expected):
+        dataset.scanner(order_by=["ts"], limit=1, ordered_index="sorted")
+
+
 @pytest.fixture
 def ts_index_dataset(tmp_path):
     table = pa.table({"ts": pa.array(range(59, -1, -1), pa.int32())})
@@ -7211,16 +7292,14 @@ def test_require_ordered_index_without_limit(ts_index_dataset):
     assert plan.endswith(reason + "\n") and "SortExec" in plan, plan
 
 
-def test_require_ordered_index_with_use_ordered_index_false(ts_index_dataset):
-    error = (
-        "require_ordered_index=true and use_ordered_index=false are mutually exclusive"
-    )
+def test_require_ordered_index_with_ordered_index_off(ts_index_dataset):
+    error = "require_ordered_index=true and ordered_index=off are mutually exclusive"
     with pytest.raises(ValueError, match=re.escape(error)):
         ts_index_dataset.to_table(
             order_by=["ts"],
             limit=10,
             require_ordered_index=True,
-            use_ordered_index=False,
+            ordered_index="off",
         )
 
 

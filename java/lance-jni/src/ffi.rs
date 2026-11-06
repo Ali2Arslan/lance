@@ -4,9 +4,10 @@
 use core::slice;
 
 use crate::Error;
+use crate::blocking_scanner::get_ordered_index_mode;
 use crate::error::Result;
 use crate::utils::{get_query, get_vector_index_params};
-use jni::objects::{JByteBuffer, JFloatArray, JObjectArray, JString};
+use jni::objects::{JByteArray, JByteBuffer, JFloatArray, JObjectArray, JString};
 use jni::sys::jobjectArray;
 use jni::{JNIEnv, objects::JObject};
 use lance_index::scalar::inverted::query::{Occur, Operator};
@@ -72,8 +73,12 @@ pub trait JNIEnvExt {
     fn get_string_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<String>;
     // Get float array from Java Object with given method name.
     fn get_vec_f32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<f32>>;
+    // Get byte array from Java Object with given method name.
+    fn get_vec_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<u8>>;
     // Get int as usize from Java Object with given method name.
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize>;
+    // Get u8 byte from Java Object with given method name.
+    fn get_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u8>;
     // Get u32 int from Java Object with given method name.
     fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32>;
     // Get u64 int from Java Object with given method name.
@@ -186,8 +191,9 @@ impl JNIEnvExt for JNIEnv<'_> {
         let mut results = Vec::with_capacity(list.size(self)? as usize);
         while let Some(elem) = iter.next(self)? {
             let jstr = JString::from(elem);
-            let val = self.get_string(&jstr)?;
-            results.push(val.to_str()?.to_string())
+            // `into` decodes the modified UTF-8 that JNI returns; `to_str` expects standard
+            // UTF-8 and rejects characters outside the BMP.
+            results.push(self.get_string(&jstr)?.into())
         }
         Ok(results)
     }
@@ -206,8 +212,7 @@ impl JNIEnvExt for JNIEnv<'_> {
     fn get_string_opt(&mut self, obj: &JObject) -> Result<Option<String>> {
         self.get_optional(obj, |env, java_string_obj| {
             let jstr = JString::from(java_string_obj);
-            let val = env.get_string(&jstr)?;
-            Ok(val.to_str()?.to_string())
+            Ok(env.get_string(&jstr)?.into())
         })
     }
 
@@ -330,8 +335,17 @@ impl JNIEnvExt for JNIEnv<'_> {
         Ok(buffer)
     }
 
+    fn get_vec_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<Vec<u8>> {
+        let array = self.call_method(obj, method_name, "()[B", &[])?.l()?;
+        Ok(self.convert_byte_array(JByteArray::from(array))?)
+    }
+
     fn get_int_as_usize_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<usize> {
         Ok(self.call_method(obj, method_name, "()I", &[])?.i()? as usize)
+    }
+
+    fn get_u8_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u8> {
+        Ok(self.call_method(obj, method_name, "()B", &[])?.b()? as u8)
     }
 
     fn get_u32_from_method(&mut self, obj: &JObject, method_name: &str) -> Result<u32> {
@@ -507,6 +521,15 @@ pub extern "system" fn Java_org_lance_test_JniTestHelper_parseQuery(
     query_opt: JObject, // Optional<TmpQuery>
 ) {
     ok_or_throw_without_return!(env, get_query(&mut env, query_opt));
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_parseOrderedIndexMode(
+    mut env: JNIEnv,
+    _obj: JObject,
+    name: JString, // String
+) {
+    ok_or_throw_without_return!(env, get_ordered_index_mode(&mut env, &name));
 }
 
 #[unsafe(no_mangle)]
