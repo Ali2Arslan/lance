@@ -697,6 +697,9 @@ impl Scanner {
     }
 }
 
+// rstest drops a parametrized test's own attributes, so the allow for
+// test_ordered_residual's eight parameters sits on the module.
+#[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1828,6 +1831,7 @@ mod tests {
         #[case] index_id: bool,
         #[case] filter: &str,
         #[case] search: &str,
+        #[values(false, true)] covered: bool,
     ) {
         let mut dataset = dataset(WriteParams::default()).await;
         if index_id {
@@ -1835,6 +1839,13 @@ mod tests {
                 .create_index(&["id"], IndexType::BTree, None, &btree(), false)
                 .await
                 .unwrap();
+        }
+        if covered {
+            cover_v(&mut dataset).await;
+            if index_id {
+                // Carrying `ts` does not make `id_idx` an index on `ts`.
+                declare_covering(&mut dataset, "id", "ts").await;
+            }
         }
         let reason = format!(
             "the filter's index query `{search}` is not an exact search of an index on column \
@@ -1849,8 +1860,11 @@ mod tests {
         assert_ordered_read(&dataset, configure, expect).await;
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn test_ordered_decline_fast_search_with_another_index() {
+    async fn test_ordered_decline_fast_search_with_another_index(
+        #[values(false, true)] covered: bool,
+    ) {
         let batch = |ids: Range<i32>| {
             RecordBatch::try_from_iter([
                 (
@@ -1891,6 +1905,9 @@ mod tests {
             )
             .await
             .unwrap();
+        if covered {
+            declare_covering(&mut dataset, "ts", "id").await;
+        }
         let configure = |scanner: &mut Scanner| {
             scanner
                 .project(&["id"])
@@ -1928,6 +1945,32 @@ mod tests {
         sorted.ordered_index(OrderedIndexMode::Off);
         let rows = scanner.try_into_batch().await.unwrap();
         assert_eq!(ids(&rows), [99, 98, 97, 96, 95]);
+        assert_eq!(rows, sorted.try_into_batch().await.unwrap());
+
+        let mut required = dataset.scan();
+        required
+            .project(&["id"])
+            .unwrap()
+            .filter("ts >= 150 AND id % 2 = 0")
+            .unwrap()
+            .order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".into())]))
+            .unwrap()
+            .limit(Some(5), None)
+            .unwrap()
+            .fast_search();
+        let mut sorted = required.clone();
+        sorted.ordered_index(OrderedIndexMode::Off);
+        required.ordered_index(OrderedIndexMode::Required);
+        let plan = required.explain_plan(false).await.unwrap();
+        assert!(
+            plan.contains(
+                "OrderedIndexScan: index=ts_idx, order=[ts DESC NULLS LAST], query=ts >= 150, \
+                 residual=CAST(id AS Int64) % Int64(2) = Int64(0)"
+            ),
+            "{plan}"
+        );
+        let rows = required.try_into_batch().await.unwrap();
+        assert_eq!(ids(&rows), [198, 196, 194, 192, 190]);
         assert_eq!(rows, sorted.try_into_batch().await.unwrap());
     }
 
@@ -2199,6 +2242,15 @@ mod tests {
         Read::Required,
         "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], residual=CAST(ts AS Int64) % Int64(50) = Int64(7) OR ts > Int32(250)"
     )]
+    #[case::required_search_and_residual(
+        Rows::Indexed,
+        "ts > 100 AND text = 'odd'",
+        |row: &Row| row.ts.is_some_and(|ts| ts > 100) && row.text == "odd",
+        ColumnOrdering::asc_nulls_last("ts".into()),
+        (10, 0),
+        Read::Required,
+        r#"OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], query=ts > 100, residual=text = Utf8("odd")"#
+    )]
     #[case::all_null_column(
         Rows::AllNullColumn,
         "w IS NULL",
@@ -2226,8 +2278,12 @@ mod tests {
         #[case] limit_offset: (i64, i64),
         #[case] read: Read,
         #[case] scan_line: &str,
+        #[values(false, true)] covered: bool,
     ) {
-        let dataset = rows.dataset().await;
+        let mut dataset = rows.dataset().await;
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let (limit, offset) = limit_offset;
         let configure = |scanner: &mut Scanner| {
             scanner
