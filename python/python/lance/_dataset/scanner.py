@@ -1018,9 +1018,15 @@ class ScannerBuilder:
         ``offset + limit`` live rows, instead of sorting every row.  This applies
         when the scan has no filter or a filter that the same index answers
         exactly.  An index named in :meth:`ignored_scalar_indices` never serves
-        the read.  ``"off"`` always sorts.  Names are case-insensitive, and the
-        scanner rejects any other name with a ``ValueError``.  Other uses of
-        scalar indices are not affected.
+        the read.  ``"off"`` always sorts.  ``"required"`` plans as ``"auto"``
+        does, but when the scan cannot serve ``order_by`` from an index, it raises
+        ``ValueError`` instead of sorting.  The message says why, for example that
+        the scan has no limit.  Under ``"auto"`` and ``"off"``,
+        ``explain_plan(verbose=True)`` prints the same reason after the plan.
+        Under ``"required"``, ``explain_plan`` raises the same ``ValueError`` that
+        planning does.  A scan without ``order_by`` is not affected.
+        Names are case-insensitive, and the scanner rejects any other name with a
+        ``ValueError``.  Other uses of scalar indices are not affected.
         """
         self._ordered_index = mode
         return self
