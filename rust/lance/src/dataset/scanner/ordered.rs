@@ -249,11 +249,9 @@ pub enum OrderedIndexMode {
     Auto,
     /// Read the index in key order, and fail planning with
     /// [`Error::InvalidInput`] when the scan cannot. Unlike [`Self::Auto`],
-    /// the read never sorts instead, so a selective filter can make it read
-    /// the whole index. It also applies a search of another index in the
-    /// filter to each row it reads, where `Auto` sorts. With
-    /// [`Scanner::fast_search`], planning fails when the read would apply
-    /// such a search.
+    /// the read never sorts instead, so a selective filter, or a search of
+    /// another index in the filter that selects few rows, can make it read
+    /// the whole index.
     Required,
 }
 
@@ -297,12 +295,17 @@ impl Scanner {
     /// With [`OrderedIndexMode::Auto`], the default, a scan with a limit that
     /// orders by one column with a B-tree index reads that index in key order
     /// and stops after `offset + limit` live rows, instead of sorting every
-    /// row. This applies when the scan has no filter, or a filter that
-    /// searches no index except with one exact search of the same index. The
-    /// read applies the rest of the filter to each row it reads, and sorts
-    /// instead when that keeps too few rows within a share of the index. An
-    /// index named in [`Self::with_ignored_scalar_indices`] never serves the
-    /// read or answers its filter. [`OrderedIndexMode::Off`] always sorts.
+    /// row. An exact search of the same index in the filter limits the keys
+    /// the read visits. Any other index search in the filter runs first, and
+    /// the read skips the rows it rules out. The scan sorts the rows that
+    /// search selects instead when they are too few for the read to pay off,
+    /// or when the read visits a budget of index rows without filling the
+    /// limit, as when the selected rows hold the keys the read reaches last.
+    /// The read applies the rest of the filter to each row it reads, and
+    /// sorts instead when that keeps too few rows within a share of the
+    /// index. An index named in [`Self::with_ignored_scalar_indices`] never
+    /// serves the read or answers its filter. [`OrderedIndexMode::Off`]
+    /// always sorts.
     ///
     /// [`OrderedIndexMode::Required`] never sorts instead. When the scan
     /// cannot serve `order_by` from an index, planning fails with
@@ -310,14 +313,11 @@ impl Scanner {
     /// [`OrderedIndexDecline`] that says why. Under `Auto` and `Off`,
     /// [`Self::explain_plan`] with `verbose` prints the same reason after the
     /// plan. Under `Required`, `explain_plan` fails with the same error that
-    /// planning does. A required read applies the part of the filter the
-    /// index does not answer, including a search of another index, to each
-    /// row it reads, so a selective filter can make it read the whole index.
-    /// With [`Self::fast_search`], planning fails instead when the read would
-    /// apply an index search this way, because `fast_search` skips the
-    /// fragments that search's index does not cover. A scan without
-    /// `order_by` is not affected. Other uses of scalar indices are not
-    /// affected.
+    /// planning does. A required read skips the rows that the filter's index
+    /// searches rule out and applies the rest of the filter to each row it
+    /// reads, so a selective filter can make it read the whole index. A scan
+    /// without `order_by` is not affected. Other uses of scalar indices are
+    /// not affected.
     ///
     /// ```
     /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};
