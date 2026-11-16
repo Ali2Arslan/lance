@@ -198,7 +198,7 @@ impl Scanner {
         let indices = self.dataset.load_indices().await?;
         let mut checked = HashSet::new();
         for index in indices.iter() {
-            if index.fields != [field_id]
+            if index.keyed_field() != Some(field_id)
                 || index_name.is_some_and(|name| name != index.name)
                 || self.ignored_scalar_index_names.contains(&index.name)
                 || !checked.insert(index.name.as_str())
@@ -264,6 +264,7 @@ mod tests {
     use crate::dataset::transaction::{Operation, Transaction};
     use crate::dataset::{UpdateBuilder, WriteDestination, WriteParams};
     use crate::index::DatasetIndexExt;
+    use crate::utils::test::covering::declare_covering;
     use crate::{Dataset, Error};
 
     const ROWS: i32 = 300;
@@ -593,20 +594,21 @@ mod tests {
         assert_ordered_read(&dataset, configure, expect).await;
     }
 
-    async fn overlay_key(dataset: Dataset, old_key: i32, new_key: i32) -> Dataset {
+    /// Overwrites `column` with `value` in the row whose `ts` is `key`.
+    async fn overlay(dataset: Dataset, column: &str, key: i32, value: i32) -> Dataset {
         let batch = dataset
             .scan()
             .project(&["ts"])
             .unwrap()
             .with_row_address()
-            .filter(&format!("ts = {old_key}"))
+            .filter(&format!("ts = {key}"))
             .unwrap()
             .try_into_batch()
             .await
             .unwrap();
-        assert_eq!(batch["ts"].as_primitive::<Int32Type>().value(0), old_key);
+        assert_eq!(batch["ts"].as_primitive::<Int32Type>().value(0), key);
         let addr = batch[ROW_ADDR].as_primitive::<UInt64Type>().value(0);
-        let field_id = dataset.schema().field("ts").unwrap().id;
+        let field_id = dataset.schema().field(column).unwrap().id;
         let mut overlay = dataset
             .get_fragment(RowAddress::from(addr).fragment_id() as usize)
             .unwrap()
@@ -616,11 +618,11 @@ mod tests {
         let values = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 ROW_ADDR_FIELD.clone(),
-                Field::from(dataset.schema().field("ts").unwrap()),
+                Field::from(dataset.schema().field(column).unwrap()),
             ])),
             vec![
                 Arc::new(UInt64Array::from(vec![addr])),
-                Arc::new(Int32Array::from(vec![new_key])),
+                Arc::new(Int32Array::from(vec![value])),
             ],
         )
         .unwrap();
@@ -640,6 +642,31 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ordered_read_serves_a_covered_index_by_its_key() {
+        let mut dataset = dataset(WriteParams::default()).await;
+        let (ts_id, id_id) = declare_covering(&mut dataset, "ts", "id").await;
+        let index = dataset.load_indices_by_name(INDEX).await.unwrap().remove(0);
+        assert_eq!(index.fields, [ts_id, id_id]);
+        let node = "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10";
+        let configure = |scanner: &mut Scanner| {
+            order_by_ts(scanner.project(&["id", "ts"]).unwrap());
+        };
+        assert_ordered_read(&dataset, configure, Expect::OrderedScan(node)).await;
+
+        let dataset = overlay(dataset, "id", 4, -4).await;
+        let rows = assert_ordered_read(&dataset, configure, Expect::OrderedScan(node)).await;
+        assert!(
+            rows["id"]
+                .as_primitive::<Int32Type>()
+                .values()
+                .contains(&-4)
+        );
+
+        let dataset = overlay(dataset, "ts", 6, 1000).await;
+        assert_ordered_read(&dataset, configure, Expect::Sort).await;
     }
 
     #[derive(Debug)]
@@ -783,7 +810,7 @@ mod tests {
                 .await
             }
             IndexShape::NewerKeyOverlay => {
-                overlay_key(dataset(WriteParams::default()).await, 150, -1).await
+                overlay(dataset(WriteParams::default()).await, "ts", 150, -1).await
             }
             IndexShape::MissingIndexFiles => {
                 let mut dataset = write(tempdir.as_str(), WriteParams::default()).await;
