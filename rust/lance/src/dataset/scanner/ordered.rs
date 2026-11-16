@@ -426,7 +426,7 @@ impl Scanner {
         let mut ignored = Vec::new();
         let mut order_indices = indices
             .iter()
-            .filter(|index| index.fields == [field.id])
+            .filter(|index| index.keyed_field() == Some(field.id))
             .collect::<Vec<_>>();
         // The searched index goes first, so that its search limits the keys it reads
         // instead of masking a walk of another index.
