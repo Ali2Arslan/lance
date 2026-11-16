@@ -11,7 +11,9 @@ use datafusion::physical_plan::replace_children_if_necessary;
 use datafusion::{catalog::Session, execution::TaskContext, logical_expr::Expr};
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-    Statistics, filter::FilterExec, metrics::MetricsSet,
+    Statistics,
+    filter::{FilterExec, FilterExecBuilder},
+    metrics::MetricsSet,
 };
 use lance_core::{Result, error::DataFusionResult};
 use lance_datafusion::planner::Planner;
@@ -63,6 +65,19 @@ impl LanceFilterExec {
 
     pub fn expr(&self) -> &Expr {
         &self.expr
+    }
+
+    // Neither `ExecutionPlan::with_fetch` nor `ExecutionPlan::fetch` exposes this fetch. With
+    // the first, limit pushdown would fold the limit above any LanceFilterExec into it; with
+    // the second, it would drop the global limit, though the fetch bounds each partition alone.
+    pub(crate) fn with_fetch_limit(&self, fetch: usize) -> Result<Self> {
+        let filter = FilterExecBuilder::from(self.filter.as_ref())
+            .with_fetch(Some(fetch))
+            .build()?;
+        Ok(Self {
+            expr: self.expr.clone(),
+            filter: Arc::new(filter),
+        })
     }
 }
 
