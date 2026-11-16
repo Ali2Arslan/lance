@@ -318,15 +318,17 @@ impl Scanner {
     /// [`OrderedIndexMode::Required`] never sorts instead. When the scan
     /// cannot serve `order_by` from an index, planning fails with
     /// [`Error::InvalidInput`]. The error's source is the
-    /// [`OrderedIndexDecline`] that says why, and [`Self::explain_plan`] with
-    /// `verbose` prints the same reason under any mode. A required read
-    /// applies the part of the filter the index does not answer, including a
-    /// search of another index, to each row it reads, so a selective filter
-    /// can make it read the whole index. With [`Self::fast_search`], planning
-    /// fails instead when the read would apply an index search this way,
-    /// because `fast_search` skips the fragments that search's index does not
-    /// cover. A scan without `order_by` is not affected. Other uses of scalar
-    /// indices are not affected.
+    /// [`OrderedIndexDecline`] that says why. Under `Auto` and `Off`,
+    /// [`Self::explain_plan`] with `verbose` prints the same reason after the
+    /// plan. Under `Required`, `explain_plan` fails with the same error that
+    /// planning does. A required read applies the part of the filter the
+    /// index does not answer, including a search of another index, to each
+    /// row it reads, so a selective filter can make it read the whole index.
+    /// With [`Self::fast_search`], planning fails instead when the read would
+    /// apply an index search this way, because `fast_search` skips the
+    /// fragments that search's index does not cover. A scan without
+    /// `order_by` is not affected. Other uses of scalar indices are not
+    /// affected.
     ///
     /// ```
     /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};
