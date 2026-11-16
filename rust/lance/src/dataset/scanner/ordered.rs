@@ -1855,6 +1855,7 @@ mod tests {
     #[derive(Clone, Copy, Debug)]
     enum MaskData {
         Indexed,
+        IndexedId,
         Deleted,
         MostlyDeleted,
         Segmented,
@@ -1943,6 +1944,18 @@ mod tests {
                     .unwrap();
             }
             match self {
+                Self::IndexedId => {
+                    dataset
+                        .create_index(
+                            &["id"],
+                            IndexType::BTree,
+                            Some("id_idx".into()),
+                            &btree(),
+                            false,
+                        )
+                        .await
+                        .unwrap();
+                }
                 Self::Deleted => {
                     dataset.delete("id % 5 = 0").await.unwrap();
                 }
@@ -2043,6 +2056,7 @@ mod tests {
     #[case::hundredth_percent(MaskData::Indexed, "status = 'p001'", |row: &MaskRow| row.status() == Some("p001"), (10, 0), false, MaskPath::Sorted, "mask=[status = p001]@status_idx(Bitmap)")]
     #[case::required_small_mask(MaskData::Indexed, "status = 'p001'", |row: &MaskRow| row.status() == Some("p001"), (10, 0), false, MaskPath::Required, "mask=[status = p001]@status_idx(Bitmap)")]
     #[case::inexact(MaskData::Indexed, "v < 700", |row: &MaskRow| row.v < 700, (10, 0), false, MaskPath::Ordered, "mask=[v < 700]@v_idx(ZoneMap), residual=v < Int64(700)")]
+    #[case::search_of_another_btree(MaskData::IndexedId, "id < 5000", |row: &MaskRow| row.id < 5000, (10, 0), false, MaskPath::Ordered, "mask=[id < 5000]@id_idx(BTree)")]
     #[case::two_searches_of_the_order_index(MaskData::Indexed, "ts < 100 OR ts > 9900", |row: &MaskRow| row.ts < 100 || row.ts > 9900, (10, 0), false, MaskPath::Ordered, "mask=OR([ts < 100]@ts_idx(BTree),[ts > 9900]@ts_idx(BTree))")]
     #[case::mask_and_residual(MaskData::Indexed, "status = 'p50' AND id % 3 = 0", |row: &MaskRow| row.status() == Some("p50") && row.id % 3 == 0, (10, 0), false, MaskPath::Ordered, "mask=[status = p50]@status_idx(Bitmap), residual=CAST(id AS Int64) % Int64(3) = Int64(0)")]
     #[case::not_equal_with_nulls(MaskData::Indexed, "status != 'p50'", |row: &MaskRow| row.status().is_some_and(|status| status != "p50"), (10, 0), false, MaskPath::Ordered, "mask=NOT([status = p50]@status_idx(Bitmap))")]
@@ -2070,8 +2084,16 @@ mod tests {
         #[case] fast_search: bool,
         #[case] path: MaskPath,
         #[case] scan_line_end: &str,
+        #[values(false, true)] covered: bool,
     ) {
-        let dataset = data.dataset().await;
+        let mut dataset = data.dataset().await;
+        if covered {
+            cover_v(&mut dataset).await;
+            if let MaskData::IndexedId = data {
+                // Carrying `ts` does not make `id_idx` an index on `ts`.
+                declare_covering(&mut dataset, "id", "ts").await;
+            }
+        }
         let (limit, offset) = limit_offset;
         let configure = |scanner: &mut Scanner| {
             scanner
@@ -2164,8 +2186,12 @@ mod tests {
         #[case] status: &str,
         #[case] mask_rows: &str,
         #[case] fallback: &str,
+        #[values(false, true)] covered: bool,
     ) {
-        let dataset = data.dataset().await;
+        let mut dataset = data.dataset().await;
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let mut scanner = dataset.scan();
         scanner
             .project(&["id"])
@@ -2190,8 +2216,72 @@ mod tests {
         );
     }
 
+    #[rstest]
+    #[case::mask_index("status = 'p50'", |row: &MaskRow| row.status() == Some("p50"), r#"residual=status = Utf8("p50")"#)]
+    #[case::one_of_two_mask_indices("status = 'p50' AND age = 'old'", |row: &MaskRow| row.status() == Some("p50") && row.ts < OLD_TS, r#"mask=[age = old]@age_idx(Bitmap), residual=status = Utf8("p50")"#)]
     #[tokio::test]
-    async fn test_ordered_mask_from_another_index_on_the_order_column() {
+    async fn test_ordered_mask_skips_ignored_indices(
+        #[case] filter: &str,
+        #[case] keep: fn(&MaskRow) -> bool,
+        #[case] scan_line_end: &str,
+    ) {
+        let dataset = MaskData::Indexed.dataset().await;
+        let configure = |scanner: &mut Scanner| {
+            scanner
+                .project(&["id", "ts"])
+                .unwrap()
+                .filter(filter)
+                .unwrap()
+                .order_by(Some(vec![ColumnOrdering::desc_nulls_last("ts".into())]))
+                .unwrap()
+                .limit(Some(10), None)
+                .unwrap()
+                .with_ignored_scalar_indices(["status_idx"]);
+        };
+        let expected = mask_oracle(&dataset, keep, 10, 0).await;
+        assert!(!expected.is_empty(), "{filter} keeps live rows");
+        for mode in [
+            OrderedIndexMode::Auto,
+            OrderedIndexMode::Required,
+            OrderedIndexMode::Off,
+        ] {
+            let mut scanner = dataset.scan();
+            configure(&mut scanner);
+            scanner.ordered_index(mode);
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert!(!plan.contains("status_idx"), "{plan}");
+            let scan_line = plan
+                .lines()
+                .find(|line| line.trim_start().starts_with("OrderedIndexScan: "));
+            match mode {
+                OrderedIndexMode::Off => assert!(scan_line.is_none(), "{plan}"),
+                _ => assert!(
+                    scan_line.is_some_and(|line| line.ends_with(scan_line_end)),
+                    "{plan}"
+                ),
+            }
+            assert_eq!(
+                ids(&scanner.try_into_batch().await.unwrap()),
+                expected,
+                "{plan}"
+            );
+        }
+
+        let ignore_ts_idx = |scanner: &mut Scanner| {
+            configure(scanner);
+            scanner.with_ignored_scalar_indices(["status_idx", INDEX]);
+        };
+        let expect = Expect::Sort {
+            reason_prefix: IGNORED_TS_INDEX,
+        };
+        assert_ordered_read(&dataset, ignore_ts_idx, expect).await;
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_ordered_mask_from_another_index_on_the_order_column(
+        #[values(false, true)] covered: bool,
+    ) {
         let mut dataset = write("memory://", WriteParams::default()).await;
         dataset
             .create_index(
@@ -2203,6 +2293,9 @@ mod tests {
             )
             .await
             .unwrap();
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         dataset
             .create_index(
                 &["ts"],
