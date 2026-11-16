@@ -654,13 +654,38 @@ mod tests {
         .unwrap()
     }
 
+    #[rstest]
+    #[case::one_segment(
+        ONE_SEGMENT,
+        1,
+        "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10"
+    )]
+    #[case::every_segment_of_three(
+        SEGMENT_PER_FRAGMENT,
+        3,
+        "OrderedIndexScan: index=ts_idx, segments=3, order=[ts ASC NULLS LAST], fetch=10"
+    )]
+    #[case::one_segment_of_three(
+        SEGMENT_PER_FRAGMENT,
+        1,
+        "OrderedIndexScan: index=ts_idx, segments=3, order=[ts ASC NULLS LAST], fetch=10"
+    )]
     #[tokio::test]
-    async fn test_ordered_read_serves_a_covered_index_by_its_key() {
-        let mut dataset = dataset(WriteParams::default()).await;
+    async fn test_ordered_read_serves_a_covered_index_by_its_key(
+        #[case] segment_fragments: &[&[u32]],
+        #[case] covered_segments: usize,
+        #[case] node: &str,
+    ) {
+        let mut dataset = segmented_dataset(segment_fragments).await;
         let (ts_id, id_id) = declare_covering(&mut dataset, "ts", "id").await;
-        let index = dataset.load_indices_by_name(INDEX).await.unwrap().remove(0);
-        assert_eq!(index.fields, [ts_id, id_id]);
-        let node = "OrderedIndexScan: index=ts_idx, order=[ts ASC NULLS LAST], fetch=10";
+        for _ in 1..covered_segments {
+            declare_covering(&mut dataset, "ts", "id").await;
+        }
+        let segments = dataset.load_indices_by_name(INDEX).await.unwrap();
+        let covered = segments
+            .iter()
+            .filter(|segment| segment.fields == [ts_id, id_id]);
+        assert_eq!(covered.count(), covered_segments);
         let configure = |scanner: &mut Scanner| {
             order_by_ts(scanner.project(&["id", "ts"]).unwrap());
         };

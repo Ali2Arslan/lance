@@ -184,17 +184,17 @@ impl OrderedIndexScanExec {
         let mut scanned = RoaringBitmap::new();
         let mut scopes = Vec::with_capacity(segments.len());
         for segment in &segments {
-            if segment.name != first.name || segment.fields != first.fields {
+            if segment.name != first.name || segment.keyed_fields() != first.keyed_fields() {
                 return Err(Error::invalid_input(format!(
                     "ordered index scan merges the segments of one index, but segment {} is of \
-                     index '{}' on field ids {:?} and segment {} is of index '{}' on field ids \
-                     {:?}",
+                     index '{}' keyed on field ids {:?} and segment {} is of index '{}' keyed on \
+                     field ids {:?}",
                     first.uuid,
                     first.name,
-                    first.fields,
+                    first.keyed_fields(),
                     segment.uuid,
                     segment.name,
-                    segment.fields
+                    segment.keyed_fields()
                 )));
             }
             let Some(coverage) = &segment.fragment_bitmap else {
@@ -2045,6 +2045,11 @@ mod tests {
         |segments: &mut Vec<IndexMetadata>| segments[1].name = "other_idx".into(),
         |error: &Error| matches!(error, Error::InvalidInput { .. }),
         "is of index 'other_idx'"
+    )]
+    #[case::segment_keyed_on_two_columns(
+        |segments: &mut Vec<IndexMetadata>| segments[1].fields.extend_from_within(..),
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "field ids [0, 0]"
     )]
     #[case::fragments_in_two_segments(
         |segments: &mut Vec<IndexMetadata>| {
