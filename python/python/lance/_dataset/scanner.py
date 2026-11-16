@@ -1015,11 +1015,15 @@ class ScannerBuilder:
 
         With ``"auto"``, the default, a scan with a limit that orders by one column
         with a B-tree index reads that index in key order and stops after
-        ``offset + limit`` live rows, instead of sorting every row.  This applies
-        when the scan has no filter, or a filter that searches no index except
-        with one exact search of the same index.  The read applies the rest of
-        the filter to each row it reads, and sorts instead when that keeps too
-        few rows within a share of the index.  An index named in
+        ``offset + limit`` live rows, instead of sorting every row.  An exact
+        search of the same index in the filter limits the keys the read visits.
+        Any other index search in the filter runs first, and the read skips the
+        rows it rules out.  The scan sorts the rows that search selects instead
+        when they are too few for the read to pay off, or when the read visits a
+        budget of index rows without filling the limit, as when the selected rows
+        hold the keys the read reaches last.  The read applies the rest of the
+        filter to each row it reads, and sorts instead when that keeps too few rows
+        within a share of the index.  An index named in
         :meth:`ignored_scalar_indices` never serves the read.  ``"off"`` always
         sorts.
 
@@ -1028,13 +1032,10 @@ class ScannerBuilder:
         why, for example that the scan has no limit.  Under ``"auto"`` and
         ``"off"``, ``explain_plan(verbose=True)`` prints the same reason after
         the plan.  Under ``"required"``, ``explain_plan`` raises the same
-        ``ValueError`` that planning does.  A required read applies the part of
-        the filter the index does not answer, including a search of another
-        index, to each row it reads, so a selective filter can make it read the
-        whole index.  With :meth:`fast_search`, it raises instead when the read
-        would apply an index search this way, because ``fast_search`` skips the
-        fragments that search's index does not cover.  A scan without
-        ``order_by`` is not affected.
+        ``ValueError`` that planning does.  A required read skips the rows that
+        the filter's index searches rule out and applies the rest of the filter
+        to each row it reads, so a selective filter can make it read the whole
+        index.  A scan without ``order_by`` is not affected.
         Names are case-insensitive, and the scanner rejects any other name with a
         ``ValueError``.  Other uses of scalar indices are not affected.
         """

@@ -33,10 +33,8 @@ public class ScanOptions {
     AUTO("auto"),
     /**
      * Read the index in key order, and throw {@link IllegalArgumentException} when the scan cannot.
-     * Unlike {@link #AUTO}, the read never sorts instead, so a selective filter can make it read
-     * the whole index. It also applies a search of another index in the filter to each row it
-     * reads, where {@code AUTO} sorts. With {@link Builder#fastSearch(boolean)}, it throws when the
-     * read would apply such a search.
+     * Unlike {@link #AUTO}, the read never sorts instead, so a selective filter, or a search of
+     * another index in the filter that selects few rows, can make it read the whole index.
      */
     REQUIRED("required");
 
@@ -1063,20 +1061,22 @@ public class ScanOptions {
      *
      * <p>With {@link OrderedIndexMode#AUTO}, the default, a scan with a limit that orders by one
      * column with a B-tree index reads that index in key order and stops after {@code offset +
-     * limit} live rows, instead of sorting every row. This applies when the scan has no filter, or
-     * a filter that searches no index except with one exact search of the same index. The read
-     * applies the rest of the filter to each row it reads, and sorts instead when that keeps too
-     * few rows within a share of the index. An index named in {@link #ignoredScalarIndices(List)}
-     * never serves the read. {@link OrderedIndexMode#OFF} always sorts.
+     * limit} live rows, instead of sorting every row. An exact search of the same index in the
+     * filter limits the keys the read visits. Any other index search in the filter runs first, and
+     * the read skips the rows it rules out. The scan sorts the rows that search selects instead
+     * when they are too few for the read to pay off, or when the read visits a budget of index rows
+     * without filling the limit, as when the selected rows hold the keys the read reaches last. The
+     * read applies the rest of the filter to each row it reads, and sorts instead when that keeps
+     * too few rows within a share of the index. An index named in {@link
+     * #ignoredScalarIndices(List)} never serves the read. {@link OrderedIndexMode#OFF} always
+     * sorts.
      *
      * <p>{@link OrderedIndexMode#REQUIRED} never sorts instead. When the scan cannot serve the
      * column orderings from an index, it throws {@link IllegalArgumentException}. The message says
-     * why, for example that the scan has no limit. A required read applies the part of the filter
-     * the index does not answer, including a search of another index, to each row it reads, so a
-     * selective filter can make it read the whole index. With {@link #fastSearch(boolean)}, it
-     * throws instead when the read would apply an index search this way, because {@code fastSearch}
-     * skips the fragments that search's index does not cover. A scan without column orderings is
-     * not affected. Other uses of scalar indices are not affected.
+     * why, for example that the scan has no limit. A required read skips the rows that the filter's
+     * index searches rule out and applies the rest of the filter to each row it reads, so a
+     * selective filter can make it read the whole index. A scan without column orderings is not
+     * affected. Other uses of scalar indices are not affected.
      *
      * @param orderedIndex the ordered index mode. Default is {@link OrderedIndexMode#AUTO}.
      * @return Builder instance for method chaining.

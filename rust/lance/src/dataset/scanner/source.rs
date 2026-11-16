@@ -325,6 +325,35 @@ impl Scanner {
         }
     }
 
+    pub(super) async fn scalar_index_search(
+        &self,
+        index_query: ScalarIndexExpr,
+        fragments: &[Fragment],
+    ) -> Result<ScalarIndexExec> {
+        let target_fragments = fragments
+            .iter()
+            .map(|fragment| fragment.id as u32)
+            .collect::<RoaringBitmap>();
+        let fragment_scope =
+            ScalarIndexExec::fragments_covered_by_index_query(&index_query, self.dataset.as_ref())
+                .await?
+                & target_fragments;
+        let mut exec = ScalarIndexExec::new(
+            self.dataset.clone(),
+            index_query,
+            self.index_expr_result_format(),
+        )
+        .with_fragment_scope(fragment_scope);
+        if let Some(segment_uuids) = self
+            .scalar_index_selection
+            .as_ref()
+            .and_then(|selection| selection.segment_uuids.clone())
+        {
+            exec = exec.with_segment_uuids(segment_uuids);
+        }
+        Ok(exec)
+    }
+
     // A plain-scan external row mask is fed as the FilteredReadExec row source so
     // only masked rows are read, with any SQL filter applied as a refine on top.
     // Vector and full-text searches apply the mask via their own prefilter paths
@@ -461,7 +490,6 @@ impl Scanner {
             }
         }
 
-        let result_format = self.index_expr_result_format();
         let index_input = match self.external_row_mask.as_deref() {
             Some(mask) if use_external_mask => Some(self.mask_as_take_input(mask.clone())?),
             _ => {
@@ -469,26 +497,10 @@ impl Scanner {
                     let target_fragments = read_options
                         .fragments
                         .as_ref()
-                        .unwrap_or_else(|| self.dataset.fragments())
-                        .iter()
-                        .map(|fragment| fragment.id as u32)
-                        .collect::<RoaringBitmap>();
-                    let fragment_scope = ScalarIndexExec::fragments_covered_by_index_query(
-                        &index_query,
-                        self.dataset.as_ref(),
-                    )
-                    .await?
-                        & target_fragments;
-                    let mut exec =
-                        ScalarIndexExec::new(self.dataset.clone(), index_query, result_format)
-                            .with_fragment_scope(fragment_scope);
-                    if let Some(segment_uuids) = self
-                        .scalar_index_selection
-                        .as_ref()
-                        .and_then(|selection| selection.segment_uuids.clone())
-                    {
-                        exec = exec.with_segment_uuids(segment_uuids);
-                    }
+                        .unwrap_or_else(|| self.dataset.fragments());
+                    let exec = self
+                        .scalar_index_search(index_query, target_fragments)
+                        .await?;
                     Some(Arc::new(exec) as Arc<dyn ExecutionPlan>)
                 } else {
                     None

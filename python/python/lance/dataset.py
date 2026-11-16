@@ -720,11 +720,10 @@ class LanceDataset(pa.dataset.Dataset):
             when it can serve the ordering, and ``"off"`` always sorts.
             ``"required"`` reads the index, and raises ``ValueError`` with the
             reason instead of sorting when it cannot.  Unlike ``"auto"``, it never
-            sorts instead, so a selective filter can make it read the whole index.
-            It also applies a search of another index in the filter to each row it
-            reads.  With ``fast_search``, it raises instead of applying such a
-            search.  An index named in ``ignored_scalar_indices`` never serves the
-            read.  See ``ScannerBuilder.ordered_index`` for more information.
+            sorts instead, so a selective filter, or a search of another index in
+            the filter that selects few rows, can make it read the whole index.  An
+            index named in ``ignored_scalar_indices`` never serves the read.  See
+            ``ScannerBuilder.ordered_index`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
             fetches non-query columns using a take operation after the filter.  This
