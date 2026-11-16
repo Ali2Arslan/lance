@@ -358,9 +358,9 @@ impl Scanner {
         let (index_name, query) = match search {
             None => (None, None),
             Some(search)
-                if indices
-                    .iter()
-                    .any(|index| index.name == search.index_name && index.fields == [field.id]) =>
+                if indices.iter().any(|index| {
+                    index.name == search.index_name && index.keyed_field() == Some(field.id)
+                }) =>
             {
                 (Some(search.index_name.clone()), Some(search.query.clone()))
             }
@@ -677,6 +677,14 @@ mod tests {
         dataset
     }
 
+    /// Declares `v` as a covering column of every segment of `ts_idx`.
+    async fn cover_v(dataset: &mut Dataset) {
+        let segments = dataset.load_indices_by_name(INDEX).await.unwrap().len();
+        for _ in 0..segments {
+            declare_covering(dataset, "ts", "v").await;
+        }
+    }
+
     async fn scan(
         dataset: &Dataset,
         configure: &impl Fn(&mut Scanner),
@@ -779,8 +787,12 @@ mod tests {
             Some("ts IS NULL")
         )]
         filter: Option<&str>,
+        #[values(false, true)] covered: bool,
     ) {
-        let dataset = dataset(WriteParams::default()).await;
+        let mut dataset = dataset(WriteParams::default()).await;
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let ordering = ColumnOrdering {
             ascending,
             nulls_first,
@@ -909,8 +921,12 @@ mod tests {
     async fn test_ordered_decline_scan_options(
         #[case] decline: fn(&mut Scanner),
         #[case] reason: &str,
+        #[values(false, true)] covered: bool,
     ) {
-        let dataset = dataset(WriteParams::default()).await;
+        let mut dataset = dataset(WriteParams::default()).await;
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let configure = |scanner: &mut Scanner| {
             decline(order_by_ts(scanner));
         };
@@ -990,6 +1006,7 @@ mod tests {
         #[case] ignored: &str,
         #[case] segment_fragments: &[&[u32]],
         #[case] expect: Expect<'static>,
+        #[values(false, true)] covered: bool,
     ) {
         let mut dataset = segmented_dataset("memory://", segment_fragments).await;
         dataset
@@ -1002,6 +1019,9 @@ mod tests {
             )
             .await
             .unwrap();
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let configure = |scanner: &mut Scanner| {
             order_by_ts(scanner).with_ignored_scalar_indices([ignored]);
         };
@@ -1387,12 +1407,13 @@ mod tests {
             IndexShape::FilterOnAnotherIndex
         )]
         shape: IndexShape,
+        #[values(false, true)] covered: bool,
     ) {
         let mut order_column = "ts";
         let mut full_text_query = None;
         let mut filter = None;
         let tempdir = TempStrDir::default();
-        let dataset = match shape {
+        let mut dataset = match shape {
             IndexShape::AppendedFragment | IndexShape::FragmentSubsetOfPartialIndex => {
                 let mut dataset = dataset(WriteParams::default()).await;
                 let batch = rows(ROWS..ROWS + 30);
@@ -1517,6 +1538,9 @@ mod tests {
                 dataset
             }
         };
+        if covered {
+            cover_v(&mut dataset).await;
+        }
         let fragments = match shape {
             IndexShape::FragmentSubsetOfPartialIndex => Some(dataset.fragments()[..3].to_vec()),
             _ => None,
