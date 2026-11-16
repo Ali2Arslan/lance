@@ -877,9 +877,13 @@ impl Scanner {
             },
             None => (None, None),
         };
-        let (ordered_scan, residual_read) = match ordered_read {
-            Some(OrderedRead { scan, residual }) => (Some(scan), residual),
-            None => (None, None),
+        let (ordered_scan, residual_read, fallback_limit) = match ordered_read {
+            Some(OrderedRead {
+                scan,
+                residual,
+                fallback_limit,
+            }) => (Some(scan), residual, fallback_limit),
+            None => (None, None, None),
         };
         let mut use_limit_node = true;
         let mut is_index_ordered = false;
@@ -1117,10 +1121,8 @@ impl Scanner {
         for rule in optimizer.rules {
             plan = rule.optimize(plan, &options)?;
         }
-        if let Some(residual_read) = &residual_read {
-            plan = self
-                .with_sort_fallback(plan, residual_read, session)
-                .await?;
+        if let Some(limit) = fallback_limit {
+            plan = self.with_sort_fallback(plan, limit, session).await?;
         }
 
         Ok((plan, ordered_index_decline))
