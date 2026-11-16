@@ -7333,6 +7333,9 @@ def test_ordered_index_required_without_limit(ts_index_dataset):
     )
     with pytest.raises(ValueError, match=re.escape(reason)):
         ts_index_dataset.to_table(order_by=["ts"], ordered_index="required")
+    required = ts_index_dataset.scanner(order_by=["ts"], ordered_index="required")
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        required.explain_plan(verbose=True)
     plan = ts_index_dataset.scanner(order_by=["ts"]).explain_plan(verbose=True)
     assert plan.endswith(reason + "\n") and "SortExec" in plan, plan
 

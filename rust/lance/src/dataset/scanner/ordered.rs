@@ -715,13 +715,13 @@ mod tests {
         let verbose_plan = scanner.explain_plan(true).await.unwrap();
         let required_plan = scanner
             .ordered_index(OrderedIndexMode::Required)
-            .explain_plan(false)
+            .explain_plan(true)
             .await;
         match expect {
             Expect::OrderedScan(node) => {
                 assert!(plan.contains(node) && !plan.contains("SortExec"), "{plan}");
                 assert!(!verbose_plan.contains("declined"), "{verbose_plan}");
-                assert_eq!(required_plan.unwrap(), plan);
+                assert_eq!(required_plan.unwrap(), verbose_plan);
             }
             Expect::Sort { reason_prefix } => {
                 assert_eq!(plan, sorted_plan);
@@ -736,6 +736,8 @@ mod tests {
                 let error = required_plan.unwrap_err();
                 assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
                 assert!(error.to_string().contains(&declined), "{error}");
+                let planning_error = scanner.create_plan().await.unwrap_err();
+                assert_eq!(error.to_string(), planning_error.to_string());
             }
         }
         assert_eq!(rows, sorted_rows);
