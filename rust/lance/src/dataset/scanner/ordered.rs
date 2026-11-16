@@ -27,7 +27,9 @@ use crate::io::exec::ordered_index_scan::OrderedIndexScanExec;
 ///
 /// With [`OrderedIndexMode::Required`], planning fails with an
 /// [`Error::InvalidInput`] whose source is this value.
-/// [`Scanner::explain_plan`] with `verbose` prints it after the plan.
+/// [`Scanner::explain_plan`] with `verbose` prints it after the plan under
+/// [`OrderedIndexMode::Auto`] and [`OrderedIndexMode::Off`]. Under `Required`,
+/// `explain_plan` fails with the same error that planning does.
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum OrderedIndexDecline {
@@ -264,10 +266,11 @@ impl Scanner {
     /// [`OrderedIndexMode::Off`] always sorts. [`OrderedIndexMode::Required`]
     /// plans as `Auto` does, but when the scan cannot serve `order_by` from an
     /// index, planning fails with [`Error::InvalidInput`] instead of sorting.
-    /// The error's source is the [`OrderedIndexDecline`] that says why, and
-    /// [`Self::explain_plan`] with `verbose` prints the same reason under any
-    /// mode. A scan without `order_by` is not affected. Other uses of scalar
-    /// indices are not affected.
+    /// The error's source is the [`OrderedIndexDecline`] that says why. Under
+    /// `Auto` and `Off`, [`Self::explain_plan`] with `verbose` prints the same
+    /// reason after the plan. Under `Required`, `explain_plan` fails with the
+    /// same error that planning does. A scan without `order_by` is not
+    /// affected. Other uses of scalar indices are not affected.
     ///
     /// ```
     /// # use lance::dataset::scanner::{ColumnOrdering, OrderedIndexMode};

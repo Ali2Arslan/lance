@@ -1021,8 +1021,10 @@ class ScannerBuilder:
         the read.  ``"off"`` always sorts.  ``"required"`` plans as ``"auto"``
         does, but when the scan cannot serve ``order_by`` from an index, it raises
         ``ValueError`` instead of sorting.  The message says why, for example that
-        the scan has no limit, and ``explain_plan(verbose=True)`` prints the same
-        reason under any mode.  A scan without ``order_by`` is not affected.
+        the scan has no limit.  Under ``"auto"`` and ``"off"``,
+        ``explain_plan(verbose=True)`` prints the same reason after the plan.
+        Under ``"required"``, ``explain_plan`` raises the same ``ValueError`` that
+        planning does.  A scan without ``order_by`` is not affected.
         Names are case-insensitive, and the scanner rejects any other name with a
         ``ValueError``.  Other uses of scalar indices are not affected.
         """
