@@ -209,7 +209,14 @@ fn age(ts: u64) -> &'static str {
     }
 }
 
-fn with_mask_columns(rows: impl RecordBatchReader) -> impl RecordBatchReader {
+// The age of an appended row starts with this, so that a mask of the oldest indexed rows selects
+// none of the appended ones unless it names their ages too.
+const APPENDED_AGE: &str = "appended ";
+
+fn with_mask_columns(
+    rows: impl RecordBatchReader,
+    age_prefix: &'static str,
+) -> impl RecordBatchReader {
     let mut fields = rows.schema().fields().to_vec();
     fields.push(Arc::new(Field::new("status", DataType::Utf8, false)));
     fields.push(Arc::new(Field::new("age", DataType::Utf8, false)));
@@ -225,7 +232,7 @@ fn with_mask_columns(rows: impl RecordBatchReader) -> impl RecordBatchReader {
                 ids.iter().copied().map(status),
             )));
             columns.push(Arc::new(StringArray::from_iter_values(
-                ts.iter().copied().map(age),
+                ts.iter().map(|&ts| format!("{age_prefix}{}", age(ts))),
             )));
             RecordBatch::try_new(schema.clone(), columns)
         }
@@ -251,6 +258,7 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
                     RowCount::from(100_000),
                     BatchCount::from(batches_per_segment),
                 ),
+            "",
         )
     };
     let params = WriteParams {
@@ -297,6 +305,54 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
         segments as usize
     );
     dataset
+}
+
+/// Appends rows that every index misses.
+async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
+    let data = with_mask_columns(
+        gen_batch()
+            .with_seed(Seed::from(seed))
+            .col("ts", array::rand::<UInt64Type>())
+            .col("id", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(100_000), BatchCount::from(batches)),
+        APPENDED_AGE,
+    );
+    let params = WriteParams {
+        max_rows_per_file: 1_000_000,
+        ..Default::default()
+    };
+    dataset.append(data, Some(params)).await.unwrap();
+}
+
+/// Indexes the appended rows' ages, so that a mask on `age` is exact over
+/// every fragment.
+async fn index_ages(dataset: &mut Dataset) {
+    dataset
+        .optimize_indices(&OptimizeOptions::append().index_names(vec!["age_idx".into()]))
+        .await
+        .unwrap();
+}
+
+/// The `age` filters of the anti-correlated masks at an unindexed share: the
+/// oldest 0.01% and 1% of the indexed rows, which `ORDER BY ts DESC` reaches
+/// last, alone and with the appended rows of the same ages.
+fn oldest_masks() -> Vec<(String, String)> {
+    let ages = ["0-0.01%", "0.01-0.03%", "0.03-0.06%", "0.06-1%"];
+    [("0.01%", &ages[..1]), ("1%", &ages[..])]
+        .into_iter()
+        .flat_map(|(share, ages)| {
+            let indexed = ages.iter().map(|age| format!("'{age}'"));
+            let appended = ages.iter().map(|age| format!("'{APPENDED_AGE}{age}'"));
+            let filter = |ages: Vec<String>| format!("age IN ({})", ages.join(", "));
+            [
+                (format!("oldest_{share}"), filter(indexed.clone().collect())),
+                (
+                    format!("oldest_{share}_and_appended"),
+                    filter(indexed.chain(appended).collect()),
+                ),
+            ]
+        })
+        .collect()
 }
 
 async fn ordered_limit(dataset: &Dataset, configure: impl Fn(&mut Scanner)) {
@@ -430,6 +486,76 @@ fn bench_ordered_limit(c: &mut Criterion) {
                     });
                 },
             );
+        }
+        if segments > 1 {
+            continue;
+        }
+        let mut appended = dataset.clone();
+        let mut appended_batches = 0;
+        for (share, total_batches) in [
+            ("1%", 1),
+            ("9%", 10),
+            ("25%", 33),
+            ("49%", 96),
+            ("51%", 104),
+        ] {
+            let seed = DEFAULT_SEED.0 + 1_000 + u64::from(total_batches);
+            rt.block_on(append_unindexed(
+                &mut appended,
+                total_batches - appended_batches,
+                seed,
+            ));
+            appended_batches = total_batches;
+            // While `age_idx` misses the appended rows, the read of them checks each one
+            // against an oldest mask and yields no row until it has read them all.
+            let stale_mask = appended.clone();
+            rt.block_on(index_ages(&mut appended));
+            let mut cases = vec![(String::new(), None, &appended)];
+            if share == "9%" {
+                cases.push((
+                    "_mask_50%".to_string(),
+                    Some("status = '50%'".to_string()),
+                    &appended,
+                ));
+            }
+            if matches!(share, "9%" | "49%") {
+                cases.extend(
+                    oldest_masks()
+                        .into_iter()
+                        .map(|(name, filter)| (format!("_{name}"), Some(filter), &appended)),
+                );
+            }
+            if share == "49%" {
+                cases.extend(
+                    oldest_masks()
+                        .into_iter()
+                        .filter(|(name, _)| !name.ends_with("_and_appended"))
+                        .map(|(name, filter)| {
+                            (format!("_{name}_stale_mask"), Some(filter), &stale_mask)
+                        }),
+                );
+            }
+            for (case, filter, dataset) in &cases {
+                for (mode, suffix) in [
+                    (OrderedIndexMode::Auto, ""),
+                    (OrderedIndexMode::Off, "_off"),
+                ] {
+                    group.bench_with_input(
+                        BenchmarkId::new(format!("unindexed_{share}{case}{suffix}"), segments),
+                        *dataset,
+                        |b, dataset| {
+                            b.iter(|| {
+                                rt.block_on(ordered_limit(dataset, |scanner| {
+                                    scanner.ordered_index(mode);
+                                    if let Some(filter) = filter {
+                                        scanner.filter(filter).unwrap();
+                                    }
+                                }))
+                            });
+                        },
+                    );
+                }
+            }
         }
     }
     group.finish();

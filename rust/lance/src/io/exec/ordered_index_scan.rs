@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Waker;
 
 use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -46,6 +47,7 @@ use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
 use futures::future::{self, try_join_all};
+use futures::task::AtomicWaker;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
@@ -176,6 +178,12 @@ impl IndexMask {
         }
     }
 
+    /// Whether a read with this mask may stop short of its fetch so that the
+    /// sort runs instead.
+    pub(crate) fn may_sort(&self) -> bool {
+        matches!(self.read, MaskedRead::MaySort)
+    }
+
     /// Runs the search and returns the rows it lets through with the row
     /// counts of the fragments in `scope`, or with `None` when one of those
     /// fragments does not record its physical row count.
@@ -289,17 +297,20 @@ fn visit_budget(segments: usize, fetch: usize, index_rows: u64, mask_rows: u64) 
     (budget <= MASK_SORT_VISITS_PER_ROW * mask_rows as f64).then(|| budget.ceil() as usize)
 }
 
-struct VisitBudget {
+/// The index rows a masked read may visit, and whether it stopped short of
+/// its fetch. A read that merges in the fragments its index misses finds the
+/// budget of [`SharedVisitBudgetExec`](super::ordered_merge::SharedVisitBudgetExec)
+/// in its task context, so that its stop short also stops the merge.
+#[derive(Debug, Default)]
+pub(crate) struct VisitBudget {
     remaining: AtomicUsize,
     is_spent: AtomicBool,
+    spend_waker: AtomicWaker,
 }
 
 impl VisitBudget {
-    fn new(visits: usize) -> Self {
-        Self {
-            remaining: AtomicUsize::new(visits),
-            is_spent: AtomicBool::new(false),
-        }
+    fn grant(&self, visits: usize) {
+        self.remaining.fetch_add(visits, Ordering::Relaxed);
     }
 
     fn remaining(&self) -> usize {
@@ -314,12 +325,19 @@ impl VisitBudget {
             });
     }
 
-    fn mark_spent(&self) {
+    pub(crate) fn mark_spent(&self) {
         self.is_spent.store(true, Ordering::Relaxed);
+        self.spend_waker.wake();
     }
 
-    fn is_spent(&self) -> bool {
+    pub(crate) fn is_spent(&self) -> bool {
         self.is_spent.load(Ordering::Relaxed)
+    }
+
+    /// Whether the budget is spent. If it is not, `waker` wakes once it is.
+    pub(crate) fn is_spent_or_wake(&self, waker: &Waker) -> bool {
+        self.spend_waker.register(waker);
+        self.is_spent()
     }
 }
 
@@ -580,6 +598,10 @@ impl OrderedIndexScanExec {
                 }
                 let budget = match (mask.read, self.fetch) {
                     (MaskedRead::MaySort, Some(fetch)) => {
+                        let budget = context
+                            .session_config()
+                            .get_extension::<VisitBudget>()
+                            .unwrap_or_default();
                         let Some(visits) = rows.and_then(|rows| {
                             visit_budget(
                                 self.segments.len(),
@@ -588,6 +610,7 @@ impl OrderedIndexScanExec {
                                 rows.mask_rows,
                             )
                         }) else {
+                            budget.mark_spent();
                             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                                 schema,
                                 stream::empty(),
@@ -596,7 +619,8 @@ impl OrderedIndexScanExec {
                         self.metrics
                             .new_count("visit_budget", partition)
                             .add(visits);
-                        Some(Arc::new(VisitBudget::new(visits)))
+                        budget.grant(visits);
+                        Some(budget)
                     }
                     _ => None,
                 };
@@ -2260,7 +2284,8 @@ mod tests {
         .await
         .unwrap();
         let schema = plan.schema();
-        let budget = Arc::new(VisitBudget::new(1));
+        let budget = Arc::new(VisitBudget::default());
+        budget.grant(1);
         let spends_the_budget = LiveRows {
             batches: page(&schema, &[0, 1]),
             dataset,
@@ -2312,7 +2337,8 @@ mod tests {
         let mut store = dataset.object_store.as_ref().clone();
         store.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy.clone()));
         dataset.object_store = Arc::new(store);
-        let budget = Arc::new(VisitBudget::new(5));
+        let budget = Arc::new(VisitBudget::default());
+        budget.grant(5);
         let other_segment = budget.clone();
         policy.lock().unwrap().set_before_policy(
             "another segment spends the budget",

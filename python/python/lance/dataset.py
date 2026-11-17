@@ -717,12 +717,17 @@ class LanceDataset(pa.dataset.Dataset):
         ordered_index: str, default None
             Whether a scan with ``order_by`` and a limit may read a B-tree index in
             key order instead of sorting.  ``"auto"``, the default, reads the index
-            when it can serve the ordering, and ``"off"`` always sorts.
+            when it can serve the ordering, and ``"off"`` always sorts.  The scan
+            sorts the rows of fragments the index does not cover, as rows appended
+            since the index was last optimized, and merges them into the read,
+            unless they hold more than half of the live rows.
             ``"required"`` reads the index, and raises ``ValueError`` with the
             reason instead of sorting when it cannot.  Unlike ``"auto"``, it never
             sorts instead, so a selective filter, or a search of another index in
-            the filter that selects few rows, can make it read the whole index.  An
-            index named in ``ignored_scalar_indices`` never serves the read.  See
+            the filter that selects few rows, can make it read the whole index.  It
+            merges in the rows of fragments the index does not cover however many
+            they are, unless the index covers none of the live rows.  An index
+            named in ``ignored_scalar_indices`` never serves the read.  See
             ``ScannerBuilder.ordered_index`` for more information.
         late_materialization: bool or List[str], default None
             Allows custom control over late materialization.  Late materialization
