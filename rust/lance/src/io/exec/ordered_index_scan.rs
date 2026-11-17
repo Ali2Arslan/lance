@@ -176,35 +176,22 @@ impl IndexMask {
         }
     }
 
-    pub(crate) fn label(&self) -> &str {
-        &self.label
-    }
-
-    pub(crate) fn search(&self) -> &Arc<dyn ExecutionPlan> {
-        &self.search
-    }
-
-    pub(crate) fn with_search(&self, search: Arc<dyn ExecutionPlan>) -> Self {
-        Self {
-            search,
-            ..self.clone()
-        }
-    }
-
     /// Whether a read with this mask may stop short of its fetch so that the
     /// sort runs instead.
     pub(crate) fn may_sort(&self) -> bool {
         matches!(self.read, MaskedRead::MaySort)
     }
 
-    /// Runs the search and returns the rows it lets through in the fragments
-    /// in `scope`.
-    pub(crate) async fn select(
+    /// Runs the search and returns the rows it lets through with the row
+    /// counts of the fragments in `scope`, or with `None` when one of those
+    /// fragments does not record its physical row count.
+    async fn evaluate(
         &self,
+        dataset: &Dataset,
         scope: &RoaringBitmap,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> Result<RowAddrMask> {
+    ) -> Result<(RowAddrMask, Option<ScopeRows>)> {
         let batch = self
             .search
             .execute(partition, context)?
@@ -221,24 +208,11 @@ impl IndexMask {
         for fragment_id in scope - &indexed {
             unindexed.insert_fragment(fragment_id);
         }
-        Ok(match self.unindexed {
+        let selected = match self.unindexed {
             UnindexedFragments::Emit => result.upper.also_allow(unindexed),
             UnindexedFragments::Skip => result.upper.also_block(unindexed),
         }
-        .also_allow(self.stale_rows.clone()))
-    }
-
-    /// Runs the search and returns the rows it lets through with the row
-    /// counts of the fragments in `scope`, or with `None` when one of those
-    /// fragments does not record its physical row count.
-    async fn evaluate(
-        &self,
-        dataset: &Dataset,
-        scope: &RoaringBitmap,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> Result<(RowAddrMask, Option<ScopeRows>)> {
-        let selected = self.select(scope, partition, context).await?;
+        .also_allow(self.stale_rows.clone());
         let Some(fragments) = dataset
             .fragments()
             .iter()

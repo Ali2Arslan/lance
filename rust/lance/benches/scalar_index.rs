@@ -209,7 +209,14 @@ fn age(ts: u64) -> &'static str {
     }
 }
 
-fn with_mask_columns(rows: impl RecordBatchReader) -> impl RecordBatchReader {
+// The age of an appended row starts with this, so that a mask of the oldest indexed rows selects
+// none of the appended ones unless it names their ages too.
+const APPENDED_AGE: &str = "appended ";
+
+fn with_mask_columns(
+    rows: impl RecordBatchReader,
+    age_prefix: &'static str,
+) -> impl RecordBatchReader {
     let mut fields = rows.schema().fields().to_vec();
     fields.push(Arc::new(Field::new("status", DataType::Utf8, false)));
     fields.push(Arc::new(Field::new("age", DataType::Utf8, false)));
@@ -225,7 +232,7 @@ fn with_mask_columns(rows: impl RecordBatchReader) -> impl RecordBatchReader {
                 ids.iter().copied().map(status),
             )));
             columns.push(Arc::new(StringArray::from_iter_values(
-                ts.iter().copied().map(age),
+                ts.iter().map(|&ts| format!("{age_prefix}{}", age(ts))),
             )));
             RecordBatch::try_new(schema.clone(), columns)
         }
@@ -251,6 +258,7 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
                     RowCount::from(100_000),
                     BatchCount::from(batches_per_segment),
                 ),
+            "",
         )
     };
     let params = WriteParams {
@@ -299,6 +307,8 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     dataset
 }
 
+/// Appends rows that `ts_idx` and `status_idx` miss, and indexes their ages,
+/// so that a mask on `age` is exact over every fragment.
 async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
     let data = with_mask_columns(
         gen_batch()
@@ -306,12 +316,39 @@ async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
             .col("ts", array::rand::<UInt64Type>())
             .col("id", array::step::<UInt64Type>())
             .into_reader_rows(RowCount::from(100_000), BatchCount::from(batches)),
+        APPENDED_AGE,
     );
     let params = WriteParams {
         max_rows_per_file: 1_000_000,
         ..Default::default()
     };
     dataset.append(data, Some(params)).await.unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::append().index_names(vec!["age_idx".into()]))
+        .await
+        .unwrap();
+}
+
+/// The `age` filters of the anti-correlated masks at an unindexed share: the
+/// oldest 0.01% and 1% of the indexed rows, which `ORDER BY ts DESC` reaches
+/// last, alone and with the appended rows of the same ages.
+fn oldest_masks() -> Vec<(String, String)> {
+    let ages = ["0-0.01%", "0.01-0.03%", "0.03-0.06%", "0.06-1%"];
+    [("0.01%", &ages[..1]), ("1%", &ages[..])]
+        .into_iter()
+        .flat_map(|(share, ages)| {
+            let indexed = ages.iter().map(|age| format!("'{age}'"));
+            let appended = ages.iter().map(|age| format!("'{APPENDED_AGE}{age}'"));
+            let filter = |ages: Vec<String>| format!("age IN ({})", ages.join(", "));
+            [
+                (format!("oldest_{share}"), filter(indexed.clone().collect())),
+                (
+                    format!("oldest_{share}_and_appended"),
+                    filter(indexed.chain(appended).collect()),
+                ),
+            ]
+        })
+        .collect()
 }
 
 async fn ordered_limit(dataset: &Dataset, configure: impl Fn(&mut Scanner)) {
@@ -465,29 +502,31 @@ fn bench_ordered_limit(c: &mut Criterion) {
                 seed,
             ));
             appended_batches = total_batches;
-            let masks = if share == "9%" {
-                &[None, Some("50%")][..]
-            } else {
-                &[None][..]
-            };
-            for mask in masks {
+            let mut filters = vec![(String::new(), None)];
+            if share == "9%" {
+                filters.push(("_mask_50%".to_string(), Some("status = '50%'".to_string())));
+            }
+            if matches!(share, "9%" | "49%") {
+                filters.extend(
+                    oldest_masks()
+                        .into_iter()
+                        .map(|(name, filter)| (format!("_{name}"), Some(filter))),
+                );
+            }
+            for (case, filter) in &filters {
                 for (mode, suffix) in [
                     (OrderedIndexMode::Auto, ""),
                     (OrderedIndexMode::Off, "_off"),
                 ] {
-                    let name = match mask {
-                        None => format!("unindexed_{share}{suffix}"),
-                        Some(mask) => format!("unindexed_{share}_mask_{mask}{suffix}"),
-                    };
                     group.bench_with_input(
-                        BenchmarkId::new(name, segments),
+                        BenchmarkId::new(format!("unindexed_{share}{case}{suffix}"), segments),
                         &appended,
                         |b, dataset| {
                             b.iter(|| {
                                 rt.block_on(ordered_limit(dataset, |scanner| {
                                     scanner.ordered_index(mode);
-                                    if let Some(mask) = mask {
-                                        scanner.filter(&format!("status = '{mask}'")).unwrap();
+                                    if let Some(filter) = filter {
+                                        scanner.filter(filter).unwrap();
                                     }
                                 }))
                             });
