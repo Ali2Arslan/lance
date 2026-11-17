@@ -307,8 +307,7 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     dataset
 }
 
-/// Appends rows that `ts_idx` and `status_idx` miss, and indexes their ages,
-/// so that a mask on `age` is exact over every fragment.
+/// Appends rows that every index misses.
 async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
     let data = with_mask_columns(
         gen_batch()
@@ -323,6 +322,11 @@ async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
         ..Default::default()
     };
     dataset.append(data, Some(params)).await.unwrap();
+}
+
+/// Indexes the appended rows' ages, so that a mask on `age` is exact over
+/// every fragment.
+async fn index_ages(dataset: &mut Dataset) {
     dataset
         .optimize_indices(&OptimizeOptions::append().index_names(vec!["age_idx".into()]))
         .await
@@ -502,25 +506,43 @@ fn bench_ordered_limit(c: &mut Criterion) {
                 seed,
             ));
             appended_batches = total_batches;
-            let mut filters = vec![(String::new(), None)];
+            // While `age_idx` misses the appended rows, the read of them checks each one
+            // against an oldest mask and yields no row until it has read them all.
+            let stale_mask = appended.clone();
+            rt.block_on(index_ages(&mut appended));
+            let mut cases = vec![(String::new(), None, &appended)];
             if share == "9%" {
-                filters.push(("_mask_50%".to_string(), Some("status = '50%'".to_string())));
+                cases.push((
+                    "_mask_50%".to_string(),
+                    Some("status = '50%'".to_string()),
+                    &appended,
+                ));
             }
             if matches!(share, "9%" | "49%") {
-                filters.extend(
+                cases.extend(
                     oldest_masks()
                         .into_iter()
-                        .map(|(name, filter)| (format!("_{name}"), Some(filter))),
+                        .map(|(name, filter)| (format!("_{name}"), Some(filter), &appended)),
                 );
             }
-            for (case, filter) in &filters {
+            if share == "49%" {
+                cases.extend(
+                    oldest_masks()
+                        .into_iter()
+                        .filter(|(name, _)| !name.ends_with("_and_appended"))
+                        .map(|(name, filter)| {
+                            (format!("_{name}_stale_mask"), Some(filter), &stale_mask)
+                        }),
+                );
+            }
+            for (case, filter, dataset) in &cases {
                 for (mode, suffix) in [
                     (OrderedIndexMode::Auto, ""),
                     (OrderedIndexMode::Off, "_off"),
                 ] {
                     group.bench_with_input(
                         BenchmarkId::new(format!("unindexed_{share}{case}{suffix}"), segments),
-                        &appended,
+                        *dataset,
                         |b, dataset| {
                             b.iter(|| {
                                 rt.block_on(ordered_limit(dataset, |scanner| {

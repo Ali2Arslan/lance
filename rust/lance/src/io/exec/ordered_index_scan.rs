@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Waker;
 
 use arrow_array::{Array, RecordBatch, UInt32Array, cast::AsArray, types::UInt64Type};
 use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -46,6 +47,7 @@ use datafusion_physical_expr::{
     EquivalenceProperties, LexOrdering, PhysicalSortExpr, expressions::Column,
 };
 use futures::future::{self, try_join_all};
+use futures::task::AtomicWaker;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use lance_core::{Error, ROW_ADDR, ROW_ADDR_FIELD, Result, utils::address::RowAddress};
 use lance_datafusion::utils::{ExecutionPlanMetricsSetExt, ROWS_SCANNED_METRIC};
@@ -303,6 +305,7 @@ fn visit_budget(segments: usize, fetch: usize, index_rows: u64, mask_rows: u64) 
 pub(crate) struct VisitBudget {
     remaining: AtomicUsize,
     is_spent: AtomicBool,
+    spend_waker: AtomicWaker,
 }
 
 impl VisitBudget {
@@ -324,10 +327,17 @@ impl VisitBudget {
 
     pub(crate) fn mark_spent(&self) {
         self.is_spent.store(true, Ordering::Relaxed);
+        self.spend_waker.wake();
     }
 
     pub(crate) fn is_spent(&self) -> bool {
         self.is_spent.load(Ordering::Relaxed)
+    }
+
+    /// Whether the budget is spent. If it is not, `waker` wakes once it is.
+    pub(crate) fn is_spent_or_wake(&self, waker: &Waker) -> bool {
+        self.spend_waker.register(waker);
+        self.is_spent()
     }
 }
 

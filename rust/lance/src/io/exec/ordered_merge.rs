@@ -6,20 +6,27 @@
 //!
 //! The planner merges the ordered read of the covered fragments with a top-k
 //! sort of the others, both by key and then by `_rowaddr`. The sort reads the
-//! other fragments with the scan's filter, as the sort plan does:
+//! other fragments with the scan's filter, as the sort plan does. With a
+//! residual filter, the merge carries whether each covered row passes it, and
+//! keeps the rows that do and every sorted row:
 //!
 //! ```text
-//! SharedVisitBudgetExec        with a mask that may sort instead
-//!   SortPreservingMergeExec    fetch
-//!     UnionExec
-//!       OrderedIndexScanExec   the covered fragments
-//!       SortExec               fetch
-//!         VisitBudgetCutExec   with a mask that may sort instead
-//!           FilteredReadExec   the other fragments: key, _rowaddr
+//! ProjectionExec                 key, _rowaddr           with a residual
+//!   LanceFilterExec              passes                  with a residual
+//!     SharedVisitBudgetExec      with a mask that may sort instead
+//!       SortPreservingMergeExec  fetch
+//!         UnionExec
+//!           ProjectionExec       key, _rowaddr, passes   with a residual
+//!             TakeExec           the residual's columns  with a residual
+//!               OrderedIndexScanExec  the covered fragments
+//!           ProjectionExec       passes is true          with a residual
+//!             SortExec           fetch
+//!               FilteredReadExec the other fragments: key, _rowaddr
 //! ```
 
 use std::fmt;
 use std::sync::Arc;
+use std::task::Poll;
 
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -29,13 +36,16 @@ use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
 };
-use futures::{StreamExt, future};
+use futures::{StreamExt, stream};
 
 use super::ordered_index_scan::VisitBudget;
 use super::utils::InstrumentedRecordBatchStreamAdapter;
 
 /// Gives its input one [`VisitBudget`] per execution through the task context,
-/// and ends its output once a read in the input spends it.
+/// and ends its output once a read in the input spends it, without waiting for
+/// the input's next batch, and drops the input. A read of the other fragments
+/// whose filter matches none of their rows yields no batch until it has read
+/// them all. Errors from the input always pass.
 ///
 /// A masked ordered read that stops short ends its stream, and the merge above
 /// it would then emit sorted rows in place of the index rows it never read.
@@ -121,100 +131,23 @@ impl ExecutionPlan for SharedVisitBudgetExec {
             context.window_functions().clone(),
             context.runtime_env(),
         ));
-        let rows = self
-            .input
-            .execute(partition, context)?
-            .take_while(move |batch| future::ready(batch.is_err() || !budget.is_spent()));
-        Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
-            self.schema(),
-            rows,
-            partition,
-            &self.metrics,
-        )))
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-}
-
-/// Ends its input, the read of the fragments an ordered read's index misses,
-/// once the ordered read under the same [`SharedVisitBudgetExec`] spends the
-/// budget, so that a read that stops short does not wait for the rest of it.
-/// Errors always pass, so the sort runs only after a read that ended cleanly.
-#[derive(Debug)]
-pub struct VisitBudgetCutExec {
-    input: Arc<dyn ExecutionPlan>,
-    metrics: ExecutionPlanMetricsSet,
-}
-
-impl VisitBudgetCutExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        Self {
-            input,
-            metrics: ExecutionPlanMetricsSet::new(),
-        }
-    }
-}
-
-impl DisplayAs for VisitBudgetCutExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "VisitBudgetCut")
-    }
-}
-
-impl ExecutionPlan for VisitBudgetCutExec {
-    fn name(&self) -> &str {
-        "VisitBudgetCutExec"
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        self.input.properties()
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.input]
-    }
-
-    fn apply_expressions(
-        &self,
-        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DataFusionResult<TreeNodeRecursion>,
-    ) -> DataFusionResult<TreeNodeRecursion> {
-        Ok(TreeNodeRecursion::Continue)
-    }
-
-    fn maintains_input_order(&self) -> Vec<bool> {
-        vec![true]
-    }
-
-    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        vec![false]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let [input] = <[_; 1]>::try_from(children).map_err(|children| {
-            DataFusionError::Internal(format!(
-                "VisitBudgetCutExec takes 1 child, but got {}",
-                children.len()
-            ))
-        })?;
-        Ok(Arc::new(Self::new(input)))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        let budget = context.session_config().get_extension::<VisitBudget>();
-        let is_spent = move || budget.as_ref().is_some_and(|budget| budget.is_spent());
-        let rows = self
-            .input
-            .execute(partition, context)?
-            .take_while(move |batch| future::ready(batch.is_err() || !is_spent()));
+        let mut input = Some(self.input.execute(partition, context)?);
+        let rows = stream::poll_fn(move |cx| {
+            let Some(rows) = input.as_mut() else {
+                return Poll::Ready(None);
+            };
+            let polled = rows.poll_next_unpin(cx);
+            let is_cut = match &polled {
+                Poll::Ready(Some(Ok(_))) => budget.is_spent(),
+                Poll::Pending => budget.is_spent_or_wake(cx.waker()),
+                Poll::Ready(Some(Err(_)) | None) => false,
+            };
+            if is_cut {
+                input = None;
+                return Poll::Ready(None);
+            }
+            polled
+        });
         Ok(Box::pin(InstrumentedRecordBatchStreamAdapter::new(
             self.schema(),
             rows,
@@ -231,6 +164,7 @@ impl ExecutionPlan for VisitBudgetCutExec {
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::time::Duration;
 
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema, SchemaRef, SortOptions};
@@ -241,9 +175,12 @@ mod tests {
     use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::union::UnionExec;
-    use futures::{TryStreamExt, stream};
+    use futures::channel::oneshot;
+    use futures::{TryStreamExt, future};
     use lance_core::{ROW_ADDR, ROW_ADDR_FIELD};
     use lance_datafusion::exec::OneShotExec;
+    use rstest::rstest;
+    use tokio::runtime::Builder;
 
     use super::*;
     use crate::io::exec::ordered_fallback::OrderedFallbackExec;
@@ -268,16 +205,21 @@ mod tests {
         .unwrap()
     }
 
-    /// An ordered read of the covered fragments that spends the budget before
-    /// it reads a row, as one whose mask is too small to walk does.
+    /// An ordered read of the covered fragments that spends the budget. With
+    /// no `delay`, it spends it before it reads a row and ends, as one whose
+    /// mask is too small to walk does. With one, it spends it after the delay
+    /// and then waits, as a walk does while another of its segments still
+    /// reads a page.
     #[derive(Debug)]
     struct SpendsTheBudget {
+        delay: Option<Duration>,
         properties: Arc<PlanProperties>,
     }
 
     impl SpendsTheBudget {
-        fn new() -> Self {
+        fn new(delay: Option<Duration>) -> Self {
             Self {
+                delay,
                 properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(schema()),
                     Partitioning::RoundRobinBatch(1),
@@ -326,21 +268,42 @@ mod tests {
             _partition: usize,
             context: Arc<TaskContext>,
         ) -> DataFusionResult<SendableRecordBatchStream> {
-            context
+            let budget = context
                 .session_config()
                 .get_extension::<VisitBudget>()
-                .unwrap()
-                .mark_spent();
-            Ok(Box::pin(RecordBatchStreamAdapter::new(
-                self.schema(),
-                stream::empty(),
-            )))
+                .unwrap();
+            let Some(delay) = self.delay else {
+                budget.mark_spent();
+                return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema(),
+                    stream::empty(),
+                )));
+            };
+            let rows = stream::once(async move {
+                tokio::time::sleep(delay).await;
+                budget.mark_spent();
+                future::pending().await
+            });
+            Ok(Box::pin(RecordBatchStreamAdapter::new(self.schema(), rows)))
         }
     }
 
-    /// The planner's merge of the covered read with `uncovered`, under one
-    /// budget.
-    fn merge(uncovered: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    /// A read of the uncovered fragments that matches none of their rows, so
+    /// it yields nothing until it is dropped, which resolves the receiver.
+    fn pending_until_dropped() -> (Arc<dyn ExecutionPlan>, oneshot::Receiver<()>) {
+        let (on_drop, dropped) = oneshot::channel::<()>();
+        let rows = stream::pending().inspect(move |_: &DataFusionResult<RecordBatch>| {
+            let _ = &on_drop;
+        });
+        let read = RecordBatchStreamAdapter::new(schema(), rows);
+        (Arc::new(OneShotExec::new(Box::pin(read))), dropped)
+    }
+
+    /// The planner's merge of `covered` with `uncovered`, under one budget.
+    fn merge(
+        covered: SpendsTheBudget,
+        uncovered: Arc<dyn ExecutionPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
         let schema = schema();
         let newest_first = SortOptions {
             descending: true,
@@ -350,7 +313,7 @@ mod tests {
             PhysicalSortExpr::new(col("ts", &schema).unwrap(), newest_first),
             PhysicalSortExpr::new(col(ROW_ADDR, &schema).unwrap(), SortOptions::default()),
         ]);
-        let union = UnionExec::try_new(vec![Arc::new(SpendsTheBudget::new()), uncovered]).unwrap();
+        let union = UnionExec::try_new(vec![Arc::new(covered), uncovered]).unwrap();
         let merged = SortPreservingMergeExec::new(order, union).with_fetch(Some(LIMIT));
         Arc::new(SharedVisitBudgetExec::new(Arc::new(merged)))
     }
@@ -358,7 +321,7 @@ mod tests {
     #[tokio::test]
     async fn test_shared_budget_ends_the_merge_once_spent() {
         let uncovered = Arc::new(OneShotExec::from_batch(rows(0..LIMIT as i32)));
-        let batches = merge(uncovered)
+        let batches = merge(SpendsTheBudget::new(None), uncovered)
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
             .try_collect::<Vec<_>>()
@@ -375,11 +338,10 @@ mod tests {
                 "the uncovered read failed".into(),
             ))]),
         );
-        let uncovered = Arc::new(VisitBudgetCutExec::new(Arc::new(OneShotExec::new(
-            Box::pin(failing),
-        ))));
+        let uncovered = Arc::new(OneShotExec::new(Box::pin(failing)));
         let sorted = Arc::new(OneShotExec::from_batch(rows(0..LIMIT as i32)));
-        let query = OrderedFallbackExec::try_new(merge(uncovered), sorted, LIMIT).unwrap();
+        let merged = merge(SpendsTheBudget::new(None), uncovered);
+        let query = OrderedFallbackExec::try_new(merged, sorted, LIMIT).unwrap();
         let error = query
             .execute(0, Arc::new(TaskContext::default()))
             .unwrap()
@@ -390,5 +352,40 @@ mod tests {
             error.to_string().contains("the uncovered read failed"),
             "{error}"
         );
+    }
+
+    #[rstest]
+    fn test_shared_budget_stops_an_uncovered_read_that_yields_nothing(
+        #[values(false, true)] is_multi_thread: bool,
+        #[values(None, Some(Duration::from_millis(50)))] spend_delay: Option<Duration>,
+    ) {
+        let mut runtime = if is_multi_thread {
+            Builder::new_multi_thread()
+        } else {
+            Builder::new_current_thread()
+        };
+        runtime.enable_all().build().unwrap().block_on(async {
+            let (uncovered, dropped) = pending_until_dropped();
+            let sorted = rows(0..LIMIT as i32);
+            let query = OrderedFallbackExec::try_new(
+                merge(SpendsTheBudget::new(spend_delay), uncovered),
+                Arc::new(OneShotExec::from_batch(sorted.clone())),
+                LIMIT,
+            )
+            .unwrap();
+            let rows = query
+                .execute(0, Arc::new(TaskContext::default()))
+                .unwrap()
+                .try_collect::<Vec<_>>();
+            let rows = tokio::time::timeout(Duration::from_secs(5), rows)
+                .await
+                .expect("the merge waits for the uncovered read after the budget is spent")
+                .unwrap();
+            assert_eq!(rows, [sorted]);
+            tokio::time::timeout(Duration::from_secs(5), dropped)
+                .await
+                .expect("the uncovered read is never dropped")
+                .unwrap_err();
+        });
     }
 }

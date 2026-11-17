@@ -9,13 +9,20 @@ use std::sync::Arc;
 
 use arrow_schema::{SchemaRef, SortOptions};
 use datafusion::catalog::Session;
-use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
+use datafusion::common::Column;
+use datafusion::logical_expr::{Expr, Literal, when};
+use datafusion::physical_expr::{LexOrdering, PhysicalExpr, PhysicalSortExpr};
+use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::union::UnionExec;
-use datafusion::physical_plan::{ExecutionPlan, expressions::col};
+use datafusion::physical_plan::{
+    ExecutionPlan,
+    expressions::{col, lit},
+};
 use lance_core::ROW_ADDR;
 use lance_core::datatypes::OnMissing;
+use lance_datafusion::planner::Planner;
 use lance_file::version::ConcreteFileVersion;
 use lance_index::scalar::expression::ScalarIndexExpr;
 use lance_index::scalar::registry::IndexOrderingCapability;
@@ -32,7 +39,7 @@ use crate::io::exec::ordered_fallback::OrderedFallbackExec;
 use crate::io::exec::ordered_index_scan::{
     IndexMask, MaskedRead, OrderedIndexScanExec, UnindexedFragments,
 };
-use crate::io::exec::ordered_merge::{SharedVisitBudgetExec, VisitBudgetCutExec};
+use crate::io::exec::ordered_merge::SharedVisitBudgetExec;
 use crate::io::exec::scalar_index::ScalarIndexExec;
 
 // On 10,000,000 rows with `LIMIT 100`, 1024 was the fastest of 256, 512, 1024, and 2048 that
@@ -151,17 +158,21 @@ pub enum OrderedIndexDecline {
     /// The index covers `indexed_fragments` of the dataset's `fragments`
     /// fragments. `indexed_fragments` is `None` when a segment of the index
     /// records no fragment coverage, so the count is unknown.
-    /// `unindexed_share` is the share of the dataset's live rows in the
-    /// fragments the index misses, or `None` when a fragment records no row
-    /// count. Under [`OrderedIndexMode::Auto`], the read sorts those rows and
-    /// merges them in unless they hold more than half of the live rows.
-    /// Under [`OrderedIndexMode::Required`], it does so at any share, unless
-    /// the index covers none of the live rows.
+    /// `unindexed_fragments` counts the fragments the index misses that the
+    /// scan reads: all of them, or under [`Scanner::fast_search`] those that
+    /// the filter's index searches cover. `unindexed_share` is the share
+    /// those fragments hold of the live rows in them and the covered
+    /// fragments, or `None` when one of them records no row count. Under
+    /// [`OrderedIndexMode::Auto`], the read sorts their rows and merges them
+    /// in unless they hold more than half of those live rows. Under
+    /// [`OrderedIndexMode::Required`], it does so at any share, unless the
+    /// index covers none of the live rows.
     PartialCoverage {
         column: String,
         index: String,
         indexed_fragments: Option<usize>,
         fragments: usize,
+        unindexed_fragments: usize,
         unindexed_share: Option<f64>,
     },
     /// `source` stopped the read. With an `index`, that index failed to open
@@ -234,6 +245,7 @@ impl fmt::Display for OrderedIndexDecline {
                 index,
                 indexed_fragments: Some(indexed_fragments),
                 fragments,
+                unindexed_fragments,
                 unindexed_share,
             } => {
                 write!(
@@ -241,23 +253,34 @@ impl fmt::Display for OrderedIndexDecline {
                     "index '{index}' on column '{column}' covers {indexed_fragments} of the \
                      dataset's {fragments} fragments"
                 )?;
-                let unindexed = fragments - indexed_fragments;
+                let (unindexed, live_rows) = if indexed_fragments + unindexed_fragments < *fragments
+                {
+                    (
+                        format!("{unindexed_fragments} it misses that the fast search reads"),
+                        format!("the live rows in those and the {indexed_fragments} it covers"),
+                    )
+                } else {
+                    (
+                        format!("{unindexed_fragments} it misses"),
+                        "its live rows".to_owned(),
+                    )
+                };
                 match unindexed_share {
                     Some(share) if *share >= 1.0 => {
                         write!(f, ", which hold none of its live rows")
                     }
                     Some(share) => write!(
                         f,
-                        ", and the {unindexed} it misses hold {:.1}% of its live rows, more than \
-                         the {:.0}% that the read sorts and merges in",
+                        ", and the {unindexed} hold {:.1}% of {live_rows}, more than the {:.0}% \
+                         that the read sorts and merges in",
                         share * 100.0,
                         MAX_UNINDEXED_SHARE * 100.0
                     ),
                     None => write!(
                         f,
                         ", and a fragment records no row count, so the share of live rows in the \
-                         {unindexed} it misses is unknown, and the read sorts and merges them in \
-                         only when they hold at most {:.0}%",
+                         {unindexed} is unknown, and the read sorts and merges them in only when \
+                         they hold at most {:.0}%",
                         MAX_UNINDEXED_SHARE * 100.0
                     ),
                 }
@@ -568,7 +591,8 @@ impl Scanner {
                         index: index.name.clone(),
                         indexed_fragments: (!is_coverage_unknown).then_some(covered.len()),
                         fragments: fragments.len(),
-                        unindexed_share: share,
+                        unindexed_fragments: unindexed.len(),
+                        unindexed_share: merged_share,
                     };
                     continue;
                 }
@@ -646,21 +670,23 @@ impl Scanner {
                         "OrderedIndexScanExec does not accept a fetch",
                     ))
                 })?;
-        let scan = if unindexed.is_empty() {
-            scan
+        let (scan, residual) = if unindexed.is_empty() {
+            (scan, residual)
         } else {
             let unindexed = unindexed.into_iter().cloned().collect();
             let shares_budget = mask.as_ref().is_some_and(IndexMask::may_sort);
-            self.merge_unindexed(
-                scan,
-                unindexed,
-                expr_filter,
-                shares_budget,
-                options,
-                scan_fetch,
-            )
-            .await
-            .map_err(unreadable)?
+            let merged = self
+                .merge_unindexed(
+                    scan,
+                    unindexed,
+                    expr_filter,
+                    residual.as_ref(),
+                    shares_budget,
+                    options,
+                )
+                .await
+                .map_err(unreadable)?;
+            (merged, None)
         };
         let residual = match residual {
             None => {
@@ -681,22 +707,32 @@ impl Scanner {
 
     /// Merges `scan` with a top-k sort of the `unindexed` fragments, which
     /// reads them with `filter` as the sort plan does, so it keeps only the
-    /// rows the scan's mask and filter let through.
+    /// rows the scan's mask and filter let through. The scan's fetch bounds
+    /// the sort and the merge.
+    ///
+    /// The rows of `scan` that a `residual` rejects count toward that fetch,
+    /// as in the read of a fully covered index, so that sorted rows cannot
+    /// fill it with keys past the one where the scan stops. Each of those rows
+    /// carries through the merge whether it passes the residual, and the
+    /// sorted rows, which passed the whole filter in their read, all pass, so
+    /// no row meets the filter twice.
     async fn merge_unindexed(
         &self,
         scan: Arc<dyn ExecutionPlan>,
         unindexed: Vec<Fragment>,
         filter: &ExprFilterPlan,
+        residual: Option<&Expr>,
         shares_budget: bool,
         options: SortOptions,
-        fetch: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, Error> {
+        let fetch = scan.fetch();
+        let key = scan.schema().field(0).name().clone();
         let projection = self
             .dataset
             .empty_projection()
-            .union_column(scan.schema().field(0).name(), OnMissing::Error)?
+            .union_column(&key, OnMissing::Error)?
             .with_row_addr();
-        let mut read = self
+        let read = self
             .new_filtered_read(
                 filter,
                 projection,
@@ -706,31 +742,63 @@ impl Scanner {
                 None,
             )
             .await?;
-        if shares_budget {
-            read = Arc::new(VisitBudgetCutExec::new(read));
-        }
         let order = |schema: &SchemaRef| -> Result<LexOrdering, Error> {
             Ok(LexOrdering::from([
-                PhysicalSortExpr::new(col(schema.field(0).name(), schema)?, options),
+                PhysicalSortExpr::new(col(&key, schema)?, options),
                 PhysicalSortExpr::new(col(ROW_ADDR, schema)?, SortOptions::default()),
             ]))
         };
-        let sorted = SortExec::new(order(&read.schema())?, read).with_fetch(fetch);
-        let union = UnionExec::try_new(vec![scan, Arc::new(sorted)])?;
+        let sorted: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(order(&read.schema())?, read).with_fetch(fetch));
+        // Named after the key, so that it differs from both other columns.
+        let passes_column = format!("{key}_passes_filter");
+        let project = |input: Arc<dyn ExecutionPlan>,
+                       passes: Option<Arc<dyn PhysicalExpr>>|
+         -> Result<Arc<dyn ExecutionPlan>, Error> {
+            let schema = input.schema();
+            let mut columns = vec![
+                (col(&key, &schema)?, key.clone()),
+                (col(ROW_ADDR, &schema)?, ROW_ADDR.to_owned()),
+            ];
+            columns.extend(passes.map(|passes| (passes, passes_column.clone())));
+            Ok(Arc::new(ProjectionExec::try_new(columns, input)?))
+        };
+        let inputs = match residual {
+            None => vec![scan, sorted],
+            Some(residual) => {
+                let columns = self
+                    .dataset
+                    .empty_projection()
+                    .union_columns(Planner::column_names_in_expr(residual), OnMissing::Ignore)?;
+                let scan = self.take(scan, columns)?;
+                // `CASE` turns a null into false, so the column is non-null like the sorted
+                // rows' `true`, and the union does not cast one input to match the other.
+                let passes = when(residual.clone(), true.lit()).otherwise(false.lit())?;
+                let passes = Planner::new(scan.schema()).create_physical_expr(&passes)?;
+                vec![
+                    project(scan, Some(passes))?,
+                    project(sorted, Some(lit(true)))?,
+                ]
+            }
+        };
+        let union = UnionExec::try_new(inputs)?;
         // EnforceDistribution removes a merge without a fetch as a mere change of partitions,
         // so a read without a candidate budget bounds the merge by the live rows.
         let merge_fetch = fetch.unwrap_or_else(|| {
             live_rows_bound(self.dataset.fragments().iter().map(Fragment::num_rows))
         });
-        let merged: Arc<dyn ExecutionPlan> = Arc::new(
+        let mut merged: Arc<dyn ExecutionPlan> = Arc::new(
             SortPreservingMergeExec::new(order(&union.schema())?, union)
                 .with_fetch(Some(merge_fetch)),
         );
-        Ok(if shares_budget {
-            Arc::new(SharedVisitBudgetExec::new(merged))
-        } else {
-            merged
-        })
+        if shares_budget {
+            merged = Arc::new(SharedVisitBudgetExec::new(merged));
+        }
+        if residual.is_some() {
+            let passes = Expr::Column(Column::new_unqualified(&passes_column));
+            merged = project(Arc::new(LanceFilterExec::try_new(passes, merged)?), None)?;
+        }
+        Ok(merged)
     }
 
     /// The mask that applies `index_query` to an ordered read as the sort plan
@@ -881,20 +949,21 @@ impl Scanner {
 mod tests {
     use std::collections::{HashMap, HashSet};
     use std::ops::Range;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use arrow_array::{
-        Array, ArrayRef, FixedSizeListArray, Float32Array, Int32Array, Int64Array, RecordBatch,
-        RecordBatchIterator, StringArray, StructArray, UInt64Array,
+        Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int32Array, Int64Array,
+        RecordBatch, RecordBatchIterator, StringArray, StructArray, UInt64Array,
         cast::AsArray,
         types::{Int32Type, Int64Type, UInt64Type},
     };
     use arrow_schema::{DataType, Field, Schema, SortOptions};
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{ColumnarValue, Expr, Volatility, col, create_udf};
     use datafusion::physical_expr::{PhysicalSortExpr, expressions::Column};
     use datafusion::physical_plan::{ExecutionPlan, displayable};
     use lance_core::utils::tempfile::TempStrDir;
-    use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, utils::address::RowAddress};
+    use lance_core::{ROW_ADDR, ROW_ADDR_FIELD, ROW_ID, utils::address::RowAddress};
     use lance_file::version::LanceFileVersion;
     use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
@@ -3605,18 +3674,58 @@ mod tests {
             shares_budget,
             "{plan}"
         );
-        let inputs = plan_children(&lines, union);
-        let [(_, scan), (sort, sorted)] = inputs[..] else {
-            panic!("{plan}");
-        };
-        assert!(
-            scan.starts_with("OrderedIndexScan: index=ts_idx, "),
-            "{plan}"
-        );
-        let fetch = scan
+        let scan = lines
+            .iter()
+            .position(|line| line.trim().starts_with("OrderedIndexScan: index=ts_idx, "))
+            .unwrap_or_else(|| panic!("{plan}"));
+        let fetch = lines[scan]
             .split(", ")
             .find_map(|part| part.strip_prefix("fetch="))
             .map(|fetch| format!("fetch={fetch}"));
+        let has_residual = lines[scan].contains(", residual=");
+        // The residual runs once on each row: on the scan's rows before the merge, which
+        // carries the result, and on the sorted rows in their read.
+        let mut ancestors = vec![];
+        let mut node = merge;
+        while indent(lines[node]) > 0 {
+            node = parent(node);
+            ancestors.push(lines[node].trim());
+        }
+        let filters = ancestors
+            .into_iter()
+            .filter(|line| line.starts_with("FilterExec: "))
+            .collect::<Vec<_>>();
+        let expected_filters: &[&str] = if has_residual {
+            &["FilterExec: ts_passes_filter@2"]
+        } else {
+            &[]
+        };
+        assert_eq!(filters, expected_filters, "{plan}");
+        let inputs = plan_children(&lines, union);
+        let [(covered, covered_line), (sort, sorted)] = inputs[..] else {
+            panic!("{plan}");
+        };
+        let (sort, sorted) = if has_residual {
+            let (prefix, suffix) = (
+                "ProjectionExec: expr=[ts@0 as ts, _rowaddr@1 as _rowaddr, ",
+                " as ts_passes_filter]",
+            );
+            assert!(
+                covered_line.starts_with(prefix)
+                    && covered_line.ends_with(suffix)
+                    && covered < scan
+                    && scan < sort,
+                "{plan}"
+            );
+            assert_eq!(sorted, format!("{prefix}true{suffix}"), "{plan}");
+            let [sort] = plan_children(&lines, sort)[..] else {
+                panic!("{plan}");
+            };
+            sort
+        } else {
+            assert_eq!(covered, scan, "{plan}");
+            (sort, sorted)
+        };
         let key = PhysicalSortExpr::new(
             Arc::new(Column::new("ts", 0)),
             SortOptions {
@@ -3635,15 +3744,7 @@ mod tests {
             None => format!("SortExec: expr={order}, preserve_partitioning=[false]"),
         };
         assert_eq!(sorted, expected_sort, "{plan}");
-        let mut read = plan_children(&lines, sort);
-        if shares_budget {
-            let [(cut, line)] = read[..] else {
-                panic!("{plan}");
-            };
-            assert_eq!(line, "VisitBudgetCut", "{plan}");
-            read = plan_children(&lines, cut);
-        }
-        let [(read, line)] = read[..] else {
+        let [(read, line)] = plan_children(&lines, sort)[..] else {
             panic!("{plan}");
         };
         assert!(
@@ -3830,12 +3931,11 @@ mod tests {
                             analyzed.contains(&format!("ordered_fallback={sorts}")),
                             "{analyzed}"
                         );
-                        for node in ["SharedVisitBudget, ", "VisitBudgetCut, "] {
-                            let counts_rows = analyzed.lines().any(|line| {
-                                line.trim_start().starts_with(node) && line.contains("output_rows=")
-                            });
-                            assert_eq!(counts_rows, shares_budget, "{analyzed}");
-                        }
+                        let counts_rows = analyzed.lines().any(|line| {
+                            line.trim_start().starts_with("SharedVisitBudget, ")
+                                && line.contains("output_rows=")
+                        });
+                        assert_eq!(counts_rows, shares_budget, "{analyzed}");
                     }
                     plan
                 }
@@ -4091,6 +4191,177 @@ mod tests {
             let rows = scanner.try_into_batch().await.unwrap();
             let ts = rows["ts"].as_primitive::<Int32Type>().values().to_vec();
             assert_eq!(ts, expected, "{plan}");
+        }
+    }
+
+    /// A filter on `_rowid` that holds the first time it sees a row and fails
+    /// after that, so a row that meets it twice drops out. `seen` records
+    /// each row id it sees.
+    fn true_once(seen: Arc<Mutex<Vec<u64>>>) -> Expr {
+        let udf = create_udf(
+            "true_once",
+            vec![DataType::UInt64],
+            DataType::Boolean,
+            Volatility::Volatile,
+            Arc::new(move |args: &[ColumnarValue]| {
+                let ids = ColumnarValue::values_to_arrays(args)?;
+                let mut seen = seen.lock().unwrap();
+                let passes = ids[0]
+                    .as_primitive::<UInt64Type>()
+                    .values()
+                    .iter()
+                    .map(|&id| {
+                        let is_first = !seen.contains(&id);
+                        seen.push(id);
+                        is_first
+                    })
+                    .collect::<Vec<_>>();
+                Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(passes))))
+            }),
+        );
+        udf.call(vec![col(ROW_ID)])
+    }
+
+    /// The read evaluates a volatile filter once on each row, as the sort plan
+    /// does: on the indexed rows before the merge and on the appended rows in
+    /// their read, whichever holds the newest row.
+    #[rstest]
+    #[case::appended_row_first(|id| Some(id))]
+    #[case::indexed_row_first(|id| Some(id - 200))]
+    #[tokio::test]
+    async fn test_ordered_partial_evaluates_a_volatile_filter_once(
+        #[case] appended_key: fn(i32) -> Option<i32>,
+    ) {
+        let indexed = partial_rows(0..100, Some);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(indexed.clone())], indexed.schema()),
+            "memory://",
+            None,
+        )
+        .await
+        .unwrap();
+        dataset
+            .create_index(
+                &["ts"],
+                IndexType::BTree,
+                Some(INDEX.into()),
+                &btree(),
+                false,
+            )
+            .await
+            .unwrap();
+        append(&mut dataset, partial_rows(100..200, appended_key)).await;
+        let ordering = ColumnOrdering::desc_nulls_last("ts".into());
+        let newest = partial_oracle(&dataset, ALL, &ordering).await[0];
+        for mode in [
+            OrderedIndexMode::Auto,
+            OrderedIndexMode::Required,
+            OrderedIndexMode::Off,
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let mut scanner = dataset.scan();
+            scanner
+                .project(&["id", "ts"])
+                .unwrap()
+                .filter_expr(true_once(seen.clone()))
+                .order_by(Some(vec![ordering.clone()]))
+                .unwrap()
+                .limit(Some(1), None)
+                .unwrap()
+                .ordered_index(mode);
+            let plan = scanner.explain_plan(false).await.unwrap();
+            assert_eq!(
+                plan.contains("UnionExec"),
+                mode != OrderedIndexMode::Off,
+                "{plan}"
+            );
+            let rows = scanner.try_into_batch().await.unwrap();
+            let ts = rows["ts"].as_primitive::<Int32Type>();
+            assert_eq!(
+                ts.iter().zip(ids(&rows)).collect::<Vec<_>>(),
+                [newest],
+                "{mode}: {plan}"
+            );
+            let seen = seen.lock().unwrap();
+            assert_eq!(
+                seen.iter().collect::<HashSet<_>>().len(),
+                seen.len(),
+                "{mode} evaluates the filter twice on a row: {seen:?}"
+            );
+            let fragments = seen
+                .iter()
+                .map(|&id| RowAddress::from(id).fragment_id())
+                .collect::<HashSet<_>>();
+            assert_eq!(fragments, HashSet::from([0, 1]), "{mode}: {seen:?}");
+        }
+    }
+
+    /// Under `fast_search`, the read sorts and merges in only the fragments
+    /// its index misses that the filter's index covers, so a decline names
+    /// those and the share they hold of the rows the scan reads.
+    #[tokio::test]
+    async fn test_ordered_partial_fast_search_decline_names_the_fragments_it_reads() {
+        let batch = partial_rows(0..90, interleaved_key);
+        let mut dataset = Dataset::write(
+            RecordBatchIterator::new([Ok(batch.clone())], batch.schema()),
+            "memory://",
+            Some(WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        index_ts_segments(&mut dataset, &[&[0, 1, 2, 3]]).await;
+        index_status(&mut dataset).await;
+        append(&mut dataset, partial_rows(90..100, interleaved_key)).await;
+        assert_eq!(dataset.fragments().len(), 10);
+        let ordering = ColumnOrdering::desc_nulls_last("ts".into());
+        let configure = |scanner: &mut Scanner| {
+            scanner
+                .project(&["id", "ts"])
+                .unwrap()
+                .filter("status = 'p50'")
+                .unwrap()
+                .order_by(Some(vec![ordering.clone()]))
+                .unwrap()
+                .limit(Some(100), None)
+                .unwrap()
+                .fast_search();
+        };
+        let sorted_rows = partial_oracle(
+            &dataset,
+            |row| row.id < 90 && row.status == "p50",
+            &ordering,
+        )
+        .await;
+        let mut sorted = dataset.scan();
+        configure(&mut sorted);
+        sorted.ordered_index(OrderedIndexMode::Off);
+        let sorted_plan = sorted.explain_plan(false).await.unwrap();
+        let rows = sorted.try_into_batch().await.unwrap();
+        assert_window(&rows, &sorted_rows, 0, 100, &sorted_plan);
+        for mode in [OrderedIndexMode::Auto, OrderedIndexMode::Required] {
+            let mut scanner = dataset.scan();
+            configure(&mut scanner);
+            scanner.ordered_index(mode);
+            let plan = scanner.explain_plan(false).await.unwrap();
+            if mode == OrderedIndexMode::Auto {
+                assert_eq!(plan, sorted_plan);
+                let verbose = scanner.explain_plan(true).await.unwrap();
+                assert_eq!(
+                    verbose.lines().last().unwrap(),
+                    "OrderedIndexScan declined: index 'ts_idx' on column 'ts' covers 4 of the \
+                     dataset's 10 fragments, and the 5 it misses that the fast search reads hold \
+                     55.6% of the live rows in those and the 4 it covers, more than the 50% that \
+                     the read sorts and merges in",
+                    "{verbose}"
+                );
+            } else {
+                assert!(plan.contains("UnionExec"), "{plan}");
+            }
+            let rows = scanner.try_into_batch().await.unwrap();
+            assert_window(&rows, &sorted_rows, 0, 100, &plan);
         }
     }
 }
