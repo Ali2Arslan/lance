@@ -377,12 +377,17 @@ mod tests {
                 .execute(0, Arc::new(TaskContext::default()))
                 .unwrap()
                 .try_collect::<Vec<_>>();
-            let rows = tokio::time::timeout(Duration::from_secs(5), rows)
+            let timeout = Duration::from_secs(5);
+            let started = tokio::time::Instant::now();
+            let rows = tokio::time::timeout(timeout, rows)
                 .await
                 .expect("the merge waits for the uncovered read after the budget is spent")
                 .unwrap();
+            // The timeout's own wake polls the merge again, which ends a merge that no
+            // spend woke, so ending well before it shows that the spend woke the merge.
+            assert!(started.elapsed() < timeout / 2, "{:?}", started.elapsed());
             assert_eq!(rows, [sorted]);
-            tokio::time::timeout(Duration::from_secs(5), dropped)
+            tokio::time::timeout(timeout, dropped)
                 .await
                 .expect("the uncovered read is never dropped")
                 .unwrap_err();
