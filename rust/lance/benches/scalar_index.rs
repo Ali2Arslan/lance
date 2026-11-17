@@ -299,6 +299,21 @@ async fn ordered_limit_dataset(tempdir: &TempStrDir, segments: u32) -> Dataset {
     dataset
 }
 
+async fn append_unindexed(dataset: &mut Dataset, batches: u32, seed: u64) {
+    let data = with_mask_columns(
+        gen_batch()
+            .with_seed(Seed::from(seed))
+            .col("ts", array::rand::<UInt64Type>())
+            .col("id", array::step::<UInt64Type>())
+            .into_reader_rows(RowCount::from(100_000), BatchCount::from(batches)),
+    );
+    let params = WriteParams {
+        max_rows_per_file: 1_000_000,
+        ..Default::default()
+    };
+    dataset.append(data, Some(params)).await.unwrap();
+}
+
 async fn ordered_limit(dataset: &Dataset, configure: impl Fn(&mut Scanner)) {
     let mut scanner = dataset.scan();
     scanner
@@ -430,6 +445,56 @@ fn bench_ordered_limit(c: &mut Criterion) {
                     });
                 },
             );
+        }
+        if segments > 1 {
+            continue;
+        }
+        let mut appended = dataset.clone();
+        let mut appended_batches = 0;
+        for (share, total_batches) in [
+            ("1%", 1),
+            ("9%", 10),
+            ("25%", 33),
+            ("49%", 96),
+            ("51%", 104),
+        ] {
+            let seed = DEFAULT_SEED.0 + 1_000 + u64::from(total_batches);
+            rt.block_on(append_unindexed(
+                &mut appended,
+                total_batches - appended_batches,
+                seed,
+            ));
+            appended_batches = total_batches;
+            let masks = if share == "9%" {
+                &[None, Some("50%")][..]
+            } else {
+                &[None][..]
+            };
+            for mask in masks {
+                for (mode, suffix) in [
+                    (OrderedIndexMode::Auto, ""),
+                    (OrderedIndexMode::Off, "_off"),
+                ] {
+                    let name = match mask {
+                        None => format!("unindexed_{share}{suffix}"),
+                        Some(mask) => format!("unindexed_{share}_mask_{mask}{suffix}"),
+                    };
+                    group.bench_with_input(
+                        BenchmarkId::new(name, segments),
+                        &appended,
+                        |b, dataset| {
+                            b.iter(|| {
+                                rt.block_on(ordered_limit(dataset, |scanner| {
+                                    scanner.ordered_index(mode);
+                                    if let Some(mask) = mask {
+                                        scanner.filter(&format!("status = '{mask}'")).unwrap();
+                                    }
+                                }))
+                            });
+                        },
+                    );
+                }
+            }
         }
     }
     group.finish();

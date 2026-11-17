@@ -176,16 +176,35 @@ impl IndexMask {
         }
     }
 
-    /// Runs the search and returns the rows it lets through with the row
-    /// counts of the fragments in `scope`, or with `None` when one of those
-    /// fragments does not record its physical row count.
-    async fn evaluate(
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn search(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.search
+    }
+
+    pub(crate) fn with_search(&self, search: Arc<dyn ExecutionPlan>) -> Self {
+        Self {
+            search,
+            ..self.clone()
+        }
+    }
+
+    /// Whether a read with this mask may stop short of its fetch so that the
+    /// sort runs instead.
+    pub(crate) fn may_sort(&self) -> bool {
+        matches!(self.read, MaskedRead::MaySort)
+    }
+
+    /// Runs the search and returns the rows it lets through in the fragments
+    /// in `scope`.
+    pub(crate) async fn select(
         &self,
-        dataset: &Dataset,
         scope: &RoaringBitmap,
         partition: usize,
         context: Arc<TaskContext>,
-    ) -> Result<(RowAddrMask, Option<ScopeRows>)> {
+    ) -> Result<RowAddrMask> {
         let batch = self
             .search
             .execute(partition, context)?
@@ -202,11 +221,24 @@ impl IndexMask {
         for fragment_id in scope - &indexed {
             unindexed.insert_fragment(fragment_id);
         }
-        let selected = match self.unindexed {
+        Ok(match self.unindexed {
             UnindexedFragments::Emit => result.upper.also_allow(unindexed),
             UnindexedFragments::Skip => result.upper.also_block(unindexed),
         }
-        .also_allow(self.stale_rows.clone());
+        .also_allow(self.stale_rows.clone()))
+    }
+
+    /// Runs the search and returns the rows it lets through with the row
+    /// counts of the fragments in `scope`, or with `None` when one of those
+    /// fragments does not record its physical row count.
+    async fn evaluate(
+        &self,
+        dataset: &Dataset,
+        scope: &RoaringBitmap,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<(RowAddrMask, Option<ScopeRows>)> {
+        let selected = self.select(scope, partition, context).await?;
         let Some(fragments) = dataset
             .fragments()
             .iter()
@@ -289,17 +321,19 @@ fn visit_budget(segments: usize, fetch: usize, index_rows: u64, mask_rows: u64) 
     (budget <= MASK_SORT_VISITS_PER_ROW * mask_rows as f64).then(|| budget.ceil() as usize)
 }
 
-struct VisitBudget {
+/// The index rows a masked read may visit, and whether it stopped short of
+/// its fetch. A read that merges in the fragments its index misses finds the
+/// budget of [`SharedVisitBudgetExec`](super::ordered_merge::SharedVisitBudgetExec)
+/// in its task context, so that its stop short also stops the merge.
+#[derive(Debug, Default)]
+pub(crate) struct VisitBudget {
     remaining: AtomicUsize,
     is_spent: AtomicBool,
 }
 
 impl VisitBudget {
-    fn new(visits: usize) -> Self {
-        Self {
-            remaining: AtomicUsize::new(visits),
-            is_spent: AtomicBool::new(false),
-        }
+    fn grant(&self, visits: usize) {
+        self.remaining.fetch_add(visits, Ordering::Relaxed);
     }
 
     fn remaining(&self) -> usize {
@@ -314,11 +348,11 @@ impl VisitBudget {
             });
     }
 
-    fn mark_spent(&self) {
+    pub(crate) fn mark_spent(&self) {
         self.is_spent.store(true, Ordering::Relaxed);
     }
 
-    fn is_spent(&self) -> bool {
+    pub(crate) fn is_spent(&self) -> bool {
         self.is_spent.load(Ordering::Relaxed)
     }
 }
@@ -580,6 +614,10 @@ impl OrderedIndexScanExec {
                 }
                 let budget = match (mask.read, self.fetch) {
                     (MaskedRead::MaySort, Some(fetch)) => {
+                        let budget = context
+                            .session_config()
+                            .get_extension::<VisitBudget>()
+                            .unwrap_or_default();
                         let Some(visits) = rows.and_then(|rows| {
                             visit_budget(
                                 self.segments.len(),
@@ -588,6 +626,7 @@ impl OrderedIndexScanExec {
                                 rows.mask_rows,
                             )
                         }) else {
+                            budget.mark_spent();
                             return Ok(Box::pin(RecordBatchStreamAdapter::new(
                                 schema,
                                 stream::empty(),
@@ -596,7 +635,8 @@ impl OrderedIndexScanExec {
                         self.metrics
                             .new_count("visit_budget", partition)
                             .add(visits);
-                        Some(Arc::new(VisitBudget::new(visits)))
+                        budget.grant(visits);
+                        Some(budget)
                     }
                     _ => None,
                 };
@@ -2260,7 +2300,8 @@ mod tests {
         .await
         .unwrap();
         let schema = plan.schema();
-        let budget = Arc::new(VisitBudget::new(1));
+        let budget = Arc::new(VisitBudget::default());
+        budget.grant(1);
         let spends_the_budget = LiveRows {
             batches: page(&schema, &[0, 1]),
             dataset,
@@ -2312,7 +2353,8 @@ mod tests {
         let mut store = dataset.object_store.as_ref().clone();
         store.inner = Arc::new(ProxyObjectStore::new(store.inner.clone(), policy.clone()));
         dataset.object_store = Arc::new(store);
-        let budget = Arc::new(VisitBudget::new(5));
+        let budget = Arc::new(VisitBudget::default());
+        budget.grant(5);
         let other_segment = budget.clone();
         policy.lock().unwrap().set_before_policy(
             "another segment spends the budget",

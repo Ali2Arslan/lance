@@ -20,6 +20,7 @@ pub mod minhash;
 mod optimizer;
 pub(crate) mod ordered_fallback;
 pub mod ordered_index_scan;
+pub(crate) mod ordered_merge;
 mod prefilter_union;
 mod projection;
 mod pushdown_scan;
