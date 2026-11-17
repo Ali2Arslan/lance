@@ -598,13 +598,13 @@ impl Scanner {
                 }
             }
             if is_full || chosen.is_none() {
-                chosen = Some((index, segments, unindexed));
+                chosen = Some((index, segments, covered, unindexed));
             }
             if is_full {
                 break;
             }
         }
-        let Some((index, segments, unindexed)) = chosen else {
+        let Some((index, segments, covered, unindexed)) = chosen else {
             if matches!(decline, OrderedIndexDecline::NoIndex { .. }) {
                 let mut ignored_indices = Vec::new();
                 for index in ignored {
@@ -636,8 +636,9 @@ impl Scanner {
                 } else {
                     MaskedRead::MaySort
                 };
+                let covered = covered.into_iter().cloned().collect::<Vec<_>>();
                 let (mask, is_exact) = self
-                    .index_mask(index_query, read)
+                    .index_mask(index_query, read, &covered)
                     .await
                     .map_err(|source| OrderedIndexDecline::unreadable(column, None, source))?;
                 let residual = if is_exact {
@@ -801,15 +802,16 @@ impl Scanner {
         Ok(merged)
     }
 
-    /// The mask that applies `index_query` to an ordered read as the sort plan
-    /// applies it, and whether the search is exact for every row it lets
-    /// through.
+    /// The mask that applies `index_query` to an ordered read of `fragments`
+    /// as the sort plan applies it, and whether the search is exact for every
+    /// row it lets through there. A merge reads the other fragments with the
+    /// whole filter, so their rows need no recheck after the read.
     async fn index_mask(
         &self,
         index_query: &ScalarIndexExpr,
         read: MaskedRead,
+        fragments: &[Fragment],
     ) -> Result<(IndexMask, bool), Error> {
-        let fragments = self.dataset.fragments();
         let search = self
             .scalar_index_search(index_query.clone(), fragments)
             .await?;
@@ -4180,6 +4182,8 @@ mod tests {
                 mode == OrderedIndexMode::Auto,
                 "{plan}"
             );
+            // The mask answers every row the walk reads, so no residual rechecks them.
+            assert!(!plan.contains("residual="), "{plan}");
             if mode == OrderedIndexMode::Auto {
                 let analyzed = scanner.analyze_plan().await.unwrap();
                 assert!(
