@@ -1015,8 +1015,11 @@ class ScannerBuilder:
 
         With ``"auto"``, the default, a scan with a limit that orders by one column
         with a B-tree index reads that index in key order and stops after
-        ``offset + limit`` live rows, instead of sorting every row.  An exact
-        search of the same index in the filter limits the keys the read visits.
+        ``offset + limit`` live rows, instead of sorting every row.  The scan sorts
+        the rows of fragments the index does not cover, as rows appended since the
+        index was last optimized, and merges them into the read, unless they hold
+        more than half of the live rows.  An exact search of the same index in the
+        filter limits the keys the read visits.
         Any other index search in the filter runs first, and the read skips the
         rows it rules out.  The scan sorts the rows that search selects instead
         when they are too few for the read to pay off, or when the read visits a
@@ -1035,7 +1038,9 @@ class ScannerBuilder:
         ``ValueError`` that planning does.  A required read skips the rows that
         the filter's index searches rule out and applies the rest of the filter
         to each row it reads, so a selective filter can make it read the whole
-        index.  A scan without ``order_by`` is not affected.
+        index.  It merges in the rows of fragments the index does not cover however
+        many they are, unless the index covers none of the live rows.  A scan
+        without ``order_by`` is not affected.
         Names are case-insensitive, and the scanner rejects any other name with a
         ``ValueError``.  Other uses of scalar indices are not affected.
         """
