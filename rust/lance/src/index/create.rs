@@ -16,7 +16,7 @@ use crate::{
         lifecycle::build_index_metadata_from_segments,
         loading::{DatasetIndexInternalExt, load_all_indices, load_all_indices_by_name},
         memory_progress::{ObservedBuild, ObservedOperation, index_type_label},
-        scalar::{build_bitmap_index_segment, build_scalar_index},
+        scalar::{KeyColumnsTraining, build_bitmap_index_segment, build_scalar_index},
         vector::details::{vector_index_details, vector_index_details_default},
         vector::{
             LANCE_VECTOR_INDEX, StageParams, VectorIndexParams, build_distributed_vector_index,
@@ -33,7 +33,7 @@ use lance_index::{
 use lance_index::{
     metrics::NoOpMetricsCollector,
     scalar::{
-        LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
+        BuiltinIndexType, LANCE_SCALAR_INDEX, ScalarIndexParams, index_files_to_table,
         inverted::tokenizer::InvertedIndexParams, table_files_to_index,
     },
 };
@@ -222,12 +222,14 @@ impl<'a> CreateIndexBuilder<'a> {
         &mut self,
     ) -> BoxFuture<'_, Result<(IndexMetadata, ObservedBuild)>> {
         async move {
-        if self.columns.len() != 1 {
-            return Err(Error::index(
-                "Only support building index on 1 column at the moment".to_string(),
+        if self.columns.is_empty() {
+            return Err(Error::invalid_input(
+                "CreateIndex: an index needs at least one column",
             ));
         }
-        let column_input = &self.columns[0];
+        let [column_input] = self.columns.as_slice() else {
+            return self.execute_uncommitted_key_columns().await;
+        };
         let scalar_fts_request = self.index_type == IndexType::Scalar
             && self
                 .params
@@ -386,16 +388,8 @@ impl<'a> CreateIndexBuilder<'a> {
             .dataset
             .open_frag_reuse_index(&NoOpMetricsCollector)
             .await?;
-        // Read without consuming: a failed build must leave the requested name in
-        // place so a retry commits under it instead of an auto-generated one.
-        let index_name = if let Some(name) = self.name.as_deref() {
-            name.to_string()
-        } else {
-            // Generate default name with collision handling.
-            // A name is available when there is no existing index with:
-            //   - the same name AND different fields, OR
-            //   - the same name AND same field BUT a different index kind
-            let column_path = resolved_fts_field
+        let index_name = self.resolve_index_name(&indices, &[field.id], || {
+            resolved_fts_field
                 .as_ref()
                 .map(|resolved| {
                     if resolved.document_granularity.is_list_element() {
@@ -404,44 +398,8 @@ impl<'a> CreateIndexBuilder<'a> {
                         resolved.canonical_path.clone()
                     }
                 })
-                .unwrap_or_else(|| default_index_name(&names));
-            let base_name = format!("{column_path}_idx");
-            let mut candidate = base_name.clone();
-            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
-            while indices.iter().any(|idx| {
-                // A covered index still names the same column by its keyed
-                // prefix; only that prefix decides whether this is "the same
-                // field", not the full `fields` vector including carried
-                // columns.
-                let different_field = idx.keyed_field() != Some(field.id);
-                idx.name == candidate
-                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
-            }) {
-                candidate = format!("{base_name}_{counter}");
-                counter += 1;
-            }
-            candidate
-        };
-        let existing_named_indices = indices
-            .iter()
-            .filter(|idx| idx.name == index_name)
-            .collect::<Vec<_>>();
-        if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
-            // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
-        }) {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        if !existing_named_indices.is_empty() && !self.replace {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists, \
-                please specify a different name or use replace=True"
-            )));
-        }
+                .unwrap_or_else(|| default_index_name(&names))
+        })?;
         ensure_index_uuid_allowed(
             self.index_type,
             self.params,
@@ -717,10 +675,187 @@ impl<'a> CreateIndexBuilder<'a> {
             }
         };
 
-        let index_metadata = IndexMetadata {
-            uuid: output_index_uuid,
-            name: index_name,
-            fields: vec![field.id],
+        let index_metadata = self.new_index_metadata(
+            output_index_uuid,
+            index_name,
+            vec![field.id],
+            train,
+            created_index,
+        );
+        // A generic scalar request only resolves to an implementation here.
+        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
+        Ok((index_metadata, observed))
+        }
+        .boxed()
+    }
+
+    async fn execute_uncommitted_key_columns(&mut self) -> Result<(IndexMetadata, ObservedBuild)> {
+        let schema = self.dataset.schema();
+        let mut key_fields: Vec<&lance_core::datatypes::Field> =
+            Vec::with_capacity(self.columns.len());
+        let mut key_paths = Vec::with_capacity(self.columns.len());
+        let mut default_names = Vec::with_capacity(self.columns.len());
+        for column in &self.columns {
+            let Some(field_path) = schema.resolve_case_insensitive(column) else {
+                return Err(Error::index(format!(
+                    "CreateIndex: column '{column}' does not exist"
+                )));
+            };
+            let Some(&field) = field_path.last() else {
+                return Err(Error::index(format!(
+                    "CreateIndex: column '{column}' resolved to an empty field path"
+                )));
+            };
+            if key_fields.iter().any(|key| key.id == field.id) {
+                return Err(Error::invalid_input(format!(
+                    "CreateIndex: column '{column}' is listed more than once in {:?}",
+                    self.columns
+                )));
+            }
+            let names: Vec<&str> = field_path.iter().map(|f| f.name.as_str()).collect();
+            key_fields.push(field);
+            key_paths.push(format_field_path(&names));
+            default_names.push(default_index_name(&names));
+        }
+
+        let params = self.key_columns_params()?;
+        let first_key = key_paths[0].clone();
+        let training = KeyColumnsTraining::new(self.dataset, &params, key_paths)?;
+        if self.preprocessed_data.is_some() {
+            return Err(Error::invalid_input(format!(
+                "CreateIndex: preprocessed data trains an index on one column, but this \
+                 index is keyed on {:?}",
+                self.columns
+            )));
+        }
+
+        let indices = load_all_indices(self.dataset).await?;
+        let train = should_train_index(self.dataset, self.train, None, None, &first_key).await?;
+        let key_ids = key_fields.iter().map(|field| field.id).collect::<Vec<_>>();
+        let index_name = self.resolve_index_name(&indices, &key_ids, || default_names.join("_"))?;
+        ensure_index_uuid_allowed(
+            self.index_type,
+            self.params,
+            self.fragments.as_ref(),
+            self.index_uuid.as_ref(),
+        )?;
+
+        let index_id = self.index_uuid.unwrap_or_else(Uuid::new_v4);
+        let observed = self.observe_build(train)?;
+        let created_index = training
+            .build(
+                self.dataset,
+                index_id,
+                train,
+                self.fragments.clone(),
+                observed.progress(),
+            )
+            .await?;
+        let index_metadata =
+            self.new_index_metadata(index_id, index_name, key_ids, train, created_index);
+        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
+        Ok((index_metadata, observed))
+    }
+
+    fn key_columns_params(&self) -> Result<ScalarIndexParams> {
+        let provided = self.params.as_any().downcast_ref::<ScalarIndexParams>();
+        if self.index_type == IndexType::Scalar
+            && let Some(provided) = provided
+        {
+            // The registry has no "fts" plugin; it is Lance's name for "inverted".
+            let index_type = if provided.index_type.eq_ignore_ascii_case("fts") {
+                BuiltinIndexType::Inverted.as_str()
+            } else {
+                provided.index_type.as_str()
+            };
+            return Ok(ScalarIndexParams {
+                index_type: index_type.to_string(),
+                params: provided.params.clone(),
+            });
+        }
+        let is_scalar_plugin = self.params.index_name() == LANCE_SCALAR_INDEX
+            || self.index_type == IndexType::Inverted;
+        match BuiltinIndexType::try_from(self.index_type) {
+            Ok(builtin) if is_scalar_plugin => Ok(ScalarIndexParams {
+                index_type: builtin.as_str().to_string(),
+                params: provided.and_then(|provided| provided.params.clone()),
+            }),
+            _ => Err(Error::invalid_input(format!(
+                "{} index: this index type takes one column, but {} were given: {:?}",
+                self.index_type,
+                self.columns.len(),
+                self.columns
+            ))),
+        }
+    }
+
+    fn resolve_index_name(
+        &self,
+        indices: &[IndexMetadata],
+        key_fields: &[i32],
+        column_path: impl FnOnce() -> String,
+    ) -> Result<String> {
+        // Read without consuming: a failed build must leave the requested name in
+        // place so a retry commits under it instead of an auto-generated one.
+        let index_name = if let Some(name) = self.name.as_deref() {
+            name.to_string()
+        } else {
+            // Generate default name with collision handling.
+            // A name is available when there is no existing index with:
+            //   - the same name AND different fields, OR
+            //   - the same name AND same field BUT a different index kind
+            let base_name = format!("{}_idx", column_path());
+            let mut candidate = base_name.clone();
+            let mut counter = 2; // Start with no suffix, then use _2, _3, ...
+            while indices.iter().any(|idx| {
+                // A covered index still names the same column by its keyed
+                // prefix; only that prefix decides whether this is "the same
+                // field", not the full `fields` vector including carried
+                // columns.
+                let different_field = idx.keyed_fields() != key_fields;
+                idx.name == candidate
+                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
+            }) {
+                candidate = format!("{base_name}_{counter}");
+                counter += 1;
+            }
+            candidate
+        };
+        let existing_named_indices = indices
+            .iter()
+            .filter(|idx| idx.name == index_name)
+            .collect::<Vec<_>>();
+        if existing_named_indices.iter().any(|idx| {
+            // Same rule as above: the keyed prefix decides identity, not the
+            // full `fields` vector.
+            idx.keyed_fields() != key_fields
+        }) {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists with different fields, \
+                please specify a different name"
+            )));
+        }
+        if !existing_named_indices.is_empty() && !self.replace {
+            return Err(Error::index(format!(
+                "Index name '{index_name}' already exists, \
+                please specify a different name or use replace=True"
+            )));
+        }
+        Ok(index_name)
+    }
+
+    fn new_index_metadata(
+        &self,
+        uuid: Uuid,
+        name: String,
+        fields: Vec<i32>,
+        train: bool,
+        created_index: CreatedIndex,
+    ) -> IndexMetadata {
+        IndexMetadata {
+            uuid,
+            name,
+            fields,
             covering_fields: vec![],
             dataset_version: self.dataset.manifest.version,
             fragment_bitmap: if train {
@@ -739,12 +874,7 @@ impl<'a> CreateIndexBuilder<'a> {
             files: Some(index_files_to_table(created_index.files)),
             clustering_id: None,
             metadata: Default::default(),
-        };
-        // A generic scalar request only resolves to an implementation here.
-        ensure_index_allowed_with_frag_reuse(&self.dataset.manifest, &indices, &index_metadata)?;
-        Ok((index_metadata, observed))
         }
-        .boxed()
     }
 
     #[instrument(skip_all)]
@@ -752,10 +882,14 @@ impl<'a> CreateIndexBuilder<'a> {
         // Multi-segment FM-Index path: split whole-table builds into fragment groups.
         // Explicit fragment selections stay on the single-segment path.
         if self.fragments.is_none()
+            && let [column] = self.columns.as_slice()
             && let Some(num_segments) = self.fmindex_num_segments()
             && num_segments > 1
         {
-            return self.execute_multi_segment_fmindex(num_segments).await;
+            let column = column.clone();
+            return self
+                .execute_multi_segment_fmindex(&column, num_segments)
+                .await;
         }
 
         let (new_idx, observed) = self
@@ -819,15 +953,11 @@ impl<'a> CreateIndexBuilder<'a> {
     }
 
     /// Build FM-Index with multiple segments, each covering a subset of fragments.
-    async fn execute_multi_segment_fmindex(&mut self, num_segments: u32) -> Result<IndexMetadata> {
-        // Validate column count: same check as execute_uncommitted
-        if self.columns.len() != 1 {
-            return Err(Error::index(
-                "Only support building index on 1 column at the moment".to_string(),
-            ));
-        }
-
-        let column_input = &self.columns[0];
+    async fn execute_multi_segment_fmindex(
+        &mut self,
+        column_input: &str,
+        num_segments: u32,
+    ) -> Result<IndexMetadata> {
         let Some(field_path) = self.dataset.schema().resolve_case_insensitive(column_input) else {
             return Err(Error::index(format!(
                 "CreateIndex: column '{column_input}' does not exist"
@@ -844,47 +974,12 @@ impl<'a> CreateIndexBuilder<'a> {
         };
 
         let indices = load_all_indices(self.dataset).await?;
-        // Matches execute_uncommitted. Unobservable here, since the only caller
-        // consumes the builder.
-        let index_name = if let Some(name) = self.name.as_deref() {
-            name.to_string()
-        } else {
-            let column_path = default_index_name(&names);
-            let base_name = format!("{column_path}_idx");
-            let mut candidate = base_name.clone();
-            let mut counter = 2;
-            while indices.iter().any(|idx| {
-                // Same name-collision rule as `execute_uncommitted_impl`'s
-                // default-name loop above in this file.
-                let different_field = idx.keyed_field() != Some(field.id);
-                idx.name == candidate
-                    && (different_field || !index_matches_type(idx, self.index_type, self.params))
-            }) {
-                candidate = format!("{base_name}_{counter}");
-                counter += 1;
-            }
-            candidate
-        };
+        let index_name =
+            self.resolve_index_name(&indices, &[field.id], || default_index_name(&names))?;
         let existing_named_indices = indices
             .iter()
             .filter(|idx| idx.name == index_name)
             .collect::<Vec<_>>();
-        if existing_named_indices.iter().any(|idx| {
-            // Same rule as above: the keyed prefix decides identity, not the
-            // full `fields` vector.
-            idx.keyed_field() != Some(field.id)
-        }) {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists with different fields, \
-                please specify a different name"
-            )));
-        }
-        if !existing_named_indices.is_empty() && !self.replace {
-            return Err(Error::index(format!(
-                "Index name '{index_name}' already exists, \
-                please specify a different name or use replace=True"
-            )));
-        }
 
         let all_fragment_ids: Vec<u32> = self.dataset.fragment_bitmap.as_ref().iter().collect();
         if !train || all_fragment_ids.is_empty() {
@@ -5682,5 +5777,225 @@ mod tests {
                         && idx.fragment_bitmap.as_ref().unwrap().len() == 1)
             );
         }
+    }
+
+    #[rstest]
+    #[case::btree(IndexType::BTree, "i", "text", "BTree", 0)]
+    #[case::bitmap(IndexType::Bitmap, "i", "text", "Bitmap", 0)]
+    #[case::label_list(IndexType::LabelList, "labels", "i", "LabelList", 1)]
+    #[case::inverted(IndexType::Inverted, "text", "i", "Inverted", 2)]
+    #[case::ngram(IndexType::NGram, "text", "i", "NGram", 0)]
+    #[case::zone_map(IndexType::ZoneMap, "i", "text", "ZoneMap", 1)]
+    #[case::bloom_filter(IndexType::BloomFilter, "i", "text", "BloomFilter", 0)]
+    #[tokio::test]
+    async fn create_index_builtin_scalar_types_take_one_column(
+        #[case] index_type: IndexType,
+        #[case] column: &str,
+        #[case] other_column: &str,
+        #[case] plugin_name: &str,
+        #[case] index_version: i32,
+    ) {
+        let mut dataset = gen_batch()
+            .col("i", lance_datagen::array::step::<Int64Type>())
+            .col(
+                "labels",
+                lance_datagen::array::rand_list(&DataType::Int64, false),
+            )
+            .col("text", lance_datagen::array::random_sentence(2, 6, false))
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(20))
+            .await
+            .unwrap();
+        let inverted_params = InvertedIndexParams::default();
+        let scalar_params = ScalarIndexParams::default();
+        let params: &dyn IndexParams = if index_type == IndexType::Inverted {
+            &inverted_params
+        } else {
+            &scalar_params
+        };
+
+        let error = dataset
+            .create_index(&[column, other_column], index_type, None, params, false)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        let expected = format!(
+            "{plugin_name} index: this index type takes one column, but 2 were given: \
+             [\"{column}\", \"{other_column}\"]"
+        );
+        assert!(error.to_string().contains(&expected), "{error}");
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+
+        dataset
+            .create_index(&[column], index_type, None, params, false)
+            .await
+            .unwrap();
+        let indices = dataset.load_indices().await.unwrap();
+        let [index] = indices.as_slice() else {
+            panic!("expected one index, got {indices:?}");
+        };
+        assert_eq!(index.name, format!("{column}_idx"));
+        assert_eq!(index.fields, [dataset.schema().field(column).unwrap().id]);
+        assert!(index.covering_fields.is_empty());
+        assert_eq!(index.index_version, index_version);
+        assert_eq!(
+            index.fragment_bitmap.as_ref().unwrap(),
+            dataset.fragment_bitmap.as_ref()
+        );
+        let type_url = &index.index_details.as_ref().unwrap().type_url;
+        assert!(
+            type_url.ends_with(&format!(".{plugin_name}IndexDetails")),
+            "{type_url}"
+        );
+    }
+
+    #[rstest]
+    #[case::repeated(
+        &["a", "a"],
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "column 'a' is listed more than once"
+    )]
+    #[case::repeated_in_another_case(
+        &["a", "A"],
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "column 'A' is listed more than once"
+    )]
+    #[case::missing(
+        &["a", "missing"],
+        |error: &Error| matches!(error, Error::Index { .. }),
+        "column 'missing' does not exist"
+    )]
+    #[case::no_columns(
+        &[],
+        |error: &Error| matches!(error, Error::InvalidInput { .. }),
+        "an index needs at least one column"
+    )]
+    #[tokio::test]
+    async fn create_index_rejects_key_columns_it_cannot_resolve(
+        #[case] columns: &[&str],
+        #[case] is_expected_variant: fn(&Error) -> bool,
+        #[case] expected_message: &str,
+    ) {
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let error = dataset
+            .create_index(
+                columns,
+                IndexType::Scalar,
+                None,
+                &ScalarIndexParams::new("keycolumnstest".to_string()),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(is_expected_variant(&error), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_index_vector_types_take_one_column() {
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let error = dataset
+            .create_index(
+                &["a", "b"],
+                IndexType::IvfPq,
+                None,
+                &VectorIndexParams::ivf_pq(2, 8, 1, MetricType::L2, 10),
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error.to_string().contains(
+                "IVF_PQ index: this index type takes one column, but 2 were given: [\"a\", \"b\"]"
+            ),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_names_key_columns_in_key_order() {
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(2), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let params = ScalarIndexParams::new("keycolumnstest".to_string());
+        let a = dataset.schema().field("a").unwrap().id;
+        let b = dataset.schema().field("b").unwrap().id;
+
+        let index = dataset
+            .create_index(&["a", "b"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(index.name, "a_b_idx");
+        assert_eq!(index.fields, [a, b]);
+
+        let error = dataset
+            .create_index(
+                &["b", "a"],
+                IndexType::Scalar,
+                Some("a_b_idx".to_string()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("already exists with different fields"),
+            "{error}"
+        );
+
+        let index = dataset
+            .create_index(&["b", "a"], IndexType::Scalar, None, &params, false)
+            .await
+            .unwrap();
+        assert_eq!(index.name, "b_a_idx");
+        assert_eq!(index.fields, [b, a]);
+    }
+
+    #[tokio::test]
+    async fn create_index_on_key_columns_refuses_preprocessed_data() {
+        let mut dataset = gen_batch()
+            .col("a", lance_datagen::array::step::<Int32Type>())
+            .col("b", lance_datagen::array::step::<Int32Type>())
+            .into_ram_dataset(FragmentCount::from(1), FragmentRowCount::from(10))
+            .await
+            .unwrap();
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let error = dataset
+            .create_index_builder(
+                &["a", "b"],
+                IndexType::Scalar,
+                &ScalarIndexParams::new("keycolumnstest".to_string()),
+            )
+            .preprocessed_data(Box::new(RecordBatchIterator::new(vec![], schema)))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("preprocessed data trains an index on one column"),
+            "{error}"
+        );
+        assert!(dataset.load_indices().await.unwrap().is_empty());
     }
 }

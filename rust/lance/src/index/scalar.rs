@@ -68,8 +68,8 @@ use lance_index::scalar::label_list::{
 };
 use lance_index::scalar::ngram::POSTINGS_FILENAME;
 use lance_index::scalar::registry::{
-    ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-    VALUE_COLUMN_NAME,
+    BasicTrainer, ScalarIndexCacheKey, ScalarIndexLoad, ScalarIndexPlugin, TrainingCriteria,
+    TrainingInputLayout, TrainingOrdering, TrainingRequest, VALUE_COLUMN_NAME,
 };
 use lance_index::scalar::zonemap::{ZONEMAP_INDEX_FILENAME, ZoneMapIndexBuilderParams};
 use lance_index::scalar::{BuiltinIndexType, CreatedIndex, InvertedIndexParams};
@@ -86,39 +86,62 @@ use tracing::instrument;
 // Log an update every TRAINING_UPDATE_FREQ million rows processed
 const TRAINING_UPDATE_FREQ: usize = 1000000;
 
-pub(crate) struct TrainingRequest {
-    pub fragment_ids: Option<Vec<u32>>,
+#[derive(Clone, Copy)]
+pub(crate) enum TrainingColumns<'a> {
+    Value(&'a str),
+    KeyColumns(&'a [&'a str]),
 }
 
-impl TrainingRequest {
-    pub fn with_fragment_ids(
-        _dataset: Arc<Dataset>,
-        _column: String,
-        fragment_ids: Vec<u32>,
-    ) -> Self {
-        Self {
-            fragment_ids: Some(fragment_ids),
+impl<'a> TrainingColumns<'a> {
+    pub(crate) fn for_request(
+        index_type: &str,
+        request: &dyn TrainingRequest,
+        columns: &'a [&'a str],
+    ) -> Result<Self> {
+        match (request.input_layout(), columns) {
+            (TrainingInputLayout::Value, [column]) => Ok(Self::Value(column)),
+            (TrainingInputLayout::Value, _) => Err(Error::not_supported(format!(
+                "{index_type} index: a value-layout training request trains on one column, but \
+                 the index is keyed on {columns:?}"
+            ))),
+            (TrainingInputLayout::KeyColumns, _)
+                if request.criteria().ordering == TrainingOrdering::Values =>
+            {
+                Err(Error::not_supported(format!(
+                    "{index_type} index: key-column training data is never sorted by value, \
+                     so its training request cannot ask for {:?}",
+                    TrainingOrdering::Values
+                )))
+            }
+            (TrainingInputLayout::KeyColumns, _) => Ok(Self::KeyColumns(columns)),
         }
     }
 
-    async fn create_empty_stream(
+    fn empty_stream(
+        self,
         dataset: &Dataset,
-        column: &str,
         criteria: &TrainingCriteria,
     ) -> Result<SendableRecordBatchStream> {
-        let column_field = dataset
-            .schema()
-            .field(column)
-            .ok_or(Error::invalid_input_source(
-                format!("No column with name {}", column).into(),
-            ))?;
-
-        let mut fields = Vec::with_capacity(3);
-        fields.push(arrow_schema::Field::new(
-            VALUE_COLUMN_NAME,
-            column_field.data_type(),
-            true,
-        ));
+        let mut fields = match self {
+            Self::Value(column) => {
+                let column_field =
+                    dataset
+                        .schema()
+                        .field(column)
+                        .ok_or(Error::invalid_input_source(
+                            format!("No column with name {}", column).into(),
+                        ))?;
+                vec![arrow_schema::Field::new(
+                    VALUE_COLUMN_NAME,
+                    column_field.data_type(),
+                    true,
+                )]
+            }
+            Self::KeyColumns(columns) => key_column_fields(dataset, columns)?
+                .into_iter()
+                .map(|(name, field)| arrow_schema::Field::new(name, field.data_type(), true))
+                .collect(),
+        };
         if criteria.needs_row_ids {
             fields.push(arrow_schema::Field::new(
                 ROW_ID,
@@ -134,7 +157,7 @@ impl TrainingRequest {
             ));
         }
 
-        // Create schema with the column and row_id field (matching scan_chunks behavior)
+        // Create schema with the columns and row_id field (matching scan_chunks behavior)
         let schema = Arc::new(arrow_schema::Schema::new(fields));
 
         // Create empty stream
@@ -144,6 +167,22 @@ impl TrainingRequest {
             empty_stream,
         )))
     }
+}
+
+fn key_column_fields<'d>(
+    dataset: &'d Dataset,
+    columns: &[&str],
+) -> Result<Vec<(String, &'d Field)>> {
+    columns
+        .iter()
+        .map(|column| {
+            let field = dataset
+                .schema()
+                .field(column)
+                .ok_or_else(|| Error::invalid_input(format!("No column with name {column}")))?;
+            Ok((dataset.schema().field_path_minimal(field.id)?, field))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -189,6 +228,23 @@ pub(crate) async fn scan_training_data(
     selection: Option<TrainingRows>,
     options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
+    scan_training_columns(
+        dataset,
+        TrainingColumns::Value(column),
+        criteria,
+        selection,
+        options,
+    )
+    .await
+}
+
+async fn scan_training_columns(
+    dataset: &Dataset,
+    columns: TrainingColumns<'_>,
+    criteria: &TrainingCriteria,
+    selection: Option<TrainingRows>,
+    options: TrainingScanOptions,
+) -> Result<SendableRecordBatchStream> {
     let num_rows = match options.expected_rows {
         Some(rows) => rows as usize,
         None => dataset.count_all_rows().await?,
@@ -202,12 +258,14 @@ pub(crate) async fn scan_training_data(
     if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
         scan.io_buffer_size(io_buffer_size);
     }
-    // Fragment filtering is now handled in load_training_data function
+    // Fragment filtering is now handled in load_training_columns function
     // This function just processes the fragments passed to it
 
     // Note: we don't need to sort for TrainingOrdering::Addresses because
     // Lance will return data in the order of the row_address by default.
-    if TrainingOrdering::Values == criteria.ordering {
+    if let TrainingColumns::Value(column) = columns
+        && TrainingOrdering::Values == criteria.ordering
+    {
         scan.order_by(Some(vec![ColumnOrdering::asc_nulls_first(
             column.to_string(),
         )]))?;
@@ -220,7 +278,20 @@ pub(crate) async fn scan_training_data(
         scan.with_row_address();
     }
 
-    scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
+    let column = match columns {
+        TrainingColumns::Value(column) => {
+            scan.project_with_transform(&[(VALUE_COLUMN_NAME, column)])?;
+            column.to_string()
+        }
+        TrainingColumns::KeyColumns(columns) => {
+            let names = key_column_fields(dataset, columns)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>();
+            scan.project(&names)?;
+            names.join(", ")
+        }
+    };
 
     match selection {
         Some(TrainingRows::Fragments(fragments)) => {
@@ -278,25 +349,31 @@ pub(crate) async fn load_training_data(
     fragment_ids: Option<Vec<u32>>,
     options: TrainingScanOptions,
 ) -> Result<SendableRecordBatchStream> {
-    // Create training request with fragment_ids if provided
-    let training_request = Box::new(match fragment_ids.clone() {
-        Some(fragment_ids) => TrainingRequest::with_fragment_ids(
-            Arc::new(dataset.clone()),
-            column.to_string(),
-            fragment_ids,
-        ),
-        None => TrainingRequest { fragment_ids: None },
-    });
+    load_training_columns(
+        dataset,
+        TrainingColumns::Value(column),
+        criteria,
+        fragments,
+        train,
+        fragment_ids,
+        options,
+    )
+    .await
+}
 
+async fn load_training_columns(
+    dataset: &Dataset,
+    columns: TrainingColumns<'_>,
+    criteria: &TrainingCriteria,
+    fragments: Option<Vec<Fragment>>,
+    train: bool,
+    fragment_ids: Option<Vec<u32>>,
+    options: TrainingScanOptions,
+) -> Result<SendableRecordBatchStream> {
     if train {
-        // Use the training request to scan data with fragment filtering
-        if let Some(ref fragment_ids) = training_request.fragment_ids {
-            let fragment_ids = fragment_ids
-                .clone()
-                .into_iter()
-                .sorted()
-                .dedup()
-                .collect_vec();
+        // Scan data with fragment filtering
+        if let Some(fragment_ids) = fragment_ids {
+            let fragment_ids = fragment_ids.into_iter().sorted().dedup().collect_vec();
             let frags = dataset.get_frags_from_ordered_ids(&fragment_ids);
             let frags: Result<Vec<_>> = fragment_ids
                 .iter()
@@ -311,13 +388,13 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection, options).await
+            scan_training_columns(dataset, columns, criteria, selection, options).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection, options).await
+            scan_training_columns(dataset, columns, criteria, selection, options).await
         }
     } else {
-        TrainingRequest::create_empty_stream(dataset, column, criteria).await
+        columns.empty_stream(dataset, criteria)
     }
 }
 
@@ -376,16 +453,20 @@ pub(crate) async fn load_fts_training_data(
 // first default registry is built, and code outside `lance` can build one at any time.
 pub(crate) static SCALAR_INDEX_PLUGIN_REGISTRY: LazyLock<Arc<IndexPluginRegistry>> =
     LazyLock::new(|| {
-        #[cfg(feature = "geo")]
+        #[cfg(any(feature = "geo", test))]
         {
             IndexPluginRegistry::with_default_plugins_and(|registry| {
+                #[cfg(feature = "geo")]
                 registry.add_plugin::<
                     lance_index::pb::RTreeIndexDetails,
                     lance_geo::rtree::RTreeIndexPlugin,
                 >();
+                #[cfg(test)]
+                registry
+                    .add_plugin::<tests::KeyColumnsTestIndexDetails, tests::KeyColumnsTestPlugin>();
             })
         }
-        #[cfg(not(feature = "geo"))]
+        #[cfg(not(any(feature = "geo", test)))]
         IndexPluginRegistry::with_default_plugins()
     });
 
@@ -557,14 +638,11 @@ pub(super) async fn build_scalar_index(
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
 
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
-    let trainer = plugin.basic_trainer().ok_or_else(|| {
-        Error::invalid_input_source(
-            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
-        )
-    })?;
-    let training_request =
-        trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
+    let (_, trainer) = scalar_trainer(params)?;
+    let training_request = trainer.new_training_request_for_fields(
+        params.params.as_deref().unwrap_or("{}"),
+        std::slice::from_ref(&field),
+    )?;
 
     // A zone map trained from the table reuses the write seeds its fragments
     // already carry and scans only the fragments without one. A caller that
@@ -605,6 +683,13 @@ pub(super) async fn build_scalar_index(
     progress.stage_start("load_data", None, "rows").await?;
     let training_data = match (preprocessed_data, resolved_fts_field.as_ref()) {
         (Some((preprocessed_data, declared)), _) => {
+            if training_request.input_layout() != TrainingInputLayout::Value {
+                return Err(Error::not_supported(format!(
+                    "preprocessed data for index type '{}' holds one value column, but it \
+                     trains from key columns",
+                    params.index_type
+                )));
+            }
             let required = training_request.criteria();
             if declared != *required {
                 return Err(Error::invalid_input(format!(
@@ -631,9 +716,14 @@ pub(super) async fn build_scalar_index(
             .await?
         }
         (None, None) => {
-            load_training_data(
+            let columns = [column];
+            load_training_columns(
                 dataset,
-                column,
+                TrainingColumns::for_request(
+                    &params.index_type,
+                    training_request.as_ref(),
+                    &columns,
+                )?,
                 training_request.criteria(),
                 None,
                 train,
@@ -692,6 +782,94 @@ pub(super) async fn build_scalar_index(
     Ok(created_index)
 }
 
+fn scalar_trainer(
+    params: &ScalarIndexParams,
+) -> Result<(&'static dyn ScalarIndexPlugin, &'static dyn BasicTrainer)> {
+    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
+    let trainer = plugin.basic_trainer().ok_or_else(|| {
+        Error::invalid_input_source(
+            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
+        )
+    })?;
+    Ok((plugin, trainer))
+}
+
+pub(super) struct KeyColumnsTraining {
+    plugin: &'static dyn ScalarIndexPlugin,
+    trainer: &'static dyn BasicTrainer,
+    request: Box<dyn TrainingRequest>,
+    columns: Vec<String>,
+}
+
+impl KeyColumnsTraining {
+    pub(super) fn new(
+        dataset: &Dataset,
+        params: &ScalarIndexParams,
+        columns: Vec<String>,
+    ) -> Result<Self> {
+        let fields = columns
+            .iter()
+            .map(|column| {
+                dataset
+                    .schema()
+                    .field(column)
+                    .map(arrow_schema::Field::from)
+                    .ok_or_else(|| Error::invalid_input(format!("No column with name {column}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (plugin, trainer) = scalar_trainer(params)?;
+        let request = trainer
+            .new_training_request_for_fields(params.params.as_deref().unwrap_or("{}"), &fields)
+            .map_err(|error| match error {
+                Error::InvalidInput { source, .. } => {
+                    Error::invalid_input(format!("{} index: {source}", plugin.name()))
+                }
+                error => error,
+            })?;
+        Ok(Self {
+            plugin,
+            trainer,
+            request,
+            columns,
+        })
+    }
+
+    pub(super) async fn build(
+        self,
+        dataset: &Dataset,
+        uuid: Uuid,
+        train: bool,
+        fragment_ids: Option<Vec<u32>>,
+        progress: Arc<dyn IndexBuildProgress>,
+    ) -> Result<CreatedIndex> {
+        let Self {
+            plugin,
+            trainer,
+            request,
+            columns,
+        } = self;
+        let columns = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        let training_columns =
+            TrainingColumns::for_request(plugin.name(), request.as_ref(), &columns)?;
+        let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
+        progress.stage_start("load_data", None, "rows").await?;
+        let training_data = load_training_columns(
+            dataset,
+            training_columns,
+            request.criteria(),
+            None,
+            train,
+            fragment_ids.clone(),
+            TrainingScanOptions::default(),
+        )
+        .await?;
+        progress.stage_complete("load_data").await?;
+        trainer
+            .train_index(training_data, &index_store, request, fragment_ids, progress)
+            .await
+    }
+}
+
 /// Build a canonical bitmap index segment over a caller-selected fragment set.
 ///
 /// This is intentionally separate from `build_scalar_index(..., fragment_ids=Some(...))`.
@@ -715,12 +893,7 @@ pub(super) async fn build_bitmap_index_segment(
     let field: arrow_schema::Field = field.into();
 
     let params = ScalarIndexParams::for_builtin(BuiltinIndexType::Bitmap);
-    let plugin = SCALAR_INDEX_PLUGIN_REGISTRY.get_plugin_by_name(&params.index_type)?;
-    let trainer = plugin.basic_trainer().ok_or_else(|| {
-        Error::invalid_input_source(
-            format!("The '{}' index type does not support basic training, please refer to the index's documentation for more details on how to create this index.", params.index_type).into(),
-        )
-    })?;
+    let (_, trainer) = scalar_trainer(&params)?;
     let training_request =
         trainer.new_training_request(params.params.as_deref().unwrap_or("{}"), &field)?;
     let criteria = training_request.criteria();
@@ -3315,5 +3488,353 @@ mod tests {
                 .unwrap();
             assert_eq!(inferred_no_files.type_url, expected_type_url);
         }
+    }
+
+    const KEY_COLUMNS_TRAINING_FILE: &str = "training.lance";
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub(super) struct KeyColumnsTestIndexDetails {
+        /// The names of the training data's columns, in order.
+        #[prost(string, repeated, tag = "1")]
+        columns: Vec<String>,
+    }
+
+    impl Name for KeyColumnsTestIndexDetails {
+        const NAME: &'static str = "KeyColumnsTestIndexDetails";
+        const PACKAGE: &'static str = "lance.test";
+    }
+
+    struct KeyColumnsTestRequest(TrainingCriteria, TrainingInputLayout);
+
+    impl TrainingRequest for KeyColumnsTestRequest {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn criteria(&self) -> &TrainingCriteria {
+            &self.0
+        }
+
+        fn input_layout(&self) -> TrainingInputLayout {
+            self.1
+        }
+    }
+
+    /// Stores the training data it receives in [`KEY_COLUMNS_TRAINING_FILE`]
+    /// so a test reads back exactly what Lance sent it. Its index is never
+    /// opened. The params `{"value_layout": true}` and `{"sort_by_value": true}`
+    /// make it ask for training data Lance cannot serve for key columns.
+    #[derive(Debug, Default)]
+    pub(super) struct KeyColumnsTestPlugin;
+
+    #[async_trait::async_trait]
+    impl BasicTrainer for KeyColumnsTestPlugin {
+        fn new_training_request(
+            &self,
+            params: &str,
+            field: &arrow_schema::Field,
+        ) -> Result<Box<dyn TrainingRequest>> {
+            self.new_training_request_for_fields(params, std::slice::from_ref(field))
+        }
+
+        fn new_training_request_for_fields(
+            &self,
+            params: &str,
+            fields: &[arrow_schema::Field],
+        ) -> Result<Box<dyn TrainingRequest>> {
+            if fields.is_empty() {
+                return Err(Error::invalid_input("needs at least one key column"));
+            }
+            let params = serde_json::from_str::<serde_json::Value>(params)?;
+            let is_set = |name: &str| params[name].as_bool().unwrap_or(false);
+            let ordering = if is_set("sort_by_value") {
+                TrainingOrdering::Values
+            } else {
+                TrainingOrdering::None
+            };
+            let layout = if is_set("value_layout") {
+                TrainingInputLayout::Value
+            } else {
+                TrainingInputLayout::KeyColumns
+            };
+            Ok(Box::new(KeyColumnsTestRequest(
+                TrainingCriteria::new(ordering).with_row_addr(),
+                layout,
+            )))
+        }
+
+        async fn train_index(
+            &self,
+            mut data: SendableRecordBatchStream,
+            index_store: &dyn IndexStore,
+            _request: Box<dyn TrainingRequest>,
+            _fragment_ids: Option<Vec<u32>>,
+            _progress: Arc<dyn IndexBuildProgress>,
+        ) -> Result<CreatedIndex> {
+            let schema = data.schema();
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect();
+            // A Lance file refuses a top-level name with a `.`, which a nested
+            // key's field path has, so the file stores the columns by position.
+            let stored_schema = Arc::new(arrow_schema::Schema::new(
+                schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .map(|(position, field)| {
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_name(format!("column_{position}"))
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let mut writer = index_store
+                .new_index_file(KEY_COLUMNS_TRAINING_FILE, stored_schema.clone())
+                .await?;
+            while let Some(batch) = data.try_next().await? {
+                let batch = arrow_array::RecordBatch::try_new(
+                    stored_schema.clone(),
+                    batch.columns().to_vec(),
+                )?;
+                writer.write_record_batch(batch).await?;
+            }
+            Ok(CreatedIndex {
+                index_details: prost_types::Any::from_msg(&KeyColumnsTestIndexDetails { columns })?,
+                index_version: 0,
+                files: vec![writer.finish().await?],
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ScalarIndexPlugin for KeyColumnsTestPlugin {
+        fn basic_trainer(&self) -> Option<&dyn BasicTrainer> {
+            Some(self)
+        }
+
+        fn name(&self) -> &str {
+            "KeyColumnsTest"
+        }
+
+        fn provides_exact_answer(&self) -> bool {
+            true
+        }
+
+        fn version(&self) -> u32 {
+            0
+        }
+
+        fn new_query_parser(
+            &self,
+            _index_name: String,
+            _index_details: &prost_types::Any,
+        ) -> Option<Box<dyn lance_index::scalar::expression::ScalarQueryParser>> {
+            None
+        }
+
+        async fn load_index(
+            &self,
+            _index_store: Arc<dyn IndexStore>,
+            _index_details: &prost_types::Any,
+            _index_version: u32,
+            _frag_reuse_index: Option<Arc<dyn lance_index::scalar::RowIdRemapper>>,
+            _cache: &lance_core::cache::LanceCache,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Err(Error::not_supported(
+                "the key-columns test index is never opened",
+            ))
+        }
+    }
+
+    async fn key_columns_dataset() -> Dataset {
+        let s = arrow_array::StructArray::from(vec![
+            (
+                Arc::new(arrow_schema::Field::new("a", DataType::Int32, false)),
+                Arc::new(arrow_array::Int32Array::from_iter_values(1000..1030))
+                    as arrow_array::ArrayRef,
+            ),
+            (
+                Arc::new(arrow_schema::Field::new("b", DataType::Int32, false)),
+                Arc::new(arrow_array::Int32Array::from_iter_values(2000..2030)),
+            ),
+        ]);
+        let batch = arrow_array::RecordBatch::try_from_iter(vec![
+            (
+                "a",
+                Arc::new(arrow_array::Int32Array::from_iter_values(0..30)) as arrow_array::ArrayRef,
+            ),
+            (
+                "b",
+                Arc::new(arrow_array::Int32Array::from_iter_values(100..130)),
+            ),
+            ("s", Arc::new(s)),
+        ])
+        .unwrap();
+        let schema = batch.schema();
+        let mut dataset = Dataset::write(
+            arrow_array::RecordBatchIterator::new([Ok(batch)], schema),
+            "memory://",
+            Some(crate::dataset::WriteParams {
+                max_rows_per_file: 10,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        dataset.delete("a % 7 = 3").await.unwrap();
+        assert_eq!(dataset.get_fragments().len(), 3);
+        dataset
+    }
+
+    async fn key_columns_index(dataset: &Dataset) -> IndexMetadata {
+        let indices = dataset.load_indices().await.unwrap();
+        indices
+            .iter()
+            .find(|index| index.name == "keys")
+            .unwrap()
+            .clone()
+    }
+
+    /// The column names of the training data the plugin received, and a
+    /// reader of its rows with the columns in that order.
+    async fn received_training_data(
+        dataset: &Dataset,
+        index: &IndexMetadata,
+    ) -> (Vec<String>, Arc<dyn lance_index::scalar::IndexReader>) {
+        let details = index
+            .index_details
+            .as_ref()
+            .unwrap()
+            .to_msg::<KeyColumnsTestIndexDetails>()
+            .unwrap();
+        let reader = LanceIndexStore::from_dataset_for_existing(dataset, index)
+            .await
+            .unwrap()
+            .open_index_file(KEY_COLUMNS_TRAINING_FILE)
+            .await
+            .unwrap();
+        (details.columns, reader)
+    }
+
+    #[rstest::rstest]
+    #[case::two_keys(&["a", "b"])]
+    #[case::caller_order(&["b", "a"])]
+    #[case::one_key(&["a"])]
+    #[case::nested_keys(&["s.a", "s.b"])]
+    #[tokio::test]
+    async fn key_columns_training_receives_each_key_and_row_address(#[case] columns: &[&str]) {
+        let mut dataset = key_columns_dataset().await;
+        dataset
+            .create_index(
+                columns,
+                IndexType::Scalar,
+                Some("keys".to_string()),
+                &ScalarIndexParams::new("keycolumnstest".to_string()),
+                false,
+            )
+            .await
+            .unwrap();
+        let index = key_columns_index(&dataset).await;
+        let field_ids = columns
+            .iter()
+            .map(|column| dataset.schema().field(column).unwrap().id)
+            .collect::<Vec<_>>();
+        assert_eq!(index.fields, field_ids);
+
+        let (names, reader) = received_training_data(&dataset, &index).await;
+        let mut expected_names = columns.to_vec();
+        expected_names.push(ROW_ADDR);
+        assert_eq!(names, expected_names);
+
+        let training = reader.read_range(0..reader.num_rows(), None).await.unwrap();
+        let live_rows = (0..30).filter(|row| row % 7 != 3).collect::<Vec<i32>>();
+        for (position, column) in columns.iter().enumerate() {
+            let offset = match *column {
+                "a" => 0,
+                "b" => 100,
+                "s.a" => 1000,
+                "s.b" => 2000,
+                _ => unreachable!("{column} is not a column of the dataset"),
+            };
+            let expected = live_rows.iter().map(|row| row + offset).collect::<Vec<_>>();
+            let values = training
+                .column(position)
+                .as_primitive::<Int32Type>()
+                .values();
+            assert_eq!(values.to_vec(), expected, "{column}");
+        }
+        let expected_addresses = live_rows
+            .iter()
+            .map(|row| {
+                u64::from(RowAddress::new_from_parts(
+                    *row as u32 / 10,
+                    *row as u32 % 10,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let addresses = training
+            .column(columns.len())
+            .as_primitive::<UInt64Type>()
+            .values();
+        assert_eq!(addresses.to_vec(), expected_addresses);
+    }
+
+    #[rstest::rstest]
+    #[case::value_layout_on_two_keys(
+        r#"{"value_layout": true}"#,
+        "a value-layout training request trains on one column"
+    )]
+    #[case::key_columns_sorted_by_value(
+        r#"{"sort_by_value": true}"#,
+        "key-column training data is never sorted by value"
+    )]
+    #[tokio::test]
+    async fn key_columns_training_refuses_requests_it_cannot_serve(
+        #[case] params: &str,
+        #[case] expected_message: &str,
+    ) {
+        let mut dataset = key_columns_dataset().await;
+        let params = ScalarIndexParams {
+            index_type: "keycolumnstest".to_string(),
+            params: Some(params.to_string()),
+        };
+        let error = dataset
+            .create_index(
+                &["a", "b"],
+                IndexType::Scalar,
+                Some("keys".to_string()),
+                &params,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::NotSupported { .. }), "{error}");
+        assert!(error.to_string().contains(expected_message), "{error}");
+        assert!(dataset.load_indices().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn key_columns_training_without_training_gets_empty_key_columns() {
+        let mut dataset = key_columns_dataset().await;
+        dataset
+            .create_index_builder(
+                &["b", "s.a"],
+                IndexType::Scalar,
+                &ScalarIndexParams::new("keycolumnstest".to_string()),
+            )
+            .name("keys".to_string())
+            .train(false)
+            .await
+            .unwrap();
+        let index = key_columns_index(&dataset).await;
+        assert!(index.fragment_bitmap.as_ref().unwrap().is_empty());
+
+        let (names, reader) = received_training_data(&dataset, &index).await;
+        assert_eq!(names, ["b", "s.a", ROW_ADDR]);
+        assert_eq!(reader.num_rows(), 0);
     }
 }
