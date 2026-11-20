@@ -95,7 +95,9 @@ use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize, Serializer};
 use tracing::{info, instrument};
 
+pub mod arrow_row;
 mod flat;
+pub mod key;
 mod lookup;
 mod ordered;
 
