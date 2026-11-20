@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow_array::{
     RecordBatchReader,
@@ -10,19 +11,19 @@ use arrow_array::{
 use criterion::{Criterion, criterion_group, criterion_main};
 use datafusion::{physical_plan::SendableRecordBatchStream, scalar::ScalarValue};
 use futures::{FutureExt, TryStreamExt};
-use lance::{Dataset, io::ObjectStore};
+use lance::{Dataset, index::DatasetIndexExt, io::ObjectStore};
 use lance_core::ROW_ADDR;
 use lance_core::cache::LanceCache;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_datafusion::utils::reader_to_stream;
 use lance_datagen::{BatchCount, RowCount, array, gen_batch};
 use lance_index::scalar::{
-    IndexStore, SargableQuery, ScalarIndex, SearchResult,
+    IndexStore, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
     btree::{DEFAULT_BTREE_BATCH_SIZE, train_btree_index},
     lance_format::LanceIndexStore,
     registry::{ScalarIndexPlugin, VALUE_COLUMN_NAME},
 };
-use lance_index::{metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
+use lance_index::{IndexType, metrics::NoOpMetricsCollector, scalar::btree::BTreeIndexPlugin};
 use lance_select::RowSetOps;
 #[cfg(target_os = "linux")]
 use lance_testing::pprof::{Output, PProfProfiler};
@@ -225,17 +226,55 @@ fn bench_warm_indexed(c: &mut Criterion) {
     });
 }
 
+fn bench_build(c: &mut Criterion) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let tempdir = TempStrDir::default();
+    let data = gen_batch()
+        .col("values", array::rand::<UInt32Type>())
+        .into_reader_rows(RowCount::from(10_000), BatchCount::from(1_000));
+    let dataset = rt
+        .block_on(Dataset::write(data, tempdir.as_str(), None))
+        .unwrap();
+    assert_eq!(dataset.get_fragments().len(), 10);
+    let params = ScalarIndexParams::default();
+
+    let mut group = c.benchmark_group("build");
+    group.bench_function("btree_one_column", |b| {
+        b.iter_custom(|iters| {
+            let mut elapsed = Duration::ZERO;
+            for _ in 0..iters {
+                let mut dataset = dataset.clone();
+                let start = Instant::now();
+                let index = rt
+                    .block_on(async {
+                        dataset
+                            .create_index_builder(&["values"], IndexType::BTree, &params)
+                            .execute_uncommitted()
+                            .await
+                    })
+                    .unwrap();
+                elapsed += start.elapsed();
+                assert_eq!(index.fragment_bitmap.map(|bitmap| bitmap.len()), Some(10));
+                std::fs::remove_dir_all(format!("{}/_indices/{}", tempdir.as_str(), index.uuid))
+                    .unwrap();
+            }
+            elapsed
+        })
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_baseline, bench_warm_indexed);
+    targets = bench_baseline, bench_warm_indexed, bench_build);
 
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_baseline, bench_warm_indexed);
+    targets = bench_baseline, bench_warm_indexed, bench_build);
 
 criterion_main!(benches);
