@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use datafusion_execution::SendableRecordBatchStream;
 use futures::future::BoxFuture;
 use lance_core::{
-    Result,
+    Error, Result,
     cache::{CacheKey, CacheKeySchema, KeyBuilder, LanceCache, UnsizedCacheKey},
     deepsize::{Context, DeepSizeOf},
 };
@@ -29,6 +29,18 @@ pub use crate::scalar::{TrainingCriteria, TrainingOrdering};
 
 pub const VALUE_COLUMN_NAME: &str = "value";
 
+/// The columns of the training data a [`TrainingRequest`] asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrainingInputLayout {
+    /// The one key column, renamed to [`VALUE_COLUMN_NAME`] and sorted when
+    /// the criteria ask for [`TrainingOrdering::Values`].
+    Value,
+    /// Every key column under its own field path, in key order. The caller
+    /// never sorts this data, so the criteria cannot ask for
+    /// [`TrainingOrdering::Values`]; the trainer orders the keys itself.
+    KeyColumns,
+}
+
 /// A trait object for plugin-specific training parameters and data requirements.
 ///
 /// Returned by [`BasicTrainer::new_training_request`]. The caller uses
@@ -38,6 +50,14 @@ pub const VALUE_COLUMN_NAME: &str = "value";
 pub trait TrainingRequest: std::any::Any + Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn criteria(&self) -> &TrainingCriteria;
+
+    /// The columns the training data holds, besides the row ids or addresses
+    /// the [`criteria`](Self::criteria) ask for.
+    ///
+    /// Defaults to [`TrainingInputLayout::Value`].
+    fn input_layout(&self) -> TrainingInputLayout {
+        TrainingInputLayout::Value
+    }
 }
 
 /// A default training request impl for indexes that don't need any parameters
@@ -80,6 +100,44 @@ pub trait BasicTrainer: Send + Sync {
     /// before calling [`train_index`](Self::train_index).
     fn new_training_request(&self, params: &str, field: &Field)
     -> Result<Box<dyn TrainingRequest>>;
+
+    /// Creates a training request for an index keyed on `fields`, in key order,
+    /// or refuses those key columns with an error.
+    ///
+    /// `fields[i]` describes the `i`-th key column of the training data as the
+    /// dataset schema declares it. A request for several key columns must
+    /// report an [`input_layout`](TrainingRequest::input_layout) of
+    /// [`TrainingInputLayout::KeyColumns`].
+    ///
+    /// The default forwards a single field to
+    /// [`new_training_request`](Self::new_training_request) and returns
+    /// [`Error::InvalidInput`] for any other number of fields.
+    ///
+    /// ```
+    /// # use arrow_schema::{DataType, Field};
+    /// # use lance_index::scalar::bitmap::BitmapIndexPlugin;
+    /// # use lance_index::scalar::registry::{BasicTrainer, TrainingInputLayout};
+    /// let a = Field::new("a", DataType::Int32, true);
+    /// let b = Field::new("b", DataType::Int32, true);
+    /// let request = BitmapIndexPlugin.new_training_request_for_fields("{}", &[a.clone()])?;
+    /// assert_eq!(request.input_layout(), TrainingInputLayout::Value);
+    /// assert!(BitmapIndexPlugin.new_training_request_for_fields("{}", &[a, b]).is_err());
+    /// # Ok::<(), lance_core::Error>(())
+    /// ```
+    fn new_training_request_for_fields(
+        &self,
+        params: &str,
+        fields: &[Field],
+    ) -> Result<Box<dyn TrainingRequest>> {
+        match fields {
+            [field] => self.new_training_request(params, field),
+            _ => Err(Error::invalid_input(format!(
+                "this index type takes one column, but {} were given: {:?}",
+                fields.len(),
+                fields.iter().map(Field::name).collect::<Vec<_>>()
+            ))),
+        }
+    }
 
     /// Train a new index from a prepared data stream.
     ///
@@ -884,6 +942,7 @@ mod tests {
     use lance_io::object_store::ObjectStore;
     use tokio::sync::Notify;
 
+    use crate::scalar::btree::BTreeIndexPlugin;
     use crate::scalar::inverted::{
         InvertedIndex, InvertedIndexParams, METADATA_FILE, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
     };
@@ -1140,5 +1199,36 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&reopened, &index_b));
         assert!(Arc::ptr_eq(&entry.index(), &index_b));
+    }
+
+    #[test]
+    fn default_training_request_for_one_field_is_the_single_column_request() {
+        let field = Field::new("a", DataType::Int32, true);
+        let request = BTreeIndexPlugin
+            .new_training_request_for_fields("{}", std::slice::from_ref(&field))
+            .unwrap();
+        let single = BTreeIndexPlugin.new_training_request("{}", &field).unwrap();
+        assert_eq!(request.input_layout(), TrainingInputLayout::Value);
+        assert_eq!(request.criteria(), single.criteria());
+    }
+
+    #[rstest::rstest]
+    #[case::no_fields(&[])]
+    #[case::two_fields(&["a", "b"])]
+    fn default_training_request_for_fields_takes_one_column(#[case] names: &[&str]) {
+        let fields = names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int32, true))
+            .collect::<Vec<_>>();
+        let error = BTreeIndexPlugin
+            .new_training_request_for_fields("{}", &fields)
+            .err()
+            .expect("the default trainer takes exactly one field");
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        let expected = format!(
+            "this index type takes one column, but {} were given: {names:?}",
+            names.len()
+        );
+        assert!(error.to_string().contains(&expected), "{error}");
     }
 }
