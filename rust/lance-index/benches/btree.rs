@@ -14,6 +14,9 @@
 //! - Range filters over pages whose row ids span many fragments
 //! - Ordered search: time to the first 100 rows in key order
 //! - Filter planning per column and as a tuple query over composite keys
+//! - Key codec: `arrow_row` version 1 encode and decode throughput against raw
+//!   `RowConverter` on the same (Int64, Utf8) keys, and the throughput of
+//!   validating stored keys
 
 mod common;
 
@@ -28,15 +31,18 @@ use std::{
 use common::{LOW_CARDINALITY_COUNT, TOTAL_ROWS};
 use std::hint::black_box;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow::row::{RowConverter, SortField};
+use arrow_array::{ArrayRef, BinaryArray, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Fields, SortOptions};
-use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use datafusion_common::ScalarValue;
 use datafusion_expr::{Expr, col, lit};
 use futures::TryStreamExt;
 use lance_core::cache::LanceCache;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::pbold;
+use lance_index::scalar::btree::arrow_row::ArrowRowV1;
+use lance_index::scalar::btree::key::BTreeKey;
 use lance_index::scalar::btree::{BTreeIndexPlugin, DEFAULT_BTREE_BATCH_SIZE, train_btree_index};
 use lance_index::scalar::expression::{
     IndexInformationProvider, MultiQueryParser, SargableQueryParser, apply_scalar_indices,
@@ -1101,6 +1107,135 @@ fn bench_tuple_planning(c: &mut Criterion) {
     group.finish();
 }
 
+const KEY_CODEC_ROWS: usize = 10_000_000;
+const KEY_CODEC_BATCH_ROWS: usize = 8192;
+
+fn key_codec_batches() -> Vec<[ArrayRef; 2]> {
+    let mut rng = SmallRng::seed_from_u64(42);
+    (0..KEY_CODEC_ROWS)
+        .step_by(KEY_CODEC_BATCH_ROWS)
+        .map(|start| {
+            let rows = KEY_CODEC_BATCH_ROWS.min(KEY_CODEC_ROWS - start);
+            let ids: Int64Array = (0..rows)
+                .map(|_| (!rng.random_bool(0.01)).then(|| rng.random::<i64>()))
+                .collect();
+            let names: StringArray = (0..rows)
+                .map(|_| {
+                    (!rng.random_bool(0.01)).then(|| {
+                        let len = rng.random_range(0..=40);
+                        (0..len)
+                            .map(|_| char::from(rng.random_range(b'a'..=b'z')))
+                            .collect::<String>()
+                    })
+                })
+                .collect();
+            [Arc::new(ids) as ArrayRef, Arc::new(names) as ArrayRef]
+        })
+        .collect()
+}
+
+fn bench_key_codec(c: &mut Criterion) {
+    let keys = vec![
+        BTreeKey {
+            name: "id".to_string(),
+            data_type: DataType::Int64,
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        },
+        BTreeKey {
+            name: "name".to_string(),
+            data_type: DataType::Utf8,
+            options: SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        },
+    ];
+    let raw = RowConverter::new(
+        keys.iter()
+            .map(|key| SortField::new_with_options(key.data_type.clone(), key.options))
+            .collect(),
+    )
+    .unwrap();
+    let codec = ArrowRowV1::try_new(keys).unwrap();
+    let cell = OnceCell::new();
+    let data = || {
+        cell.get_or_init(|| {
+            let batches = key_codec_batches();
+            let encoded = batches
+                .iter()
+                .map(|batch| codec.encode(batch).unwrap())
+                .collect::<Vec<BinaryArray>>();
+            let validated = encoded
+                .iter()
+                .map(|keys| codec.validate(keys.clone()).unwrap())
+                .collect::<Vec<_>>();
+            for ((batch, keys), validated) in batches.iter().zip(&encoded).zip(&validated) {
+                let raw_keys = raw.convert_columns(batch).unwrap().try_into_binary();
+                assert_eq!(&raw_keys.unwrap(), keys);
+                assert_eq!(codec.decode(validated).unwrap(), batch);
+            }
+            (batches, encoded, validated)
+        })
+    };
+
+    let mut group = c.benchmark_group("key_codec");
+    group
+        .throughput(Throughput::Elements(KEY_CODEC_ROWS as u64))
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(20));
+    group.bench_function("encode/raw_row_converter", |b| {
+        let (batches, _, _) = data();
+        b.iter(|| {
+            for batch in batches {
+                black_box(
+                    raw.convert_columns(batch)
+                        .unwrap()
+                        .try_into_binary()
+                        .unwrap(),
+                );
+            }
+        })
+    });
+    group.bench_function("encode/arrow_row_v1", |b| {
+        let (batches, _, _) = data();
+        b.iter(|| {
+            for batch in batches {
+                black_box(codec.encode(batch).unwrap());
+            }
+        })
+    });
+    group.bench_function("decode/raw_row_converter", |b| {
+        let (_, encoded, _) = data();
+        let parser = raw.parser();
+        b.iter(|| {
+            for keys in encoded {
+                let rows = keys.iter().flatten().map(|key| parser.parse(key));
+                black_box(raw.convert_rows(rows).unwrap());
+            }
+        })
+    });
+    group.bench_function("decode/arrow_row_v1", |b| {
+        let (_, _, validated) = data();
+        b.iter(|| {
+            for keys in validated {
+                black_box(codec.decode(keys).unwrap());
+            }
+        })
+    });
+    group.bench_function("validate/arrow_row_v1", |b| {
+        let (_, encoded, _) = data();
+        b.iter(|| {
+            for keys in encoded {
+                black_box(codec.validate(keys.clone()).unwrap());
+            }
+        })
+    });
+    group.finish();
+}
+
 #[cfg(target_os = "linux")]
 criterion_group!(
     name=benches;
@@ -1120,5 +1255,6 @@ criterion_group!(
     targets = bench_btree);
 
 criterion_group!(tuple_planning, bench_tuple_planning);
+criterion_group!(key_codec, bench_key_codec);
 
-criterion_main!(benches, tuple_planning);
+criterion_main!(benches, tuple_planning, key_codec);
