@@ -15,7 +15,8 @@
 //! - Ordered search: time to the first 100 rows in key order
 //! - Filter planning per column and as a tuple query over composite keys
 //! - Key codec: `arrow_row` version 1 encode and decode throughput against raw
-//!   `RowConverter` on the same (Int64, Utf8) keys
+//!   `RowConverter` on the same (Int64, Utf8) keys, and the throughput of
+//!   validating stored keys
 
 mod common;
 
@@ -1167,12 +1168,16 @@ fn bench_key_codec(c: &mut Criterion) {
                 .iter()
                 .map(|batch| codec.encode(batch).unwrap())
                 .collect::<Vec<BinaryArray>>();
-            for (batch, keys) in batches.iter().zip(&encoded) {
+            let validated = encoded
+                .iter()
+                .map(|keys| codec.validate(keys.clone()).unwrap())
+                .collect::<Vec<_>>();
+            for ((batch, keys), validated) in batches.iter().zip(&encoded).zip(&validated) {
                 let raw_keys = raw.convert_columns(batch).unwrap().try_into_binary();
                 assert_eq!(&raw_keys.unwrap(), keys);
-                assert_eq!(codec.decode(keys).unwrap(), batch);
+                assert_eq!(codec.decode(validated).unwrap(), batch);
             }
-            (batches, encoded)
+            (batches, encoded, validated)
         })
     };
 
@@ -1182,7 +1187,7 @@ fn bench_key_codec(c: &mut Criterion) {
         .sample_size(10)
         .measurement_time(Duration::from_secs(20));
     group.bench_function("encode/raw_row_converter", |b| {
-        let (batches, _) = data();
+        let (batches, _, _) = data();
         b.iter(|| {
             for batch in batches {
                 black_box(
@@ -1195,15 +1200,15 @@ fn bench_key_codec(c: &mut Criterion) {
         })
     });
     group.bench_function("encode/arrow_row_v1", |b| {
-        let (batches, _) = data();
+        let (batches, _, _) = data();
         b.iter(|| {
             for batch in batches {
                 black_box(codec.encode(batch).unwrap());
             }
         })
     });
-    group.bench_function("decode/raw_row_converter_unchecked", |b| {
-        let (_, encoded) = data();
+    group.bench_function("decode/raw_row_converter", |b| {
+        let (_, encoded, _) = data();
         let parser = raw.parser();
         b.iter(|| {
             for keys in encoded {
@@ -1213,10 +1218,18 @@ fn bench_key_codec(c: &mut Criterion) {
         })
     });
     group.bench_function("decode/arrow_row_v1", |b| {
-        let (_, encoded) = data();
+        let (_, _, validated) = data();
+        b.iter(|| {
+            for keys in validated {
+                black_box(codec.decode(keys).unwrap());
+            }
+        })
+    });
+    group.bench_function("validate/arrow_row_v1", |b| {
+        let (_, encoded, _) = data();
         b.iter(|| {
             for keys in encoded {
-                black_box(codec.decode(keys).unwrap());
+                black_box(codec.validate(keys.clone()).unwrap());
             }
         })
     });

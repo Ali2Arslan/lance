@@ -9,12 +9,16 @@
 //! bytes. If an Arrow upgrade changes them for an admitted type, the Encoding
 //! Stability section of the spec requires vendoring the version 1 encoder for
 //! that type rather than writing different bytes.
+//!
+//! Stored keys are untrusted. [`ArrowRowV1::validate`] checks a page of them
+//! and returns [`ValidatedKeys`], the only input that [`ArrowRowV1::decode`]
+//! takes, so decode adds no check to `arrow-row`'s own decoding. A reader
+//! validates each page once, when it loads and caches the page.
 
 use std::sync::Arc;
 
 use arrow::row::{RowConverter, SortField};
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BinaryArray, LargeStringArray, StringArray};
+use arrow_array::{Array, ArrayRef, BinaryArray};
 use arrow_schema::{DataType, SortOptions};
 use datafusion_common::ScalarValue;
 use lance_core::{Error, Result};
@@ -25,21 +29,22 @@ const MINI_BLOCKS: usize = 4;
 const MINI_BLOCK_WIDTH: usize = 8;
 const BLOCK_WIDTH: usize = 32;
 const BLOCK_CONTINUATION: u8 = 0xFF;
+const NOT_CANONICAL: &str = "is not a canonical arrow_row version 1 encoding";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum KeyBytes {
     Boolean,
     Fixed { value_width: usize },
-    Variable,
+    Binary,
+    Utf8,
 }
 
 impl KeyBytes {
     pub(super) fn of(data_type: &DataType) -> Option<Self> {
         let value_width = match data_type {
             DataType::Boolean => return Some(Self::Boolean),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Binary | DataType::LargeBinary => {
-                return Some(Self::Variable);
-            }
+            DataType::Binary | DataType::LargeBinary => return Some(Self::Binary),
+            DataType::Utf8 | DataType::LargeUtf8 => return Some(Self::Utf8),
             DataType::Int8 | DataType::UInt8 => 1,
             DataType::Int16 | DataType::UInt16 => 2,
             DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
@@ -53,35 +58,57 @@ impl KeyBytes {
         Some(Self::Fixed { value_width })
     }
 
-    fn canonical_len(self, bytes: &[u8], options: SortOptions) -> Option<usize> {
+    fn canonical_len(
+        self,
+        bytes: &[u8],
+        options: SortOptions,
+        utf8: &mut Vec<u8>,
+    ) -> std::result::Result<usize, &'static str> {
         let null = if options.nulls_first { 0x00 } else { 0xFF };
         let invert = if options.descending { 0xFF } else { 0x00 };
-        let (&first, rest) = bytes.split_first()?;
+        let (&first, rest) = bytes.split_first().ok_or(NOT_CANONICAL)?;
         let value_width = match self {
             Self::Boolean => 1,
             Self::Fixed { value_width } => value_width,
-            Self::Variable => {
+            Self::Binary | Self::Utf8 => {
                 if first == null {
-                    return Some(1);
+                    return Ok(1);
                 }
                 return match first ^ invert {
-                    0x01 => Some(1),
-                    0x02 => canonical_blocks_len(rest, invert).map(|len| 1 + len),
-                    _ => None,
+                    0x01 => Ok(1),
+                    0x02 => {
+                        utf8.clear();
+                        let gather = (self == Self::Utf8).then_some(&mut *utf8);
+                        let len =
+                            canonical_blocks_len(rest, invert, gather).ok_or(NOT_CANONICAL)?;
+                        if self == Self::Utf8 && std::str::from_utf8(utf8).is_err() {
+                            return Err("holds invalid UTF-8");
+                        }
+                        Ok(1 + len)
+                    }
+                    _ => Err(NOT_CANONICAL),
                 };
             }
         };
-        let value = rest.get(..value_width)?;
+        let value = rest.get(..value_width).ok_or(NOT_CANONICAL)?;
         let is_canonical = if first == null {
             value.iter().all(|byte| *byte == 0)
         } else {
             first == 0x01 && (self != Self::Boolean || (value[0] ^ invert) <= 1)
         };
-        is_canonical.then_some(1 + value_width)
+        if is_canonical {
+            Ok(1 + value_width)
+        } else {
+            Err(NOT_CANONICAL)
+        }
     }
 }
 
-fn canonical_blocks_len(bytes: &[u8], invert: u8) -> Option<usize> {
+fn canonical_blocks_len(
+    bytes: &[u8],
+    invert: u8,
+    mut value: Option<&mut Vec<u8>>,
+) -> Option<usize> {
     let mut len = 0;
     for block in 0.. {
         let width = if block < MINI_BLOCKS {
@@ -89,14 +116,22 @@ fn canonical_blocks_len(bytes: &[u8], invert: u8) -> Option<usize> {
         } else {
             BLOCK_WIDTH
         };
-        let value = bytes.get(len..len + width)?;
+        let data = bytes.get(len..len + width)?;
         let marker = bytes.get(len + width)? ^ invert;
         len += width + 1;
+        let used = if marker == BLOCK_CONTINUATION {
+            width
+        } else {
+            usize::from(marker)
+        };
+        if !(1..=width).contains(&used) || data[used..].iter().any(|byte| *byte != invert) {
+            return None;
+        }
+        if let Some(value) = value.as_deref_mut() {
+            value.extend(data[..used].iter().map(|byte| byte ^ invert));
+        }
         if marker != BLOCK_CONTINUATION {
-            let used = usize::from(marker);
-            let is_canonical =
-                (1..=width).contains(&used) && value[used..].iter().all(|byte| *byte == invert);
-            return is_canonical.then_some(len);
+            return Some(len);
         }
     }
     None
@@ -150,7 +185,8 @@ pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 /// let encoded = codec.encode(&columns)?;
 /// assert_eq!(encoded.value(0), b"\x01\x7f\xff\xff\xff\xfd\x9e\x9d\xff\xff\xff\xff\xff\xff\xfd");
 /// assert_eq!(encoded.value(1), b"\x00\x00\x00\x00\x00\xff");
-/// assert_eq!(codec.decode(&encoded)?, columns);
+/// let validated = codec.validate(encoded)?;
+/// assert_eq!(codec.decode(&validated)?, columns);
 /// # Ok(())
 /// # }
 /// ```
@@ -158,10 +194,23 @@ pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
 pub struct ArrowRowV1 {
     keys: Vec<BTreeKey>,
     layouts: Vec<KeyBytes>,
-    encoder: RowConverter,
-    /// Reads Utf8 keys as Binary, which has the same bytes, so that invalid
-    /// UTF-8 in a stored key is an error instead of a panic in `arrow-row`.
-    decoder: RowConverter,
+    fields: Arc<[SortField]>,
+    converter: RowConverter,
+}
+
+/// Stored keys that [`ArrowRowV1::validate`] accepted, for
+/// [`ArrowRowV1::decode`] on a codec with the same key types and options.
+#[derive(Clone, Debug)]
+pub struct ValidatedKeys {
+    fields: Arc<[SortField]>,
+    encoded: BinaryArray,
+}
+
+impl ValidatedKeys {
+    /// The encoded tuples, one per row, as [`ArrowRowV1::validate`] took them.
+    pub fn encoded(&self) -> &BinaryArray {
+        &self.encoded
+    }
 }
 
 impl ArrowRowV1 {
@@ -191,18 +240,16 @@ impl ArrowRowV1 {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let decoded_type = |data_type: &DataType| match data_type {
-            DataType::Utf8 => DataType::Binary,
-            DataType::LargeUtf8 => DataType::LargeBinary,
-            other => other.clone(),
-        };
-        let encoder = RowConverter::new(sort_fields(&keys, DataType::clone))?;
-        let decoder = RowConverter::new(sort_fields(&keys, decoded_type))?;
+        let fields: Arc<[SortField]> = keys
+            .iter()
+            .map(|key| SortField::new_with_options(key.data_type.clone(), key.options))
+            .collect();
+        let converter = RowConverter::new(fields.to_vec())?;
         Ok(Self {
             keys,
             layouts,
-            encoder,
-            decoder,
+            fields,
+            converter,
         })
     }
 
@@ -229,7 +276,7 @@ impl ArrowRowV1 {
             )));
         }
         self.check_types(columns)?;
-        Ok(self.encoder.convert_columns(columns)?.try_into_binary()?)
+        Ok(self.converter.convert_columns(columns)?.try_into_binary()?)
     }
 
     /// Encodes one tuple prefix: a value for each of the first
@@ -244,14 +291,14 @@ impl ArrowRowV1 {
     /// [`Error::InvalidInput`] when there are more values than keys, or a
     /// value does not have its key's type.
     pub fn encode_prefix(&self, values: &[ScalarValue]) -> Result<Vec<u8>> {
-        let keys = self.keys.get(..values.len()).ok_or_else(|| {
+        let fields = self.fields.get(..values.len()).ok_or_else(|| {
             Error::invalid_input(format!(
                 "a prefix of {} values is longer than the {} keys",
                 values.len(),
                 self.keys.len()
             ))
         })?;
-        if keys.is_empty() {
+        if fields.is_empty() {
             return Ok(Vec::new());
         }
         let columns = values
@@ -259,7 +306,7 @@ impl ArrowRowV1 {
             .map(ScalarValue::to_array)
             .collect::<datafusion_common::Result<Vec<_>>>()?;
         self.check_types(&columns)?;
-        let converter = RowConverter::new(sort_fields(keys, DataType::clone))?;
+        let converter = RowConverter::new(fields.to_vec())?;
         Ok(converter
             .convert_columns(&columns)?
             .row(0)
@@ -267,45 +314,66 @@ impl ArrowRowV1 {
             .to_vec())
     }
 
-    /// Decodes each encoded tuple of `keys` into one column per key, in key
-    /// order.
+    /// Checks that each row of `encoded` is the canonical encoding of a tuple
+    /// of these keys, and returns the rows for [`Self::decode`].
+    ///
+    /// `arrow-row` panics on some malformed rows and decodes others to values
+    /// that encode differently.
     ///
     /// # Errors
     ///
-    /// [`Error::CorruptFile`] when a row is null or is not the canonical
-    /// encoding of a tuple of these keys.
-    pub fn decode(&self, keys: &BinaryArray) -> Result<Vec<ArrayRef>> {
-        for (row, key) in keys.iter().enumerate() {
-            let Some(key) = key else {
+    /// [`Error::CorruptFile`] when a row is null, is not the canonical
+    /// encoding of a tuple of these keys, or holds invalid UTF-8 in a Utf8 key.
+    pub fn validate(&self, encoded: BinaryArray) -> Result<ValidatedKeys> {
+        let mut utf8 = Vec::new();
+        for (row, tuple) in encoded.iter().enumerate() {
+            let Some(mut bytes) = tuple else {
                 return Err(corrupt_key(format!(
                     "row {row} is null, but an encoded key is never null"
                 )));
             };
-            self.check_canonical(row, key)?;
+            for (position, (key, layout)) in self.keys.iter().zip(&self.layouts).enumerate() {
+                let len = layout
+                    .canonical_len(bytes, key.options, &mut utf8)
+                    .map_err(|problem| {
+                        corrupt_key(format!(
+                            "row {row} key {position} '{}' ({}, {:?}) {problem}",
+                            key.name, key.data_type, key.options
+                        ))
+                    })?;
+                bytes = &bytes[len..];
+            }
+            if !bytes.is_empty() {
+                return Err(corrupt_key(format!(
+                    "row {row} has {} bytes after its {} keys",
+                    bytes.len(),
+                    self.keys.len()
+                )));
+            }
         }
-        let parser = self.decoder.parser();
-        let columns = self
-            .decoder
-            .convert_rows(keys.iter().flatten().map(|key| parser.parse(key)))?;
-        columns
-            .into_iter()
-            .zip(&self.keys)
-            .enumerate()
-            .map(|(position, (column, key))| {
-                let column: ArrayRef = match key.data_type {
-                    DataType::Utf8 => Arc::new(
-                        StringArray::try_from_binary(column.as_binary::<i32>().clone())
-                            .map_err(|error| invalid_utf8(position, key, error))?,
-                    ),
-                    DataType::LargeUtf8 => Arc::new(
-                        LargeStringArray::try_from_binary(column.as_binary::<i64>().clone())
-                            .map_err(|error| invalid_utf8(position, key, error))?,
-                    ),
-                    _ => column,
-                };
-                Ok(column)
-            })
-            .collect()
+        Ok(ValidatedKeys {
+            fields: Arc::clone(&self.fields),
+            encoded,
+        })
+    }
+
+    /// Decodes each validated tuple into one column per key, in key order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when a codec with other key types or options
+    /// validated `keys`.
+    pub fn decode(&self, keys: &ValidatedKeys) -> Result<Vec<ArrayRef>> {
+        if keys.fields != self.fields {
+            return Err(Error::invalid_input(format!(
+                "keys validated for {:?} cannot be decoded as {:?}",
+                keys.fields, self.fields
+            )));
+        }
+        let parser = self.converter.parser();
+        Ok(self
+            .converter
+            .convert_rows(keys.encoded.iter().flatten().map(|key| parser.parse(key)))?)
     }
 
     fn check_types(&self, columns: &[ArrayRef]) -> Result<()> {
@@ -321,47 +389,10 @@ impl ArrowRowV1 {
         }
         Ok(())
     }
-
-    /// Checks that `bytes` is the canonical encoding of one tuple, because
-    /// `arrow-row` panics on some malformed rows and decodes others to values
-    /// that encode differently.
-    fn check_canonical(&self, row: usize, mut bytes: &[u8]) -> Result<()> {
-        for (position, (key, layout)) in self.keys.iter().zip(&self.layouts).enumerate() {
-            let len = layout.canonical_len(bytes, key.options).ok_or_else(|| {
-                corrupt_key(format!(
-                    "row {row} key {position} '{}' ({}, {:?}) is not a canonical arrow_row \
-                     version 1 encoding",
-                    key.name, key.data_type, key.options
-                ))
-            })?;
-            bytes = &bytes[len..];
-        }
-        if !bytes.is_empty() {
-            return Err(corrupt_key(format!(
-                "row {row} has {} bytes after its {} keys",
-                bytes.len(),
-                self.keys.len()
-            )));
-        }
-        Ok(())
-    }
-}
-
-fn sort_fields(keys: &[BTreeKey], data_type: impl Fn(&DataType) -> DataType) -> Vec<SortField> {
-    keys.iter()
-        .map(|key| SortField::new_with_options(data_type(&key.data_type), key.options))
-        .collect()
 }
 
 fn corrupt_key(message: String) -> Error {
     Error::corrupt_file_named("BTree arrow_row key", message)
-}
-
-fn invalid_utf8(position: usize, key: &BTreeKey, error: arrow_schema::ArrowError) -> Error {
-    corrupt_key(format!(
-        "key {position} '{}' ({}) holds invalid UTF-8: {error}",
-        key.name, key.data_type
-    ))
 }
 
 #[cfg(test)]
@@ -370,8 +401,8 @@ mod tests {
 
     use arrow_array::{
         BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeBinaryArray, TimestampNanosecondArray, UInt8Array,
-        UInt16Array, UInt32Array, UInt64Array,
+        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+        TimestampNanosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow_ord::sort::{SortColumn, lexsort_to_indices};
     use arrow_schema::{Field, Fields, TimeUnit};
@@ -479,7 +510,10 @@ mod tests {
                 .iter()
                 .map(|(_, hex)| hex::decode(hex).unwrap()),
         );
-        match codec.decode(&stored) {
+        match codec
+            .validate(stored)
+            .and_then(|stored| codec.decode(&stored))
+        {
             Ok(decoded) if decoded == arrays => {}
             decoded => mismatches.push(format!(
                 "decoding the arrow_row version 1 bytes of [{types}] gave {decoded:?}, not \
@@ -932,7 +966,8 @@ mod tests {
 
     fn assert_round_trip_and_order(codec: &ArrowRowV1, columns: &[ArrayRef]) {
         let encoded = codec.encode(columns).unwrap();
-        assert_eq!(codec.decode(&encoded).unwrap(), columns);
+        let validated = codec.validate(encoded.clone()).unwrap();
+        assert_eq!(codec.decode(&validated).unwrap(), columns);
 
         let mut by_bytes = (0..encoded.len() as u32).collect::<Vec<_>>();
         by_bytes.sort_by(|a, b| encoded.value(*a as usize).cmp(encoded.value(*b as usize)));
@@ -1035,13 +1070,14 @@ mod tests {
             ])),
         ];
         let encoded = codec.encode(&columns).unwrap();
-        assert_eq!(codec.decode(&encoded).unwrap(), columns);
+        let decode = |encoded: BinaryArray| codec.decode(&codec.validate(encoded).unwrap());
+        assert_eq!(decode(encoded.clone()).unwrap(), columns);
 
-        let sliced = codec.decode(&encoded.slice(1, 2)).unwrap();
+        let sliced = decode(encoded.slice(1, 2)).unwrap();
         let expected = columns.iter().map(|c| c.slice(1, 2)).collect::<Vec<_>>();
         assert_eq!(sliced, expected);
 
-        let empty = codec.decode(&encoded.slice(0, 0)).unwrap();
+        let empty = decode(encoded.slice(0, 0)).unwrap();
         assert_eq!(empty.len(), 2);
         assert!(empty.iter().all(|column| column.is_empty()));
         assert_eq!(empty[0].data_type(), &DataType::Utf8);
@@ -1143,8 +1179,14 @@ mod tests {
         "02ff0000000000000001",
         "invalid UTF-8"
     )]
+    #[case::invalid_utf8_descending(
+        DataType::Utf8,
+        DESC_NULLS_FIRST,
+        "fd00fffffffffffffffe",
+        "invalid UTF-8"
+    )]
     #[case::trailing_bytes(DataType::Int32, ASC_NULLS_FIRST, "017ffffffe00", "1 bytes after")]
-    fn decode_rejects_noncanonical_keys(
+    fn validate_rejects_noncanonical_keys(
         #[case] data_type: DataType,
         #[case] options: SortOptions,
         #[case] hex: &str,
@@ -1152,18 +1194,87 @@ mod tests {
     ) {
         let codec = codec(&[(data_type, options)]);
         let keys = BinaryArray::from_iter_values([hex::decode(hex).unwrap()]);
-        let error = codec.decode(&keys).unwrap_err();
+        let error = codec.validate(keys).unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
         assert!(error.to_string().contains(message), "{error}");
     }
 
     #[test]
-    fn decode_rejects_a_null_row() {
+    fn validate_rejects_a_null_row() {
         let codec = codec(&[(DataType::Int32, ASC_NULLS_FIRST)]);
         let keys = BinaryArray::from(vec![Some(&[0x01, 0, 0, 0, 0][..]), None]);
-        let error = codec.decode(&keys).unwrap_err();
+        let error = codec.validate(keys).unwrap_err();
         assert!(matches!(error, Error::CorruptFile { .. }), "{error}");
         assert!(error.to_string().contains("row 1 is null"), "{error}");
+    }
+
+    #[rstest]
+    fn validated_keys_decode_to_tuples_that_encode_to_the_same_bytes(
+        #[values(
+            DataType::Boolean,
+            DataType::Int16,
+            DataType::UInt64,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeBinary
+        )]
+        data_type: DataType,
+        #[values(ASC_NULLS_FIRST, ASC_NULLS_LAST, DESC_NULLS_FIRST, DESC_NULLS_LAST)]
+        options: SortOptions,
+    ) {
+        let codec = codec(&[(data_type.clone(), options)]);
+        let encoded = codec.encode(&[random_column(&data_type, 13, 50)]).unwrap();
+        let mut rng = SmallRng::seed_from_u64(17);
+        let (mut accepted, mut rejected) = (0, 0);
+        for row in 0..encoded.len() {
+            for _ in 0..20 {
+                let mut bytes = encoded.value(row).to_vec();
+                let at = rng.random_range(0..bytes.len());
+                bytes[at] = rng.random();
+                let Ok(validated) = codec.validate(BinaryArray::from_iter_values([&bytes])) else {
+                    rejected += 1;
+                    continue;
+                };
+                accepted += 1;
+                let decoded = codec.decode(&validated).unwrap();
+                assert_eq!(
+                    hex::encode(codec.encode(&decoded).unwrap().value(0)),
+                    hex::encode(&bytes)
+                );
+            }
+        }
+        assert!(accepted > 0 && rejected > 0, "{accepted} {rejected}");
+    }
+
+    #[test]
+    fn decoding_validated_keys_round_trips() {
+        let keys = [
+            (DataType::Int64, ASC_NULLS_FIRST),
+            (DataType::Utf8, DESC_NULLS_LAST),
+        ];
+        let columns = vec![
+            random_column(&DataType::Int64, 3, 100),
+            random_column(&DataType::Utf8, 4, 100),
+        ];
+        let encoded = codec(&keys).encode(&columns).unwrap();
+        let validated = codec(&keys).validate(encoded.clone()).unwrap();
+        assert_eq!(validated.encoded(), &encoded);
+        assert_eq!(codec(&keys).decode(&validated).unwrap(), columns);
+    }
+
+    #[rstest]
+    #[case::other_direction(&[(DataType::Int32, DESC_NULLS_FIRST)])]
+    #[case::other_null_placement(&[(DataType::Int32, ASC_NULLS_LAST)])]
+    #[case::other_type(&[(DataType::UInt32, ASC_NULLS_FIRST)])]
+    #[case::more_keys(&[(DataType::Int32, ASC_NULLS_FIRST), (DataType::Int32, ASC_NULLS_FIRST)])]
+    fn decode_rejects_keys_validated_for_other_keys(#[case] other: &[(DataType, SortOptions)]) {
+        let validator = codec(&[(DataType::Int32, ASC_NULLS_FIRST)]);
+        let column: ArrayRef = Arc::new(Int32Array::from(vec![Some(-2), None]));
+        let validated = validator
+            .validate(validator.encode(&[column]).unwrap())
+            .unwrap();
+        let error = codec(other).decode(&validated).unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }), "{error}");
     }
 
     #[test]
